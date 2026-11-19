@@ -184,6 +184,124 @@ I chose to store the provider's `messageId` and `timestamp` because they let me 
 - **What it costs:** Two columns and decoding the `202` body.
 - **How I will prove it (R13):** A `202` with a `messageId` fills both columns; a `202` with a broken body results in exactly one POST, the status `sent` and empty metadata; two notifications can store the same `messageId` without an error.
 
+## Tooling
+
+### K16 — HTTP router: the standard library's `net/http`
+
+I chose the standard library's `net/http` router because its `ServeMux` covers every method and path pattern this API needs, so the project needs no router dependency.
+
+- **How it works:** Routes use Go 1.22 patterns such as `GET /notifications/{id}`, and handlers read parameters with `r.PathValue("id")`. Correlation IDs (R15), request logging and panic recovery are ordinary `func(http.Handler) http.Handler` middleware around the mux. The `http.Server` sets its timeouts and shuts down as described in K6.
+- **Also considered:** chi (compatible with `http.Handler` and ships ready middleware, but since Go 1.22 the standard router covers what this API needs) and Gin (popular, but its handlers use its own `*gin.Context`, which ties the middleware, the tests and the OpenAPI layer to Gin).
+- **What it costs:** I write the three or four middleware functions myself.
+- **How I will prove it:** Tests send requests through the real router instead of calling handlers directly: path parameters reach the handler, an unknown path returns `404`, and a known path with the wrong method returns `405` with an `Allow` header.
+
+### K17 — Database access: pgx with plain SQL in the repository
+
+I chose pgx with plain SQL in the repository because the correctness of the claim, the limiter, cancellation and idempotency depends on SQL conditions and transaction boundaries, and I want to see those queries directly.
+
+- **How it works:** `pgxpool` is the connection pool. Every query is a SQL constant in the repository layer, run with numbered parameters (`$1`, `$2`, …); values are never concatenated into SQL. Transactions use `BeginTx`, `Commit` and a deferred `Rollback`.
+- **Batches (K12):** The first version writes a batch with one parameterized multi-row `INSERT`. The protocol counts a statement's parameters in a 16-bit field, and 1,000 items need about 6,000 parameters, well below that limit. If `CopyFrom` is used later, it is called on the transaction (`tx.CopyFrom`), not on the pool, so the batch row, its notifications and the K10 key with the first response stay in one transaction. The `202` is returned only after the commit.
+- **Also considered:** sqlc (the SQL stays mine and the scanning code is generated, but it adds a code generation step, and optional filters such as K13's are awkward) and GORM (closest to my SQLAlchemy experience, but the queue, limiter and idempotency queries would mostly end up as raw SQL anyway).
+- **What it costs:** I write the row scanning myself, and each query needs its own test so that a column order mistake is caught.
+- **How I will prove it:** Repository tests against a real PostgreSQL (K22), one per query, and a test that a batch whose insert fails leaves no batch row, no notifications and no idempotency key behind.
+
+### K18 — Migrations: goose with SQL files embedded in the binary
+
+I chose goose with SQL files embedded in the binary because one migration file with its Up and Down sections works like an Alembic revision, and the application and the tests can run the same files.
+
+- **How it works:** Each migration is one SQL file with `-- +goose Up` and `-- +goose Down` sections, embedded with `embed.FS`. A small `cmd/migrate` creates a provider with `goose.NewProvider` and runs `Up(ctx)`. The provider keeps no package-level state, so the tests can run the same embedded files against their own database. The `*sql.DB` it needs comes from pgx's `stdlib` package. In Compose, the one-off migration service runs `migrate up` from the same image, and the API and the worker start only after it completes successfully (K6).
+- **When a migration fails:** goose runs each migration in its own transaction by default, so the failing file is rolled back while the files applied before it stay applied. The migration service exits with an error, and the API and the worker do not start.
+- **Also considered:** golang-migrate (common, with an official Docker image, but two files per migration and a "dirty" state after a failure that needs a manual `force`) and Atlas (a declarative schema with generated migrations, but a new tool and workflow for a small project, and its default binaries are under a commercial agreement).
+- **How my decision changed:** The card I was first offered set goose up with its global settings (`SetBaseFS`, `SetDialect`) and said that a failed migration would not leave the schema half-done. I reviewed it with OpenAI Codex and researched goose's Provider API and its transaction behaviour. I switched to `NewProvider`, which has no global state, and recorded the real failure behaviour: only the failing file is rolled back.
+- **What it costs:** A third binary in the image. A failure in the middle of a run leaves the earlier migrations in place, and the next run continues from there.
+- **How I will prove it (D5):** On a clean database the migrations build the schema; a second run changes nothing; and with a broken migration the migration service fails, and the API and the worker do not start.
+
+### K19 — OpenAPI: generated from the code with Huma on the standard library router
+
+I chose Huma because it generates the OpenAPI 3.1 document from the routes and Go types, the way FastAPI does from Pydantic models, so the document cannot drift from the code.
+
+- **How it works:** Huma runs on the K16 `ServeMux` through its `humago` adapter. Operations are registered with Go input and output types, and errors use RFC 9457 problem details. The document is exported to `api/openapi.yaml` and committed, and a check fails if the committed file differs from the one the code generates.
+- **Fitting the earlier decisions:** The create operations set `DefaultStatus: 202`. A repeated request (K10) gets the stored first response as `Body []byte`, which Huma writes without serializing it again; a raw byte body does not describe itself, so these operations declare their JSON response schema explicitly. The batch operation sets `MaxBodyBytes` to the K12 body limit (16 MiB) instead of Huma's default of 1 MiB. K11's channel rules run through Huma's `Resolver` interface.
+- **Malformed JSON:** Huma v2.41.0 copies the raw request body into its error details when the JSON cannot be parsed. Our error responses remove that value, so a request body is never echoed back.
+- **Also considered:** writing `openapi.yaml` by hand and generating code with oapi-codegen (a reviewable contract first, but about 300 lines of YAML to write and generated code to explain) and swag comments (the stable version produces Swagger 2.0, and the comments can drift from the code).
+- **How my decision changed:** The card I was first offered left open whether Huma could return the stored K10 response unchanged, and it did not notice that Huma echoes a malformed body in its errors. I reviewed it with OpenAI Codex and researched Huma's response outputs and its v2.41.0 source. `Body []byte` bypasses serialization, so the K10 design holds; I added removing the echoed body and declaring the response schema explicitly.
+- **What it costs:** The handlers are tied to Huma's signatures; the service and repository layers are not. Responses returned as raw bytes have to be described by hand in the document.
+- **How I will prove it (D4, K10–K12):** Four tests through the real route: malformed JSON returns `400` (K11) without the body in the error; a field error returns `422`; a body over the limit returns `413`; and a repeat with the same key returns the first `202` body byte for byte. A separate check keeps `api/openapi.yaml` up to date.
+
+## Observability
+
+### K20 — Metrics: a JSON endpoint computed from PostgreSQL
+
+I chose a JSON endpoint computed from PostgreSQL because the case asks for queue depth, success and failure rates and latency, and the state shared in PostgreSQL lets the endpoint cover every worker without its numbers resetting when a worker restarts.
+
+- **How it works:** `GET /metrics` on the API is a Huma operation, so it appears in the OpenAPI document. It reads every value in one short `REPEATABLE READ READ ONLY` transaction: all its statements see the same snapshot, and `now()` returns the same time throughout, which the response reports as `as_of`. Results are given per channel.
+- **Queue depth:** For each channel and priority, `ready` counts the `queued` notifications whose `available_at` is at or before `as_of`, and `deferred` counts the ones waiting for a later time. I named it `deferred` rather than "retrying" because a scheduled notification (B2) will wait the same way. The age of the oldest ready notification is `as_of − min(available_at)`; this is the starvation signal K8 relies on.
+- **Success and failure:** A `completed_at` column is written when a notification becomes `sent` or `failed`; on `sent` it gets the same database time as `sent_at`. The endpoint counts the notifications completed in the last 60 seconds and reports them per second and as a success ratio, `sent / (sent + failed)`. Cancellations and retries that have not finished are left out, and the ratio is `null` when nothing completed. `sent` means the provider accepted the request (K9).
+- **Latency:** For the notifications sent in the window, the p50, p95 and p99 of `created_at → sent_at`, with the sample count, computed with PostgreSQL's `percentile_cont`. This time includes queue waiting and retries. The percentiles are `null` when there are no samples. In the first version, the duration of each provider call goes to the logs (K21), not to this endpoint.
+- **Window:** A fixed 60 seconds. I measure the queries' cost with a full queue (`EXPLAIN ANALYZE`) before changing anything.
+- **Not the proof of R8:** This endpoint summarises completed notifications. The R8 test counts the actual HTTP send starts, retries included, in a sliding one-second window (K5).
+- **Also considered:** The Prometheus text format with a Prometheus server in Compose (the industry standard, but the counters live in each process, so scaled workers need the server and replica discovery together, and the rates come from the server's queries, not from our endpoint), this JSON endpoint plus a Prometheus endpoint in every process (two sources that count different things, and without a server nobody collects the workers' numbers), and OpenTelemetry metrics (one SDK shared with the distributed tracing bonus, B5, but its Prometheus exporter is still v0.69.0 and the aggregation problem stays).
+- **How my decision changed:** The card I was first offered counted waiting notifications as `waiting_for_retry`, added a `provider_latency_ms` column, took the window as a request parameter, and did not say how the values in one response stay consistent with each other. I reviewed it with OpenAI Codex and researched PostgreSQL's isolation levels and the scheduled notifications bonus. Waiting work is now `deferred`, the provider call duration goes to the logs, the window is fixed at 60 seconds, and every value comes from one snapshot.
+- **What it costs:** No history and no Prometheus or Grafana integration; the endpoint shows the current state only. Provider call latency is only in the logs. Each request adds read queries to the database that also holds the queue. On `sent` rows `completed_at` repeats `sent_at`, kept so that one column and one index serve the completion window. When B2 adds scheduled notifications, latency should be measured from the scheduled time instead of `created_at`.
+- **How I will prove it (R14):** Repository tests against a real PostgreSQL (K22) with fixed timestamps: ready and deferred counts per channel and priority, the age of the oldest ready notification, the success ratio (`null` when only cancellations exist), the percentiles (`null` without samples), and rows outside the 60-second window left out. A run with a full queue records the `EXPLAIN ANALYZE` time.
+
+### K21 — Logging: `log/slog` JSON with a correlation ID stored on each notification
+
+I chose `log/slog` with a correlation ID stored on each notification because it lets me follow a notification across the API and worker processes, and the standard library's logger is enough for this case.
+
+- **Where the ID comes from:** A middleware (K16) reads the `X-Correlation-ID` header. If the value is valid (at most 64 characters from `A–Z a–z 0–9 - _ .`), the API uses it; otherwise it generates one, so a client cannot write arbitrary text into our logs. The response returns the ID in the same header.
+- **How it travels:** At the start of a request, the API creates `logger.With("correlation_id", id)` and passes that logger to the code handling the request. The create transaction writes the ID into the notification row, so every notification in a batch carries the batch request's ID next to its own `notification_id`. At every claim, the worker reads the ID from the row, makes a logger with the ID, the `notification_id`, the channel and the attempt number, and adds the ID to the provider POST as an `X-Correlation-ID` header. webhook.site shows the headers it receives, so the K14 integration check can show the ID reaching the provider.
+- **Why `With` and not the context:** `slog`'s built-in JSON handler ignores the context it is given, so `InfoContext` alone adds nothing. The first version passes the derived logger instead of adding a handler that reads the ID from the context.
+- **Two lines per attempt:** The worker logs the send start before the POST and the result after it (status code, duration, outcome). A worker that crashes after its POST may never write the result line, so the start has its own line. The R8 measurement reads the start lines, and the provider call duration that K20 leaves out of the metrics is in the result lines.
+- **Replays:** A repeated request with the same idempotency key (K10) does not change the correlation ID stored on the notification and starts no new provider call.
+- **Not logged:** Message content and recipients. A notification is found by its ID.
+- **Output:** JSON lines on stdout (`docker compose logs`), with the level set by `LOG_LEVEL`.
+- **Also considered:** A custom `slog` handler that reads the ID from the context (automatic, but more code than the first version needs), zap or zerolog (faster loggers, but a dependency for a log volume of a few lines per send), and W3C trace context through OpenTelemetry now (the standard form of a correlation ID, but it would pull the distributed tracing bonus, B5, into the core).
+- **How my decision changed:** The card I was first offered logged each attempt as one line and added a custom handler so that `InfoContext` would pick the ID up from the context. I reviewed it with OpenAI Codex, traced the K3 crash case and researched the `log/slog` documentation and source. A crash after the POST can leave no result line, so each attempt now has a start line and a result line. The built-in handlers ignore the context, so the ID would appear only through that extra handler; the first version passes a logger made with `With` instead. I also recorded that a K10 replay keeps the first ID.
+- **What it costs:** Every function that logs must receive the derived logger; a line written with the base logger has no ID. A migration adds the `correlation_id` column. A client can choose its own ID, within the validation rules.
+- **How I will prove it (R15):** An end-to-end test creates a notification with `X-Correlation-ID: test-123`, runs the worker against an `httptest` provider, and checks that the provider received the header and that the API and worker log lines carry the ID. Further tests: batch items share the ID with different `notification_id`s; a replay keeps the first ID and makes no new provider call; an invalid header gets a generated ID.
+
+## Tests and code layout
+
+### K22 — Test database: Testcontainers with the same PostgreSQL image as Compose
+
+I chose Testcontainers because the tests then run against a real PostgreSQL, from the same image Compose uses.
+
+- **How it works:** The PostgreSQL module of `testcontainers-go` (v0.45.0) starts a container from the Compose image once per integration test package, in `TestMain`. Each test gets its own database with the same embedded goose migrations applied (K18), and drops it with `t.Cleanup`. The container gets a random free host port and starts fresh on every run, so it neither collides with a local PostgreSQL nor reuses an old volume. Tests that need no database (validation, backoff, metric ratios) do not start one.
+- **Race tests:** The claim, cancel and idempotency races run with committed data and separate connections; a transaction rolled back at the end of a test could not show them. Each order of a race is set up with controlled steps instead of `sleep`: for example, one transaction holds the row lock while the test starts the other. The K9 test that runs cancel and claim together many times stays as an additional check.
+- **Template database later:** If applying the migrations to every test database turns out to be slow, I clone each test database from a migrated template instead (`CREATE DATABASE … TEMPLATE`).
+- **One command (D6):** `go test -count=1 ./...`, with Docker running. `-count=1` keeps `go test` from reporting a cached result: its cache checks only files and environment variables, not the database a test used.
+- **Also considered:** A separate test database in Compose with `make test` (familiar, but the single command becomes `make test`, a plain `go test` fails while the service is down, and a fixed host port brings back port collisions) and `embedded-postgres` (no Docker, but this project needs Docker anyway, and its PostgreSQL build comes from the library instead of the Compose image).
+- **How my decision changed:** The card I was first offered cloned every test database from a template from the start and left `go test`'s result cache unhandled. I reviewed it with OpenAI Codex and researched the Testcontainers PostgreSQL module and `go test`'s caching rules. I start with migrations per test database and add the template only if measurement calls for it, order race tests with controlled steps instead of `sleep`, and run the suite with `-count=1`.
+- **What it costs:** `go test` needs Docker running. Each integration package spends a few seconds starting its container, and each test spends the time it takes to apply the migrations.
+- **How I will prove it (D6):** On a clean clone with Docker running, `go test -count=1 ./...` passes; a second run executes the tests again instead of printing `(cached)`; and a row written in one test is not visible in another.
+
+### K23 — Project layout: small packages by layer, with multi-table transactions inside `postgres`
+
+I chose a small set of packages split by layer, with every multi-table transaction closed inside the `postgres` package, because a small structure is enough for this case and keeps each transaction in one place.
+
+```
+cmd/{api,worker,migrate,mockprovider}/  entry points; they build and connect the parts
+internal/
+  domain/    notification types and the K11 validation (no database)
+  httpapi/   Huma operations and middleware (K16, K19, K21)
+  service/   create, batch, cancel, list and metrics rules
+  postgres/  all SQL and transactions (K17)
+  worker/    claim loop, sending, retry policy (K3, K5, K7)
+  provider/  provider HTTP client and profiles (K14)
+migrations/  SQL files and the embed.go that embeds them (K18)
+api/openapi.yaml
+```
+
+- **How the parts connect:** `service` and `worker` each define the small interfaces they need, and `postgres` implements them without importing either package; the entry points in `cmd/` connect them. The imports are therefore: `httpapi` → `service`; `service`, `worker` and `postgres` → `domain`; `worker` → `provider`; `cmd/*` → all of them. Go's official module layout guide recommends `cmd/` for several programs and `internal/` for server code, and sets no rule for the inside of `internal/`.
+- **Transactions:** The batch row with its notifications and the idempotency key (K10, K12), and the rate-limit permit with the claim (K5), are each one transaction inside `postgres`, so no transaction has to cross packages.
+- **Opened when needed:** Packages such as `config`, `logging`, `mockprovider` and the test helper (K22) are created by the slice that first needs them, not up front.
+- **`migrations/` has its own `embed.go`:** `//go:embed` patterns cannot contain `..`, so the code that embeds the SQL files sits next to them.
+- **Also considered:** Packages by feature, such as `notification`, `batch`, `delivery` and `idempotency` (common in Go, but the batch and claim transactions cross those boundaries and would need a shared transaction mechanism), and the `golang-standards/project-layout` template (well known, but its own README says it is not an official standard of the Go team; `pkg/` signals a public library this project does not offer, and most of its directories would stay empty).
+- **How my decision changed:** The card I was first offered drew `service → postgres` as a dependency, which reads as an import. I reviewed it with OpenAI Codex and the Go module layout guide: with interfaces defined where they are used, `service` does not import `postgres`, and the entry points connect the two.
+- **What it costs:** The entry points in `cmd/` wire every implementation by hand. Moving packages after several slices means changing import paths. `service` may grow; it is then split into files, not into packages.
+- **How I will prove it:** `go build ./...` and `go vet ./...` pass, and `go list -deps` for `internal/service` and `internal/worker` does not include `internal/postgres`.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
