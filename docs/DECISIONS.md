@@ -276,6 +276,32 @@ I chose Testcontainers because the tests then run against a real PostgreSQL, fro
 - **What it costs:** `go test` needs Docker running. Each integration package spends a few seconds starting its container, and each test spends the time it takes to apply the migrations.
 - **How I will prove it (D6):** On a clean clone with Docker running, `go test -count=1 ./...` passes; a second run executes the tests again instead of printing `(cached)`; and a row written in one test is not visible in another.
 
+### K23 — Project layout: small packages by layer, with multi-table transactions inside `postgres`
+
+I chose a small set of packages split by layer, with every multi-table transaction closed inside the `postgres` package, because a small structure is enough for this case and keeps each transaction in one place.
+
+```
+cmd/{api,worker,migrate,mockprovider}/  entry points; they build and connect the parts
+internal/
+  domain/    notification types and the K11 validation (no database)
+  httpapi/   Huma operations and middleware (K16, K19, K21)
+  service/   create, batch, cancel, list and metrics rules
+  postgres/  all SQL and transactions (K17)
+  worker/    claim loop, sending, retry policy (K3, K5, K7)
+  provider/  provider HTTP client and profiles (K14)
+migrations/  SQL files and the embed.go that embeds them (K18)
+api/openapi.yaml
+```
+
+- **How the parts connect:** `service` and `worker` each define the small interfaces they need, and `postgres` implements them without importing either package; the entry points in `cmd/` connect them. The imports are therefore: `httpapi` → `service`; `service`, `worker` and `postgres` → `domain`; `worker` → `provider`; `cmd/*` → all of them. Go's official module layout guide recommends `cmd/` for several programs and `internal/` for server code, and sets no rule for the inside of `internal/`.
+- **Transactions:** The batch row with its notifications and the idempotency key (K10, K12), and the rate-limit permit with the claim (K5), are each one transaction inside `postgres`, so no transaction has to cross packages.
+- **Opened when needed:** Packages such as `config`, `logging`, `mockprovider` and the test helper (K22) are created by the slice that first needs them, not up front.
+- **`migrations/` has its own `embed.go`:** `//go:embed` patterns cannot contain `..`, so the code that embeds the SQL files sits next to them.
+- **Also considered:** Packages by feature, such as `notification`, `batch`, `delivery` and `idempotency` (common in Go, but the batch and claim transactions cross those boundaries and would need a shared transaction mechanism), and the `golang-standards/project-layout` template (well known, but its own README says it is not an official standard of the Go team; `pkg/` signals a public library this project does not offer, and most of its directories would stay empty).
+- **How my decision changed:** The card I was first offered drew `service → postgres` as a dependency, which reads as an import. I reviewed it with OpenAI Codex and the Go module layout guide: with interfaces defined where they are used, `service` does not import `postgres`, and the entry points connect the two.
+- **What it costs:** The entry points in `cmd/` wire every implementation by hand. Moving packages after several slices means changing import paths. `service` may grow; it is then split into files, not into packages.
+- **How I will prove it:** `go build ./...` and `go vet ./...` pass, and `go list -deps` for `internal/service` and `internal/worker` does not include `internal/postgres`.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
