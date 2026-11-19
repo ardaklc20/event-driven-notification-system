@@ -23,9 +23,9 @@ Every line is written so it can be tested. `docs/AI_USAGE.md` maps each ID to th
 |---|---|
 | R7 | Notifications are processed asynchronously by queue workers. API response time does not depend on the provider. |
 | R8 | At most 100 sends per second per channel (`sms`, `email` and `push` each have their own limit). This holds when measured under load. |
-| R9 | Higher-priority notifications are processed before lower-priority ones. |
+| R9 | Priority queue support with three levels: `high`, `normal` and `low`. The ordering rule between the levels is a design decision (K8 in `DECISIONS.md`). |
 | R10 | Required fields and per-channel character limits are validated. |
-| R11 | Duplicate requests or concurrent workers never cause a duplicate send. |
+| R11 | Idempotency support to prevent duplicate sends: a repeated API request with the same idempotency key does not create a new notification, and a notification has only one valid worker lease at a time. A retry after an unclear provider outcome can still send twice (K3 in `DECISIONS.md`). |
 
 ### Delivery & retry (left to the candidate's design)
 
