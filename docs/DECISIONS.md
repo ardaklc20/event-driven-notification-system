@@ -173,6 +173,17 @@ I chose a small Go mock as the Compose default because the project then starts w
 - **What it costs:** A third binary and a fourth Compose service. The mock behaves like no real provider (its latency is a setting), so the webhook.site check stays a manual step.
 - **How I will prove it (R13, R8):** R13 with the webhook.site check above; R8 with a load test against the mock that reads both the worker's send starts and the mock's arrivals.
 
+### K15 — Provider response: store `messageId` and `timestamp`
+
+I chose to store the provider's `messageId` and `timestamp` because they let me follow a notification into the provider's own records.
+
+- **How it works:** Two nullable columns, `provider_message_id` and `provider_timestamp`, are written in the same `lease_token`-conditioned update that sets `sent` (K3, K9). `sent_at` is the time we recorded the acceptance; `provider_timestamp` is the time the provider reported. The notification detail shows both.
+- **Not unique:** webhook.site's static response can give the same ID to many notifications, so the column has no `UNIQUE` constraint and is never used for deduplication.
+- **A `202` with a broken body:** The notification is still `sent`, because the provider accepted the request (`202 Accepted`, RFC 9110) and a second POST could send it twice. The invalid field stays empty, and a warning is logged with the correlation ID.
+- **Also considered:** Not storing the response (simplest, but nothing would link a notification to the provider's records) and a table with one row per attempt (the richest history and useful for B1, but one more write per attempt and more than the case asks for).
+- **What it costs:** Two columns and decoding the `202` body.
+- **How I will prove it (R13):** A `202` with a `messageId` fills both columns; a `202` with a broken body results in exactly one POST, the status `sent` and empty metadata; two notifications can store the same `messageId` without an error.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
