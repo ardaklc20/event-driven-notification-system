@@ -348,6 +348,20 @@ I chose an optional absolute `scheduled_at` because scheduling fits the existing
 - **What it costs:** A client whose clock runs behind can get `422` for a time it thinks is in the future; a client that wants immediate sending leaves the field out. Without an upper limit, a mistyped year is accepted and waits as a deferred notification until it is cancelled.
 - **How I will prove it (B2):** A notification scheduled a few seconds ahead is not claimed before its time and is claimed after it; a cancel before that time leaves no POST; a past time on a new request gets `422`; a repeat with the same key and content after the planned time returns the first response and creates nothing; the same key with a different `scheduled_at` gets `422`; batch items with different times are claimed in time order.
 
+### K27 — Distributed tracing (B5): OpenTelemetry over OTLP/HTTP, linked traces, Jaeger as an optional profile
+
+I chose OpenTelemetry with an OTLP/HTTP exporter and an optional Jaeger profile, limited at first to the API request, the worker attempt and the provider call, because those three are enough to follow a notification across the processes in the first version.
+
+- **Spans:** otelhttp (v0.72.0) creates a span for each API request and for each provider call. The create transaction stores the request's W3C trace context in a `traceparent` column. Each worker attempt starts its own span with a link to that stored context, and the provider call is a child of the attempt's span, so the `traceparent` header reaches the provider.
+- **Why a link:** OpenTelemetry's messaging conventions use links as the default connection between a producer and a consumer. As a child, a batch of 1,000 notifications, with every retry, would hang under one request's trace. The result is linked traces, not one trace.
+- **Switched on by configuration:** Tracing is off unless an OTLP endpoint is set (`OTEL_EXPORTER_OTLP_ENDPOINT`, which the exporter reads). Jaeger (`jaegertracing/jaeger:2.23.0`, in-memory storage, UI on port 16686) runs only with `docker compose --profile tracing up`, and the README shows how to point the services at it.
+- **Not in the first version:** Database spans (for example with otelpgx).
+- **Built:** after the core flow and its tests pass.
+- **Also considered:** The stdout exporter without a UI (no extra service, but the steps cannot be seen on a timeline) and correlation IDs with step durations in the logs only (no new dependency, but that is not distributed tracing).
+- **How my decision changed:** The card I was first offered promised a single Jaeger trace from the API through the worker to the provider while linking the worker's span instead of making it a child, ran Jaeger as a permanent Compose service and included database spans. I reviewed it with OpenAI Codex and researched OpenTelemetry's messaging conventions and the Jaeger setup: a link connects separate traces. I narrowed the first version to three spans, made Jaeger an optional profile and added a test that the flow completes while Jaeger is down.
+- **What it costs:** A `traceparent` column, and otelhttp is a pre-1.0 contrib module whose version is pinned. Following one notification means opening the request's trace and then the linked attempt traces.
+- **How I will prove it (B5):** With the SDK's in-memory exporter: an API request produces a span; a worker attempt's span links to the stored context; the request the provider receives (`httptest`) carries a `traceparent` from the attempt's trace. With an OTLP endpoint set and Jaeger stopped, a notification still reaches `sent`. The README shows the linked traces in Jaeger.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
