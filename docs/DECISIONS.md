@@ -261,6 +261,21 @@ I chose `log/slog` with a correlation ID stored on each notification because it 
 - **What it costs:** Every function that logs must receive the derived logger; a line written with the base logger has no ID. A migration adds the `correlation_id` column. A client can choose its own ID, within the validation rules.
 - **How I will prove it (R15):** An end-to-end test creates a notification with `X-Correlation-ID: test-123`, runs the worker against an `httptest` provider, and checks that the provider received the header and that the API and worker log lines carry the ID. Further tests: batch items share the ID with different `notification_id`s; a replay keeps the first ID and makes no new provider call; an invalid header gets a generated ID.
 
+## Tests and code layout
+
+### K22 — Test database: Testcontainers with the same PostgreSQL image as Compose
+
+I chose Testcontainers because the tests then run against a real PostgreSQL, from the same image Compose uses.
+
+- **How it works:** The PostgreSQL module of `testcontainers-go` (v0.45.0) starts a container from the Compose image once per integration test package, in `TestMain`. Each test gets its own database with the same embedded goose migrations applied (K18), and drops it with `t.Cleanup`. The container gets a random free host port and starts fresh on every run, so it neither collides with a local PostgreSQL nor reuses an old volume. Tests that need no database (validation, backoff, metric ratios) do not start one.
+- **Race tests:** The claim, cancel and idempotency races run with committed data and separate connections; a transaction rolled back at the end of a test could not show them. Each order of a race is set up with controlled steps instead of `sleep`: for example, one transaction holds the row lock while the test starts the other. The K9 test that runs cancel and claim together many times stays as an additional check.
+- **Template database later:** If applying the migrations to every test database turns out to be slow, I clone each test database from a migrated template instead (`CREATE DATABASE … TEMPLATE`).
+- **One command (D6):** `go test -count=1 ./...`, with Docker running. `-count=1` keeps `go test` from reporting a cached result: its cache checks only files and environment variables, not the database a test used.
+- **Also considered:** A separate test database in Compose with `make test` (familiar, but the single command becomes `make test`, a plain `go test` fails while the service is down, and a fixed host port brings back port collisions) and `embedded-postgres` (no Docker, but this project needs Docker anyway, and its PostgreSQL build comes from the library instead of the Compose image).
+- **How my decision changed:** The card I was first offered cloned every test database from a template from the start and left `go test`'s result cache unhandled. I reviewed it with OpenAI Codex and researched the Testcontainers PostgreSQL module and `go test`'s caching rules. I start with migrations per test database and add the template only if measurement calls for it, order race tests with controlled steps instead of `sleep`, and run the suite with `-count=1`.
+- **What it costs:** `go test` needs Docker running. Each integration package spends a few seconds starting its container, and each test spends the time it takes to apply the migrations.
+- **How I will prove it (D6):** On a clean clone with Docker running, `go test -count=1 ./...` passes; a second run executes the tests again instead of printing `(cached)`; and a row written in one test is not visible in another.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
