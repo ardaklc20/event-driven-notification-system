@@ -110,6 +110,19 @@ I chose five statuses and defined "pending" as `queued` because a notification t
 - **What it costs:** A crash after a claim uses up an attempt even if the provider never received the POST.
 - **How I will prove it (R5):** The rule under test is that no new POST goes out after a successful cancel. Cancelling a queued notification returns `200`, and no POST follows; cancelling a `processing`, `sent` or `failed` one returns `409`; a second cancel returns `200`; an unknown ID returns `404`. A race test runs cancel and claim at the same moment many times: every run ends either with a successful cancel and no new POST, or with a claim and a `409`, never both. A crash test stops a worker after its POST and checks that the attempt was counted.
 
+### K10 — Idempotency key: an optional `Idempotency-Key` header, one key per create request
+
+I chose an optional key sent by the client because only the client knows whether two identical requests are a retry or two notifications it really wants; two calls without a key are two separate requests.
+
+- **How it works:** A create request may carry an `Idempotency-Key` header. One key covers one request, so a batch has a single key. The key, a hash of the validated request and the first response are written in the same transaction as the notification or batch they create, in an `idempotency_keys` table whose primary key is the key.
+- **Repeats:** The same key with the same content creates nothing new; the API returns the first create response, with the same notification or batch ID, and the current status comes from `GET`. The same key with different content returns `422`, as the IETF `Idempotency-Key` draft (version 08, not yet an RFC) recommends.
+- **Concurrent repeats:** The key is written with `INSERT … ON CONFLICT (key) DO NOTHING RETURNING`. If a second request arrives while the first one's transaction is still open, PostgreSQL makes its insert wait for that transaction. When `RETURNING` comes back empty, a separate `SELECT` reads the stored response; under Read Committed that new statement sees the first transaction's committed row, so both calls get the same answer once the short first transaction ends.
+- **Retention and scope:** A key is kept as long as the record it created. There is no authentication (A1), so keys are global. The README states both, and that a production system would expire keys after a documented time and scope them per client.
+- **Also considered:** A required key (`400` without it; R11 would then hold for every request, but a reviewer's first call without the header fails, and the case does not ask for it) and deduplication by content hash within a time window (needs nothing from the client, but blocks legitimate repeats, and I have no data for the window).
+- **How my decision changed:** The card I was first offered answered a repeat with the notification's current state and did not say how a concurrent repeat reads the first request's result. I reviewed it with OpenAI Codex and researched PostgreSQL's Read Committed rules and the IETF draft. A repeat now returns the first create response while `GET` shows the current state, and an empty `RETURNING` is followed by a separate `SELECT`.
+- **What it costs:** A client that sends no key gets no protection against its own retries. Resending only part of a batch creates new notifications, because keys are per request, not per item. The table keeps one response body per key, up to the size of a 1000-item batch response.
+- **How I will prove it (R11, the first test in K3):** The same key with the same content returns the same ID and leaves one row; the same key with different content returns `422`; two calls without a key create two notifications; concurrent calls with the same key create one notification; a repeated batch returns the same batch ID without new rows.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
