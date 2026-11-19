@@ -48,6 +48,18 @@ I chose to take work back when a worker crashes and to retry temporary failures 
   3. *Unclear provider outcome:* the mock provider accepts the first request and delays its response; a retry happens and the second call is observed. This test shows where the guarantee ends.
 - **Decided in later cards:** K10 decides whether the idempotency key is required, whether a batch has one key or one per item, the response when the same key arrives with different content, and how long keys are kept; a content hash is one of the options there. K7 decides which errors are retried, how many times and with what backoff.
 
+### K5 — Rate limiter: one shared permit row per channel in PostgreSQL
+
+I chose a shared permit row per channel in PostgreSQL because every worker and every retry has to go through the same limit; otherwise adding workers would break the 100 messages per second per channel. I only want to bring in Redis if measurement shows that this row is the bottleneck.
+
+- **How it works:** The channel permit and the notification claim happen in one short transaction. The worker locks its channel's limiter row with `FOR UPDATE SKIP LOCKED`; if another worker holds it, the worker returns at once and tries again after a short wait. It reads the database clock (`clock_timestamp()`, the actual current time, not `now()`, which is the start of the transaction). If the permit time has not come, it leaves without taking any notification. If it has, it picks a due notification with `SKIP LOCKED`, writes the lease and the next permit time (10 ms later) together, commits and starts the HTTP call. If there is no work, the permit is not used up.
+- **Why the permit and the claim go together:** A notification that is only waiting for the limit stays `queued`, so it can still be cancelled (R5). If the cancel wins, no POST goes out; if the claim wins, the cancel is refused.
+- **How my decision changed:** The first design let each worker reserve the next free slot ahead of time and sleep until it. Workers that wake up late would then send back-to-back, so I changed it to grant a permit only when its time has come. Later I also moved the permit into the claim's transaction, for the reason above.
+- **Also considered:** Redis with the `redis_rate` library (a standard tool, but it adds a service and the library's last release is v10.0.1 from April 2023), a local limiter in each worker with the limit divided by the number of workers (breaks silently if the worker count changes without updating the setting), and one sending worker per channel chosen with an advisory lock (adding workers would add standby, not throughput).
+- **What it costs:** Every claim also updates its channel's limiter row, in the database that also holds the queue, and claims on one channel are taken one at a time. If the shared row turns out to be the bottleneck, the limiter sits behind an interface, so Redis can replace it.
+- **Still open:** How many HTTP calls are kept in flight. I set it by measurement in the worker slice: at an average provider latency of 200 ms, 100 requests per second need about 20 calls in flight per channel, summed across all workers.
+- **How I will prove it (R8, N2):** Permits spaced 10 ms apart do not by themselves prove that the real HTTP sends are spaced the same way. So I measure the actual send start times per channel in a sliding 1-second window, with two or more workers, a full queue and retry traffic, and check that no window holds more than 100.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
