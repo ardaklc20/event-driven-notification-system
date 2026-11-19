@@ -400,6 +400,17 @@ I chose a liveness endpoint and a readiness endpoint because they let me measure
 - **What it costs:** The worker's health is visible only indirectly, through K3's recovery and K20's metrics.
 - **How I will prove it (R16):** Through the real router: with the database reachable, both endpoints return `200`; with the database unreachable, `/healthz` returns `200` and `/readyz` returns `503`; after shutdown starts, `/readyz` returns `503`. In Compose, `docker compose ps` shows the API as healthy.
 
+### K31 — Image (D3): a multi-stage build on a distroless, non-root image
+
+I chose a multi-stage build with a distroless, non-root runtime image because the project has to start with one command, and one small image runs all four programs.
+
+- **How it works:** The build stage, `golang:1.27.4-trixie`, downloads the modules in their own layer and compiles `api`, `worker`, `migrate` and `mockprovider` with `CGO_ENABLED=0`; pgx and `coder/websocket` are pure Go, so the binaries are static. The runtime stage, `gcr.io/distroless/static-debian13:nonroot`, holds only those binaries. It includes CA certificates, which the HTTPS calls to webhook.site need (K14), and tzdata, and it has no shell or package manager. Both images are published for `linux/amd64` and `linux/arm64`, so the same Dockerfile builds on an Apple Silicon Mac and on GitHub's runners.
+- **No fixed entry point:** Four programs run from the same image, so `/app/api` is not the image's `ENTRYPOINT`; each Compose service chooses its program with `command`.
+- **A health check without a shell:** The image has no `curl`, so the API binary has a `healthcheck` subcommand that calls the local `/readyz` with a time limit and exits with 0 or 1. It needs only the listening port, not the API's full configuration. Compose runs it as `["CMD", "/app/api", "healthcheck"]`, which needs no shell.
+- **Also considered:** An Alpine runtime image (`wget` and a shell make health checks and debugging easy, but a shell and a package manager stay in an image that never needs them, and the non-root user has to be created by hand) and a single-stage `golang` image (the simplest Dockerfile, but the whole toolchain and the source stay in the runtime image, which is hundreds of megabytes larger and runs as root by default).
+- **What it costs:** There is no shell for `docker exec`; debugging uses the `:debug-nonroot` tag temporarily.
+- **How I will prove it (D3):** On a clean clone, `docker compose up` starts every service; `docker compose ps` shows the API as healthy; `docker inspect` shows a non-root user; and the K14 webhook.site check proves that HTTPS works from the image.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
