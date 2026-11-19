@@ -302,6 +302,23 @@ api/openapi.yaml
 - **What it costs:** The entry points in `cmd/` wire every implementation by hand. Moving packages after several slices means changing import paths. `service` may grow; it is then split into files, not into packages.
 - **How I will prove it:** `go build ./...` and `go vet ./...` pass, and `go list -deps` for `internal/service` and `internal/worker` does not include `internal/postgres`.
 
+## Real-time updates, scheduling and tracing
+
+### K24 — Real-time status events (B4): PostgreSQL `LISTEN/NOTIFY`
+
+I chose PostgreSQL `LISTEN/NOTIFY` because a status change is published only when its transaction commits, so I need neither a separate broker nor a second write step to the API.
+
+- **How it works:** A trigger added by a migration (K18) calls `pg_notify('notification_status', …)` whenever a notification's `status` changes, with the notification and batch IDs, the status, `attempts` and a `version`. The trigger catches every path that changes a status: the claim, the result, a cancel and lease recovery. PostgreSQL delivers a notification only if its transaction commits, in commit order, and the payload stays far below its 8000-byte limit.
+- **Ordering with `version`:** Every status update increments a `version` column. Row locks serialize the updates to one row, so `version` always grows. A timestamp from `now()` does not guarantee that: a transaction can start earlier, wait for the row lock and write an older `updated_at`.
+- **Listener:** The API keeps one connection out of its pool (pgxpool `Hijack`) that runs `LISTEN`, waits in `WaitForNotification` and passes each event to the subscribers of that notification or batch.
+- **A snapshot without gaps:** A new subscriber is registered first and its events are buffered; then the current state is read from the database and sent; then only events with a higher `version` than the snapshot are passed on. This follows the order the `LISTEN` documentation gives: listen first, then read the state.
+- **When the listener drops:** PostgreSQL does not replay notifications sent while a session was not listening. If the listener connection drops, the API closes the affected WebSockets, and a client that reconnects gets a fresh snapshot.
+- **Built:** after scheduled notifications (K26), together with K25.
+- **Also considered:** Polling the database for subscribed notifications (simple, but the delay equals the polling interval, and a "changed since" query on `updated_at` can skip a change that commits late with an older timestamp) and a separate channel such as Redis pub/sub or HTTP from the worker to the API (a new service or a new coupling, and the status write and the event become two steps that can disagree).
+- **How my decision changed:** The card I was first offered said that a connected client would miss no events, compared events by `updated_at`, and left open the order of subscribing and reading the snapshot. I reviewed it with OpenAI Codex and researched PostgreSQL's `LISTEN` and `NOTIFY` documentation: notifications are not replayed, and `now()` timestamps are not guaranteed to grow per row. I removed the claim, added the `version` column and fixed the order: subscribe and buffer, read the snapshot, pass newer events.
+- **What it costs:** Delivery to a WebSocket is best effort. A slow client is disconnected (K25), events held in the API's memory are lost if it crashes, and a reconnect brings the current state, not the missed events. If PostgreSQL's notification queue fills up, the commits that call `NOTIFY` fail; the documentation puts the queue at 8 GB and notes that a long transaction in a listening session blocks its cleanup, so the listener never opens a transaction. The API holds one more database connection.
+- **How I will prove it (B4):** Tests against a real PostgreSQL (K22): a committed status change reaches the listener and a rolled-back one does not; an update committed while a snapshot is being read is not lost; events older than the snapshot are dropped by `version`; when the listener connection is cut, the affected WebSockets are closed.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
