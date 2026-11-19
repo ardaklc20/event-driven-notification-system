@@ -14,7 +14,7 @@ Every line is written so it can be tested. `docs/AI_USAGE.md` maps each ID to th
 | R2 | Create a batch of 1–1000 notifications in one request. A request with more than 1000 items is rejected with a 4xx status. The response returns a batch ID. |
 | R3 | Query a notification's status by its ID. |
 | R4 | Query by batch ID: return the statuses of the notifications in that batch. |
-| R5 | Cancel a notification that has not been sent yet. A cancelled notification is never sent. |
+| R5 | A pending notification can be cancelled. A successful cancel stops any new send attempt. |
 | R6 | List notifications filtered by status, channel and date range (filters combine), with pagination. |
 
 ### Processing engine
