@@ -83,6 +83,18 @@ I chose to retry only temporary failures, a limited number of times and further 
 - **Also considered:** A fixed interval without classifying errors (simple, but it retries permanent errors and sends retries in waves), a per-channel circuit breaker now (it belongs to the Failure Handling bonus, B1, which comes after the core), and pausing a whole channel when a `429` carries `Retry-After` (also left for B1; all three channels share one provider URL, so the scope of the provider's limit has to be checked first).
 - **How I will prove it:** With the mock provider: `503` then `202` ends as sent; `400` stops after one attempt; a `Retry-After` is respected; the attempt limit is reached and the notification ends as `failed`; the same `429` response is handled differently under the webhook.site and mock profiles.
 
+## Processing rules
+
+### K8 — Priority: strict order within each channel
+
+I chose strict priority within each channel because the case asks for a priority queue with three levels, and a worker that always takes the highest ready level first is a rule I can state and test directly. Each channel has its own rate limit, so a low-priority SMS never uses capacity that a high-priority email needs; priority only has to decide the order inside a channel.
+
+- **How it works:** Within one channel, a worker claims from the notifications that are ready (their `available_at` has passed) and not held by another worker, in the order `high → normal → low`. Within a level, the earliest `available_at` goes first, and the notification ID breaks ties. This is the ordering of the K5 claim query (`ORDER BY priority, available_at, id LIMIT 1 FOR UPDATE SKIP LOCKED`), backed by a partial index on `(channel, priority, available_at, id)` for queued rows. I check with `EXPLAIN` that the index serves this order.
+- **What it guarantees:** The order in which workers take work. Calls to the provider run in parallel, so the order in which they reach the provider or finish can differ.
+- **Also considered:** Aging, where a notification that has waited long enough moves up a level (no starvation, but a `low` can then go before a fresh `high`, and I have no data for the threshold), and weighted shares such as 6:3:1 (no starvation, but a `low` is sent while a `high` waits, and a test can only check ratios, not order).
+- **What it costs:** `low` can starve: it waits whenever higher-priority work fills the channel's actual capacity, and that capacity can be below 100 per second, for example when provider latency limits how many sends finish. The metrics show queue depth and the age of the oldest waiting notification per priority, so starvation is visible. If it shows up, aging can be added as a periodic update without changing the index.
+- **How I will prove it (R9):** On one channel, I queue 50 `low` and then 50 `high` notifications, run one worker with one call in flight, and check that every `high` is claimed before any `low`; within a level, claims follow `available_at`.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
