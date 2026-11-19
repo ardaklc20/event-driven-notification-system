@@ -1,0 +1,24 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go test coverage
+coverage.*
+*.coverprofile
+
+# Local environment (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Claude Code local settings (machine-specific permissions)
+.claude/settings.local.json
