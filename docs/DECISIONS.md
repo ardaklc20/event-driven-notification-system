@@ -195,6 +195,16 @@ I chose the standard library's `net/http` router because its `ServeMux` covers e
 - **What it costs:** I write the three or four middleware functions myself.
 - **How I will prove it:** Tests send requests through the real router instead of calling handlers directly: path parameters reach the handler, an unknown path returns `404`, and a known path with the wrong method returns `405` with an `Allow` header.
 
+### K17 — Database access: pgx with plain SQL in the repository
+
+I chose pgx with plain SQL in the repository because the correctness of the claim, the limiter, cancellation and idempotency depends on SQL conditions and transaction boundaries, and I want to see those queries directly.
+
+- **How it works:** `pgxpool` is the connection pool. Every query is a SQL constant in the repository layer, run with numbered parameters (`$1`, `$2`, …); values are never concatenated into SQL. Transactions use `BeginTx`, `Commit` and a deferred `Rollback`.
+- **Batches (K12):** The first version writes a batch with one parameterized multi-row `INSERT`. The protocol counts a statement's parameters in a 16-bit field, and 1,000 items need about 6,000 parameters, well below that limit. If `CopyFrom` is used later, it is called on the transaction (`tx.CopyFrom`), not on the pool, so the batch row, its notifications and the K10 key with the first response stay in one transaction. The `202` is returned only after the commit.
+- **Also considered:** sqlc (the SQL stays mine and the scanning code is generated, but it adds a code generation step, and optional filters such as K13's are awkward) and GORM (closest to my SQLAlchemy experience, but the queue, limiter and idempotency queries would mostly end up as raw SQL anyway).
+- **What it costs:** I write the row scanning myself, and each query needs its own test so that a column order mistake is caught.
+- **How I will prove it:** Repository tests against a real PostgreSQL (K22), one per query, and a test that a batch whose insert fails leaves no batch row, no notifications and no idempotency key behind.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
