@@ -60,6 +60,16 @@ I chose a shared permit row per channel in PostgreSQL because every worker and e
 - **Still open:** How many HTTP calls are kept in flight. I set it by measurement in the worker slice: at an average provider latency of 200 ms, 100 requests per second need about 20 calls in flight per channel, summed across all workers.
 - **How I will prove it (R8, N2):** Permits spaced 10 ms apart do not by themselves prove that the real HTTP sends are spaced the same way. So I measure the actual send start times per channel in a sliding 1-second window, with two or more workers, a full queue and retry traffic, and check that no window holds more than 100.
 
+### K6 — Process layout: the API and the worker run as separate processes from one Go module
+
+I chose to run the API and the worker as separate processes because I want to add workers without adding API instances: `docker compose up --scale worker=2`.
+
+- **How it works:** One Go module with two entry points (`cmd/api` and `cmd/worker`); the business logic under `internal/` is shared. One Docker image holds both binaries.
+- **Startup order:** PostgreSQL is healthy → the migration step finishes successfully → the API and the worker start. In Compose this is `depends_on` with `condition: service_healthy` and `condition: service_completed_successfully`. Compose on its own only waits until a container is running, not until it is ready.
+- **Shutdown:** On `SIGTERM` the worker stops claiming new work and gives the calls already in flight a shutdown budget of 10 seconds, enough for the HTTP call and writing its result. Compose's `stop_grace_period` is set to 15 seconds, above that budget; by default Compose kills the container 10 seconds after `SIGTERM`. If a worker crashes instead, the lease recovery from K3 takes the work back.
+- **Also considered:** One process running both the API and the workers (scaling it also scales the API, and two copies cannot bind the same host port) and one binary that picks its role from a flag (the same split, plus an all-in-one mode the case does not ask for).
+- **What it costs:** Two entry points and a separate migration step in Compose.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
