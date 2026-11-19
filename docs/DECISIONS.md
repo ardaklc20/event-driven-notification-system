@@ -205,6 +205,17 @@ I chose pgx with plain SQL in the repository because the correctness of the clai
 - **What it costs:** I write the row scanning myself, and each query needs its own test so that a column order mistake is caught.
 - **How I will prove it:** Repository tests against a real PostgreSQL (K22), one per query, and a test that a batch whose insert fails leaves no batch row, no notifications and no idempotency key behind.
 
+### K18 — Migrations: goose with SQL files embedded in the binary
+
+I chose goose with SQL files embedded in the binary because one migration file with its Up and Down sections works like an Alembic revision, and the application and the tests can run the same files.
+
+- **How it works:** Each migration is one SQL file with `-- +goose Up` and `-- +goose Down` sections, embedded with `embed.FS`. A small `cmd/migrate` creates a provider with `goose.NewProvider` and runs `Up(ctx)`. The provider keeps no package-level state, so the tests can run the same embedded files against their own database. The `*sql.DB` it needs comes from pgx's `stdlib` package. In Compose, the one-off migration service runs `migrate up` from the same image, and the API and the worker start only after it completes successfully (K6).
+- **When a migration fails:** goose runs each migration in its own transaction by default, so the failing file is rolled back while the files applied before it stay applied. The migration service exits with an error, and the API and the worker do not start.
+- **Also considered:** golang-migrate (common, with an official Docker image, but two files per migration and a "dirty" state after a failure that needs a manual `force`) and Atlas (a declarative schema with generated migrations, but a new tool and workflow for a small project, and its default binaries are under a commercial agreement).
+- **How my decision changed:** The card I was first offered set goose up with its global settings (`SetBaseFS`, `SetDialect`) and said that a failed migration would not leave the schema half-done. I reviewed it with OpenAI Codex and researched goose's Provider API and its transaction behaviour. I switched to `NewProvider`, which has no global state, and recorded the real failure behaviour: only the failing file is rolled back.
+- **What it costs:** A third binary in the image. A failure in the middle of a run leaves the earlier migrations in place, and the next run continues from there.
+- **How I will prove it (D5):** On a clean database the migrations build the schema; a second run changes nothing; and with a broken migration the migration service fails, and the API and the worker do not start.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
