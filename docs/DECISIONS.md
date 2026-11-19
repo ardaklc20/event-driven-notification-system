@@ -411,6 +411,20 @@ I chose a multi-stage build with a distroless, non-root runtime image because th
 - **What it costs:** There is no shell for `docker exec`; debugging uses the `:debug-nonroot` tag temporarily.
 - **How I will prove it (D3):** On a clean clone, `docker compose up` starts every service; `docker compose ps` shows the API as healthy; `docker inspect` shows a non-root user; and the K14 webhook.site check proves that HTTPS works from the image.
 
+### K32 — Configuration: typed environment variables with `caarlos0/env`
+
+I chose `caarlos0/env` because, with this many durations, numbers and profile settings, a shared, ready-made parser is simpler, and it keeps a service from starting with invalid settings.
+
+- **How it works:** `internal/config` has one struct per program (the API and the worker), read with `env.Parse` (v11.4.2). Fields are declared with tags such as `env:"NAME"` and `envDefault:"…"`, and the library parses `time.Duration` values such as `5s`. All parse errors come back together (`AggregateError`), so one start shows every problem, and a program with invalid settings exits at startup with that list.
+- **Mandatory values:** `required` checks only that a variable exists, and `notEmpty` checks that its value is not empty, so a mandatory field such as `DATABASE_URL` uses both and has no default.
+- **`Validate()`:** It checks what tags cannot: the provider profile is `standard` or `webhook_site_free` (K7, K14); no channel limit exceeds 100 per second (R8); and the lease duration covers the HTTP timeout plus the budget for writing the result (K3, K9).
+- **Not read here:** The `OTEL_*` variables are read by the OpenTelemetry SDK itself (K27).
+- **Documentation:** The README lists every variable with its default, and Compose sets its values explicitly.
+- **Also considered:** The standard library with `os.LookupEnv` and small typed helpers (no dependency, in line with K16, but I would rewrite the parsing and error collection the library already has) and `spf13/viper` (support for files and flags this project does not use, with many indirect dependencies).
+- **How my decision changed:** The card I was first offered relied on `required` alone for mandatory values. I reviewed it with OpenAI Codex and read the library's v11.4.2 source: `required` accepts a variable that is set to an empty string, so mandatory fields now also use `notEmpty`. I also added the channel limit and lease checks to `Validate()`.
+- **What it costs:** One more dependency.
+- **How I will prove it:** Table tests that give the parser their own variables through `Options.Environment`: defaults are applied; a missing and an empty `DATABASE_URL` are both rejected; several errors appear in one result; and an unknown profile, a channel limit above 100 and a lease shorter than the timeout plus the result budget are rejected.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
