@@ -184,6 +184,17 @@ I chose to store the provider's `messageId` and `timestamp` because they let me 
 - **What it costs:** Two columns and decoding the `202` body.
 - **How I will prove it (R13):** A `202` with a `messageId` fills both columns; a `202` with a broken body results in exactly one POST, the status `sent` and empty metadata; two notifications can store the same `messageId` without an error.
 
+## Tooling
+
+### K16 — HTTP router: the standard library's `net/http`
+
+I chose the standard library's `net/http` router because its `ServeMux` covers every method and path pattern this API needs, so the project needs no router dependency.
+
+- **How it works:** Routes use Go 1.22 patterns such as `GET /notifications/{id}`, and handlers read parameters with `r.PathValue("id")`. Correlation IDs (R15), request logging and panic recovery are ordinary `func(http.Handler) http.Handler` middleware around the mux. The `http.Server` sets its timeouts and shuts down as described in K6.
+- **Also considered:** chi (compatible with `http.Handler` and ships ready middleware, but since Go 1.22 the standard router covers what this API needs) and Gin (popular, but its handlers use its own `*gin.Context`, which ties the middleware, the tests and the OpenAPI layer to Gin).
+- **What it costs:** I write the three or four middleware functions myself.
+- **How I will prove it:** Tests send requests through the real router instead of calling handlers directly: path parameters reach the handler, an unknown path returns `404`, and a known path with the wrong method returns `405` with an `Allow` header.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
