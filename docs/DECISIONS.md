@@ -159,6 +159,20 @@ I chose `created_at` with a cursor because every notification has a creation tim
 - **What it costs:** A client cannot jump to a given page; it can only move forward. There is no total count unless I add one as a separate query.
 - **How I will prove it (R6):** Each filter alone and combined; the range edges (`from` included, `to` excluded); with new notifications inserted between page reads, every notification that existed before the first page appears exactly once; a malformed cursor returns `400`.
 
+### K14 — Provider: a small Go mock by default, webhook.site as a separate profile
+
+I chose a small Go mock as the Compose default because the project then starts with one command and no URL setup, and load tests can run without webhook.site's request quota and seven-day lifetime.
+
+- **How it works:** The worker reads two settings: `PROVIDER_URL`, and `PROVIDER_PROFILE` (`standard` or `webhook_site_free`), which decides how a `429` is handled (K7). All channels use the one URL (A2). Compose starts a fourth service, `mockprovider` (`cmd/mockprovider`, in the same module and image), and points the worker at it with the `standard` profile.
+- **The mock:** It answers `POST /` with `202` and `{messageId, status: "accepted", timestamp}` in the case's shape, with a new UUID each time, after a configurable delay; a malformed body gets `400`. It records when each request arrives, per channel, and `GET /stats` reports the counts and the highest number of arrivals in any sliding one-second window.
+- **Two measurements, reported separately:** The mock measures when requests arrive at the provider; K5 measures when the worker starts each send. The R8 report shows both, with retries counted.
+- **Deterministic scenarios:** `503` then `202`, a delayed response (the third R11 test in K3) and a `429` under each profile are built inside the tests with Go's `net/http/httptest`, not with a random failure rate in the mock.
+- **webhook.site integration check:** To prove the integration the case asks for, I send a synthetic notification through the same worker to a webhook.site URL I created, with the `webhook_site_free` profile, and check the `POST` body webhook.site received, its `202` response and the final status in the API. The README gives the setup steps and the result of this check. Load tests run only against the mock, because a free URL's quota and lifetime are limited.
+- **Also considered:** Sending straight to webhook.site from Compose (closest to the case's wording, but every reviewer would first have to create and configure a URL, and the 100-request quota rules out load tests) and WireMock with JSON mappings (it can return delays, scripted scenarios and random UUIDs, but it brings a Java-based image and its own mapping language for something a small service in the same module can do).
+- **How my decision changed:** The card I was first offered presented the mock's `/stats` as the proof of R8 and drove failure scenarios through a random failure rate in the mock. I reviewed it with OpenAI Codex and researched the K5 measurement plan and Go's `httptest`. The mock measures arrivals, not send starts, so the two are now reported separately; the failure scenarios are deterministic tests; and I added the check against my own webhook.site URL.
+- **What it costs:** A third binary and a fourth Compose service. The mock behaves like no real provider (its latency is a setting), so the webhook.site check stays a manual step.
+- **How I will prove it (R13, R8):** R13 with the webhook.site check above; R8 with a load test against the mock that reads both the worker's send starts and the mock's arrivals.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
