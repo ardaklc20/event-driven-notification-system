@@ -374,6 +374,17 @@ I chose golangci-lint's `standard` set plus `bodyclose` and `noctx` because both
 - **What it costs:** One more tool, pinned to the same version on my machine and in CI. A false positive is silenced on its own line with a `//nolint:<linter>` comment that gives the reason.
 - **How I will prove it:** `golangci-lint run` passes at every slice gate and in CI.
 
+### K29 — CI (B6): a GitHub Actions pipeline for lint, tests, the OpenAPI check and the Docker build
+
+I chose a CI pipeline without image publishing because the case describes this bonus as an automated testing and linting pipeline, and publishing an image to GHCR would be an extra delivery step.
+
+- **How it works:** On every pull request and every push to `main`, one workflow runs golangci-lint (K28, through its v9 action after `actions/setup-go`), `go test -count=1 -race ./...`, the OpenAPI check (K19: regenerate the document and fail if `api/openapi.yaml` differs) and `docker build`. GitHub's Ubuntu runners come with Docker, so the Testcontainers tests (K22) run there.
+- **What `-race` covers:** The race detector finds data races in Go memory. The claim, cancel and idempotency races in the database are proved by the PostgreSQL tests (K22), not by `-race`.
+- **Built:** with the first working slice, so every pull request after it shows a CI result (K4).
+- **Also considered:** CI plus publishing the image to GitHub Container Registry on every merge to `main` (the option I was recommended: a verifiable delivery step that needs only `GITHUB_TOKEN` with `packages: write`) and CI plus deployment to a hosted environment (a cloud account, secrets, a managed PostgreSQL and possible costs, none of which the case asks for).
+- **What it costs:** The bonus is titled "CI/CD", and this pipeline has no delivery step; the README says so, and that Compose builds the image locally. Adding a publishing job later takes about 10 minutes.
+- **How I will prove it (B6):** The workflow runs on the pull request that adds it and on every pull request after that, and its result is visible on each one.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
