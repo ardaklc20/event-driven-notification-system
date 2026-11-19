@@ -136,6 +136,18 @@ I chose to validate every request at the API, with the same rules for single and
 - **What it costs:** A 160-character SMS with Turkish characters would take three segments at a real carrier, because the limit does not count segments. The README lists this.
 - **How I will prove it (R10):** Table-driven tests on the validation function, with no database: each channel's limit at the edge (for `sms`, 160 passes and 161 fails), a message with Turkish characters counted in code points, an invalid E.164 number, an email with a display name, an empty field, an unknown channel, and a missing `priority` saved as `normal`.
 
+### K12 — Batches: all or nothing, with mixed channels and priorities
+
+I chose all-or-nothing batches because a client can then fix the items the error lists and resend the same batch, and one idempotency key always stands for one fully saved batch.
+
+- **How it works:** `POST /notifications/batch` takes `{"notifications": [ … ]}` with 1 to 1,000 items, and each item has its own channel and priority. Every item goes through the K11 validation, and all errors are collected. If any item is invalid, the answer is `422` with each error's item index and field, and nothing is saved. Otherwise one transaction writes the batch row, all its notifications and the K10 key with the first `202` response, which holds the batch ID and the notification IDs in request order.
+- **Limits:** Two separate published limits: the number of items (1 to 1,000, from the case) and the request body size (16 MiB by default, configurable, enforced with Go's `http.MaxBytesReader` and answered with `413`). The body limit is not derived from the content limits: in escaped JSON a single emoji can take 12 bytes (`😀`), so a worst-case figure would be far too large. As a result, a batch of large items can get `413` with fewer than 1,000 items.
+- **Batch status (R4):** `GET /batches/{id}` returns the counts per status for the whole batch and a paginated list of its notifications, with the K13 pagination.
+- **Also considered:** Saving the valid items and listing the rejected ones (friendlier at first, but resending the whole batch would create the accepted items again, because a key covers a request, not an item) and one channel and priority per batch (simpler validation, but a campaign on several channels must be split into several requests, and the batch item schema would differ from the single-notification schema).
+- **How my decision changed:** The card I was first offered derived the body limit from the content limits, at about 41 MB. I reviewed it with OpenAI Codex and researched JSON escaping: one emoji can take 12 bytes, so the estimate did not hold. I replaced it with a separate body limit of 16 MiB.
+- **What it costs:** One invalid item stops the whole batch. Some large batches are refused with `413` before they reach 1,000 items.
+- **How I will prove it (R2, R4):** Three separate tests: 1,000 valid items are saved while 0 or 1,001 are refused; a batch with one invalid item returns `422` with that item's index and writes no rows; a body over the limit returns `413`. A further test checks the R4 counts for a batch with mixed statuses.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
