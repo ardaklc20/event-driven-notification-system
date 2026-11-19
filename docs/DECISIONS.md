@@ -216,6 +216,18 @@ I chose goose with SQL files embedded in the binary because one migration file w
 - **What it costs:** A third binary in the image. A failure in the middle of a run leaves the earlier migrations in place, and the next run continues from there.
 - **How I will prove it (D5):** On a clean database the migrations build the schema; a second run changes nothing; and with a broken migration the migration service fails, and the API and the worker do not start.
 
+### K19 — OpenAPI: generated from the code with Huma on the standard library router
+
+I chose Huma because it generates the OpenAPI 3.1 document from the routes and Go types, the way FastAPI does from Pydantic models, so the document cannot drift from the code.
+
+- **How it works:** Huma runs on the K16 `ServeMux` through its `humago` adapter. Operations are registered with Go input and output types, and errors use RFC 9457 problem details. The document is exported to `api/openapi.yaml` and committed, and a check fails if the committed file differs from the one the code generates.
+- **Fitting the earlier decisions:** The create operations set `DefaultStatus: 202`. A repeated request (K10) gets the stored first response as `Body []byte`, which Huma writes without serializing it again; a raw byte body does not describe itself, so these operations declare their JSON response schema explicitly. The batch operation sets `MaxBodyBytes` to the K12 body limit (16 MiB) instead of Huma's default of 1 MiB. K11's channel rules run through Huma's `Resolver` interface.
+- **Malformed JSON:** Huma v2.41.0 copies the raw request body into its error details when the JSON cannot be parsed. Our error responses remove that value, so a request body is never echoed back.
+- **Also considered:** writing `openapi.yaml` by hand and generating code with oapi-codegen (a reviewable contract first, but about 300 lines of YAML to write and generated code to explain) and swag comments (the stable version produces Swagger 2.0, and the comments can drift from the code).
+- **How my decision changed:** The card I was first offered left open whether Huma could return the stored K10 response unchanged, and it did not notice that Huma echoes a malformed body in its errors. I reviewed it with OpenAI Codex and researched Huma's response outputs and its v2.41.0 source. `Body []byte` bypasses serialization, so the K10 design holds; I added removing the echoed body and declaring the response schema explicitly.
+- **What it costs:** The handlers are tied to Huma's signatures; the service and repository layers are not. Responses returned as raw bytes have to be described by hand in the document.
+- **How I will prove it (D4, K10–K12):** Four tests through the real route: malformed JSON returns `400` (K11) without the body in the error; a field error returns `422`; a body over the limit returns `413`; and a repeat with the same key returns the first `202` body byte for byte. A separate check keeps `api/openapi.yaml` up to date.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
