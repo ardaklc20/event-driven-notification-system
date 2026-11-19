@@ -362,6 +362,18 @@ I chose OpenTelemetry with an OTLP/HTTP exporter and an optional Jaeger profile,
 - **What it costs:** A `traceparent` column, and otelhttp is a pre-1.0 contrib module whose version is pinned. Following one notification means opening the request's trace and then the linked attempt traces.
 - **How I will prove it (B5):** With the SDK's in-memory exporter: an API request produces a span; a worker attempt's span links to the stored context; the request the provider receives (`httptest`) carries a `traceparent` from the attempt's trace. With an OTLP endpoint set and Jaeger stopped, a notification still reaches `sent`. The README shows the linked traces in Jaeger.
 
+## Lint and CI
+
+### K28 — Linter: golangci-lint's standard set plus `bodyclose` and `noctx`
+
+I chose golangci-lint's `standard` set plus `bodyclose` and `noctx` because both extra linters catch problems this project can actually have: a provider response body left open, and HTTP calls not bounded by a context.
+
+- **How it works:** `.golangci.yml` has `version: "2"` and `linters.default: standard` (errcheck, govet, ineffassign, staticcheck and unused), enables `bodyclose` and `noctx`, and uses `goimports` as the formatter; goimports also applies gofmt's formatting. `golangci-lint run` reports lint and formatting problems without changing files, and `golangci-lint fmt` formats the code. The same version, v2.15.0, is pinned locally and in CI.
+- **Built:** with the first working slice. Every slice gate runs `golangci-lint run`.
+- **Also considered:** `go vet`, `staticcheck` and `gofmt -l` as three separate commands (staticcheck is already in the standard set, and errcheck, which catches ignored errors, would be missing) and only `go vet` with `gofmt` (too thin for a linting pipeline).
+- **What it costs:** One more tool, pinned to the same version on my machine and in CI. A false positive is silenced on its own line with a `//nolint:<linter>` comment that gives the reason.
+- **How I will prove it:** `golangci-lint run` passes at every slice gate and in CI.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
