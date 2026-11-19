@@ -333,6 +333,21 @@ I chose `coder/websocket` because it integrates with `net/http` and supports con
 - **What it costs:** A client that follows several notifications opens several connections. The goroutines of each connection must end when it closes; a mistake there leaks them.
 - **How I will prove it (B4):** With `httptest.Server` and the library's client: connect, receive the snapshot, change a status, receive the update; a client that stops reading is disconnected without delaying another subscriber; an unknown ID gets `404`; on shutdown, open connections receive a close frame; no goroutines remain after the tests.
 
+### K26 — Scheduled notifications (B2): an optional absolute `scheduled_at`
+
+I chose an optional absolute `scheduled_at` because scheduling fits the existing queue directly: it only sets a notification's first `available_at`.
+
+- **How it works:** Single and batch requests accept an optional `scheduled_at`, an RFC 3339 time with the offset RFC 3339 requires, normalized to UTC. It is stored in its own column and sets the first `available_at`. A retry changes only `available_at`, so the planned time is kept. Cancellation (K9), priority (K8) and the rate limit (K5) work as for any queued notification, and K20 counts scheduled notifications that are still waiting as `deferred`.
+- **Validation order:** A new request with a time in the past gets `422`. The idempotency key (K10) is checked first, so a repeat with the same key and content returns the first response even after the planned time has passed. The order is: field validation, the request hash, the key, and only for a new key the time rule.
+- **No upper limit:** The case sets no scheduling horizon, so the first version has none.
+- **Latency (K20):** Once scheduled notifications exist, the metrics show two distributions, each with its sample count: `created_at → sent_at` for notifications sent immediately and `scheduled_at → sent_at` for scheduled ones. A deliberately planned wait does not enter the p99 of immediate notifications.
+- **What it guarantees:** A notification is not sent before its planned time. After that, it waits for its channel's capacity and its priority like any other.
+- **Built:** before the WebSocket updates (K24, K25).
+- **Also considered:** A relative `delay_seconds` (no time zones, but campaigns are planned at absolute times, and the delay depends on when the request arrives) and a separate table with a scheduler process that moves due notifications into the queue (a third long-running process and a new failure mode, while the queue already has `available_at`).
+- **How my decision changed:** The card I was first offered accepted times up to 60 seconds in the past, capped scheduling at 30 days, ran the time rule before the idempotency key and measured all latency from `coalesce(scheduled_at, created_at)`. I reviewed it with OpenAI Codex and traced the K10 flow: a repeat arriving after the planned time would have been rejected with `422`, so the key is now checked first. Past times are rejected outright, the cap is gone, and latency is split into two distributions.
+- **What it costs:** A client whose clock runs behind can get `422` for a time it thinks is in the future; a client that wants immediate sending leaves the field out. Without an upper limit, a mistyped year is accepted and waits as a deferred notification until it is cancelled.
+- **How I will prove it (B2):** A notification scheduled a few seconds ahead is not claimed before its time and is claimed after it; a cancel before that time leaves no POST; a past time on a new request gets `422`; a repeat with the same key and content after the planned time returns the first response and creates nothing; the same key with a different `scheduled_at` gets `422`; batch items with different times are claimed in time order.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
