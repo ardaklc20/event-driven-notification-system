@@ -70,6 +70,19 @@ I chose to run the API and the worker as separate processes because I want to ad
 - **Also considered:** One process running both the API and the workers (scaling it also scales the API, and two copies cannot bind the same host port) and one binary that picks its role from a flag (the same split, plus an all-in-one mode the case does not ask for).
 - **What it costs:** Two entry points and a separate migration step in Compose.
 
+### K7 — Retry policy: retry by error type, exponential backoff with jitter, five attempts in total
+
+I chose to retry only temporary failures, a limited number of times and further apart each time, because the case asks for failed deliveries to be retried intelligently: a permanent error should stop at once, and a quota that waiting cannot reopen should not use up attempts.
+
+- **Retried:** temporary network errors, timeouts, `408`, `500`, `502`, `503`, `504` and a temporary `429`. If the response carries a valid `Retry-After`, the next attempt is not sent before that time.
+- **Not retried:** permanent errors such as `400` or `501`; the notification fails after one attempt.
+- **webhook.site's quota:** webhook.site documents a `429` on a free URL only for a used-up request quota (and, on paid plans, for a URL blocked under fair use), and its response does not say which case it is. Waiting does not reopen the quota, so `429` handling depends on the provider profile, configured together with the provider URL (K14). With the free webhook.site profile the case uses, a `429` stops automatic retries at once. With the mock profile and any other provider profile, a `429` is temporary: it gets the bounded retries, and a valid `Retry-After` is respected.
+- **Schedule:** Five attempts in total, the first one included, and a 5-second HTTP timeout. The n-th retry waits a random time between 0 and min(60 s, 2 s × 2^(n−1)) (full jitter). The 60-second cap belongs only to our own backoff: if a valid `Retry-After` asks for longer, the next attempt waits until that time. All values come from environment variables. The retry time is written to `available_at` in PostgreSQL, so a waiting retry holds no worker and survives a crash, and every new POST goes through the K5 limiter. The lease from K3 covers the timeout and writing the result.
+- **How my decision changed:** The first version retried every `429` the same way, so a used-up webhook.site quota would have spent all five attempts; I changed it so the provider profile decides. I also revised the list of retried status codes during review: I left out `408` and `500` at first and then added them back, because the HTTP standard allows a `408` request to be repeated and a `500` can be temporary.
+- **What `failed` means:** When the attempts run out, the notification is marked `failed` with its last error. That does not prove it was never delivered: an earlier attempt may have timed out after the provider had already accepted it (K3).
+- **Also considered:** A fixed interval without classifying errors (simple, but it retries permanent errors and sends retries in waves), a per-channel circuit breaker now (it belongs to the Failure Handling bonus, B1, which comes after the core), and pausing a whole channel when a `429` carries `Retry-After` (also left for B1; all three channels share one provider URL, so the scope of the provider's limit has to be checked first).
+- **How I will prove it:** With the mock provider: `503` then `202` ends as sent; `400` stops after one attempt; a `Retry-After` is respected; the attempt limit is reached and the notification ends as `failed`; the same `429` response is handled differently under the webhook.site and mock profiles.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
