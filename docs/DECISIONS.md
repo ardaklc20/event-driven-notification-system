@@ -385,6 +385,21 @@ I chose a CI pipeline without image publishing because the case describes this b
 - **What it costs:** The bonus is titled "CI/CD", and this pipeline has no delivery step; the README says so, and that Compose builds the image locally. Adding a publishing job later takes about 10 minutes.
 - **How I will prove it (B6):** The workflow runs on the pull request that adds it and on every pull request after that, and its result is visible on each one.
 
+## Health, image and configuration
+
+### K30 — Health checks (R16): `/healthz` for liveness, `/readyz` for readiness
+
+I chose a liveness endpoint and a readiness endpoint because they let me measure the API's health, and I left the provider out because the API keeps queueing notifications while webhook.site is down.
+
+- **How it works:** Both are Huma operations, so they appear in the OpenAPI document (D4). `GET /healthz` checks no dependency and returns `200` whenever the API can answer. `GET /readyz` pings PostgreSQL with a short time limit and returns `200` with the result of each check, or `503` naming the failing check when the database cannot be reached; it also returns `503` once shutdown has started (K6). Health requests are logged at debug level (K21), so a check every few seconds does not flood the logs.
+- **Why the provider is not checked:** The API never calls the provider (R7). While webhook.site is down, the API can still accept and queue notifications.
+- **In Compose:** The `api` service's health check calls `/readyz` through the `healthcheck` command described in K31. Docker does not restart a container because it turns unhealthy; the status shows in `docker compose ps` and in `depends_on` conditions.
+- **The worker:** It has no health endpoint. If it crashes, lease recovery (K3) takes its work back; if it stalls, the K20 metrics show the queue growing and `processing` notifications piling up.
+- **Why this entry came late:** While reviewing the decisions against the requirements, I found that R16 had no decision. The PostgreSQL health check in Compose (K6) is not an API endpoint.
+- **Also considered:** A single `/health` that checks the database (it matches the case's wording, but a liveness check that depends on the database can get a healthy process restarted) and worker heartbeats written to PostgreSQL and shown in `/readyz` (a view of the whole system, but R16 does not ask for it, and zero workers cannot be a reason for `503`, because the queue keeps accepting work).
+- **What it costs:** The worker's health is visible only indirectly, through K3's recovery and K20's metrics.
+- **How I will prove it (R16):** Through the real router: with the database reachable, both endpoints return `200`; with the database unreachable, `/healthz` returns `200` and `/readyz` returns `503`; after shutdown starts, `/readyz` returns `503`. In Compose, `docker compose ps` shows the API as healthy.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
