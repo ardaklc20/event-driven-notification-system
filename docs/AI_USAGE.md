@@ -1,0 +1,91 @@
+# AI Usage
+
+*Türkçe sürüm aşağıda — [Türkçe](#yapay-zekâ-kullanımı).*
+
+I built this project with an AI coding assistant on purpose: the role is AI-assisted engineering. This file shows how. It covers what the AI produced, how I checked it, and what I rejected or corrected. Every entry is a real event, written down while the work happened.
+
+## 1. Workflow
+
+- **Assistant:** Claude Code (desktop app), model Claude Opus 5.5.
+- **Method:** a workflow I defined and packaged as a Claude Code skill: the AI turns the brief into testable requirements, lays out each design decision as options with their consequences, and writes code in small, explained pieces; I choose, defend and verify.
+
+| Step | What happens | Output |
+|---|---|---|
+| 1. Requirements | The AI turns the case PDF into numbered, testable requirements. I review them, ask for re-checks, and approve. | [`REQUIREMENTS.md`](REQUIREMENTS.md) |
+| 2. Decisions | For each design question the AI lays out options with consequences (code, testing, failure modes, reversibility). I pick one and write the reason in my own words. | [`DECISIONS.md`](DECISIONS.md) |
+| 3. Plan | Spec → plan → tasks, as vertical slices: core first, bonus features after. | *(planning tool not chosen yet)* |
+| 4. Build | The AI writes code one small piece at a time and explains each piece. Before a slice is committed, I explain why it is built the way it is, and I make every commit myself. Each slice lives on its own branch and is merged through a pull request with a merge commit. | Commits and pull requests |
+| 5. Verify | Behaviour is measured with tests and scripts, not by reading code (see section 4). | Test and script output |
+
+## 2. Decisions
+
+The AI proposes; I decide. Every decision, with its reason and its cost, is in [`DECISIONS.md`](DECISIONS.md).
+
+## 3. Slice log
+
+| Slice | What the AI produced | How it was verified | What was rejected or changed, and why |
+|---|---|---|---|
+| Setup | Install commands and environment checks | `go version` → go1.27.4; `docker version` → 29.9.3 (linux/arm64); `docker compose version` and `docker-compose version` → v5.7.0 | Container runtime: the AI first recommended Colima; changed to Docker Desktop (see section 5) |
+
+## 4. Requirement → evidence
+
+Each requirement gets one command that proves it by running it.
+
+| ID | Evidence (command) | Status |
+|---|---|---|
+| R1–R16, N1–N3 | — | Pending; filled as slices are built |
+
+## 5. Rejected or corrected AI output
+
+1. **Design choices disguised as assumptions.** The first requirements list did two things wrong. It stated two design choices as assumptions: per-channel recipient format validation, and filtering dates on `created_at`. It also put design choices into the requirements themselves: status counts for batches, a 409 on cancel, strict priority order, validation at the API, and a "never sent twice" guarantee. I had the AI re-check its assumptions against the case text and moved all of these to the list of open decisions.
+2. **Overstated certainty.** The AI labelled "a notification is never sent to the provider twice" as certain. That cannot be guaranteed: if the provider receives a request but the response times out, we cannot know whether it was delivered. I had the AI re-check every claim it had marked as certain, and that check exposed this one. I narrowed the requirement to duplicate requests and concurrent workers and made the delivery guarantee an explicit decision.
+3. **A number from the wrong source stated as fact.** The AI wrote that a free webhook.site URL accepts "at most 50 requests". That figure came from the pricing page; the documentation (updated 2026-11-07) says 100. I corrected it and set a rule for the project: when sources conflict, the official documentation wins.
+4. **Wrong decision criterion.** For the local container runtime, the AI recommended Colima mainly because it was the option the AI could install by itself, without administrator rights. I rejected that criterion: manual setup steps are mine to do, so options are judged on their merits only. Docker Desktop was chosen ([K0](DECISIONS.md)).
+5. **A prediction disproved by measurement.** The AI predicted (labelled "likely") that the Homebrew install of Docker Desktop would not provide the hyphenated `docker-compose` command that the case uses. After installation, `docker-compose version` returned v5.7.0, so the prediction was wrong. No extra package was needed.
+6. **Decisions recorded without an owner.** The AI wrote the decision log as impersonal fields ("Decision / Why"), which hid who made each choice and on what grounds. I required every entry to state in the first person what I chose and my own reason for it, and had the log rewritten that way before the first pull request was merged.
+
+---
+
+# Yapay Zekâ Kullanımı
+
+Bu projeyi bilerek bir yapay zekâ kodlama asistanıyla geliştirdim: rol, yapay zekâ destekli mühendislik. Bu dosya bunu nasıl yaptığımı gösteriyor: yapay zekânın ne ürettiğini, benim bunu nasıl doğruladığımı ve neyi reddettiğimi ya da düzelttiğimi. Her kayıt gerçekten yaşanmış bir olaydır ve iş sürerken yazılmıştır.
+
+## 1. İş akışı
+
+- **Asistan:** Claude Code (masaüstü uygulaması), model Claude Opus 5.5.
+- **Yöntem:** Kendi tanımladığım ve bir Claude Code skill'i olarak paketlediğim bir iş akışı: yapay zekâ case metnini test edilebilir gereksinimlere çevirir, her tasarım kararını sonuçlarıyla birlikte seçenekler halinde sunar ve kodu küçük, açıklanmış parçalar halinde yazar; seçen, savunan ve doğrulayan benim.
+
+| Adım | Ne olur | Çıktı |
+|---|---|---|
+| 1. Gereksinimler | Yapay zekâ case PDF'ini numaralı, test edilebilir gereksinimlere çevirir. Ben okurum, yeniden kontrol isterim ve onaylarım. | [`REQUIREMENTS.md`](REQUIREMENTS.md) |
+| 2. Kararlar | Yapay zekâ her tasarım sorusu için seçenekleri sonuçlarıyla birlikte sunar: koda etkisi, test, olası arızalar, geri dönüş maliyeti. Birini seçerim ve gerekçemi kendi cümlemle yazarım. | [`DECISIONS.md`](DECISIONS.md) |
+| 3. Plan | Spec → plan → görevler, dikey dilimler halinde: önce çekirdek, sonra bonuslar. | *(planlama aracı henüz seçilmedi)* |
+| 4. Yapım | Yapay zekâ kodu küçük parçalar halinde yazar ve her parçayı açıklar. Bir dilim commit'lenmeden önce neden o şekilde kurulduğunu ben açıklarım; her commit'i kendim atarım. Her dilim kendi branch'inde yapılır ve bir pull request üzerinden merge commit ile birleştirilir. | Commit'ler ve pull request'ler |
+| 5. Doğrulama | Davranış kod okunarak değil, testler ve script'lerle ölçülerek doğrulanır (bkz. bölüm 4). | Test ve script çıktıları |
+
+## 2. Kararlar
+
+Yapay zekâ önerir, ben karar veririm. Her kararın gerekçesi ve bedeli [`DECISIONS.md`](DECISIONS.md)'de.
+
+## 3. Dilim günlüğü
+
+| Dilim | Yapay zekâ ne üretti | Nasıl doğrulandı | Ne reddedildi ya da değişti, neden |
+|---|---|---|---|
+| Kurulum | Kurulum komutları ve ortam kontrolleri | `go version` → go1.27.4; `docker version` → 29.9.3 (linux/arm64); `docker compose version` ve `docker-compose version` → v5.7.0 | Konteyner çalıştırıcısı: yapay zekâ önce Colima önerdi; Docker Desktop'a geçildi (bkz. bölüm 5) |
+
+## 4. Gereksinim → kanıt
+
+Her gereksinim için, çalıştırınca o gereksinimi kanıtlayan tek bir komut olacak.
+
+| ID | Kanıt (komut) | Durum |
+|---|---|---|
+| R1–R16, N1–N3 | — | Bekliyor; dilimler yapıldıkça doldurulacak |
+
+## 5. Reddedilen ya da düzeltilen yapay zekâ çıktıları
+
+1. **Varsayım gibi sunulan tasarım kararları.** İlk gereksinim listesinde iki hata vardı. İki tasarım tercihi varsayım gibi yazılmıştı: alıcı formatının kanala göre doğrulanması ve tarih filtresinin `created_at` üzerinde çalışması. Ayrıca gereksinimlerin içine tasarım tercihleri yerleştirilmişti: batch için durum sayıları, iptalde 409, katı öncelik sırası, doğrulamanın API'de yapılması ve "asla iki kez gönderilmez" garantisi. Yapay zekâya varsayımlarını case metnine karşı yeniden kontrol ettirdim ve bunların hepsini açık kararlar listesine taşıdım.
+2. **Abartılmış kesinlik.** Yapay zekâ "bir bildirim provider'a asla iki kez gönderilmez" ifadesini kesin olarak etiketlemişti. Bu garanti edilemez: provider isteği alır ama yanıt zaman aşımına uğrarsa, mesajın gidip gitmediğini bilemeyiz. Yapay zekâya kesin diye işaretlediği her iddiayı yeniden kontrol ettirdim; bu kontrol bu hatayı ortaya çıkardı. Gereksinimi tekrar eden istekler ve aynı anda çalışan worker'larla sınırladım ve teslim garantisini ayrı bir karar haline getirdim.
+3. **Yanlış kaynaktan gelen sayının kesin bilgi gibi yazılması.** Yapay zekâ ücretsiz webhook.site URL'sinin "en fazla 50 istek" aldığını yazdı. Bu sayı fiyat sayfasından geliyordu; doküman (2026-11-07'de güncellenmiş) 100 diyor. Düzelttim ve proje için bir kural koydum: kaynaklar çeliştiğinde resmi doküman esas alınır.
+4. **Yanlış karar ölçütü.** Yerel konteyner çalıştırıcısı için yapay zekâ, Colima'yı esas olarak yönetici yetkisi gerektirmeden kendisinin kurabildiği seçenek olduğu için önerdi. Bu ölçütü reddettim: elle yapılacak kurulum adımları bana ait, seçenekler yalnızca kendi değerine göre tartılır. Docker Desktop seçildi ([K0](DECISIONS.md)).
+5. **Ölçümle çürüyen bir tahmin.** Yapay zekâ, Docker Desktop'ın Homebrew kurulumunun case'te kullanılan tireli `docker-compose` komutunu getirmeyeceğini tahmin etti ("muhtemel" etiketiyle). Kurulumdan sonra `docker-compose version` v5.7.0 döndü; tahmin yanlıştı ve ek paket gerekmedi.
+6. **Sahibi belli olmayan karar kayıtları.** Yapay zekâ karar kaydını kişisiz alanlar halinde yazdı ("Decision / Why"); bu, her seçimi kimin hangi gerekçeyle yaptığını gizliyordu. Her kaydın birinci tekil şahısla, neyi seçtiğimi ve kendi gerekçemi söylemesini şart koştum ve kaydı ilk PR birleşmeden önce bu şekilde yeniden yazdırdım.
