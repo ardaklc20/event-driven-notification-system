@@ -2,11 +2,12 @@
 
 *Türkçe sürüm aşağıda — [Türkçe](#yapay-zekâ-kullanımı).*
 
-I built this project with an AI coding assistant on purpose: the role is AI-assisted engineering. This file shows how. It covers what the AI produced, how I checked it, and what I rejected or corrected. Every entry is a real event, written down while the work happened.
+I built this project with AI assistants on purpose: the role is AI-assisted engineering. This file shows how. It covers what the AI produced, how I checked it, and what I rejected or corrected. Every entry is a real event, written down while the work happened.
 
 ## 1. Workflow
 
 - **Assistant:** Claude Code (desktop app), model Claude Opus 5.5.
+- **Second reviewer:** OpenAI Codex. I give it Claude's decision cards to review and decide on its findings.
 - **Method:** a workflow I defined and packaged as a Claude Code skill: the AI turns the brief into testable requirements, lays out each design decision as options with their consequences, and writes code in small, explained pieces; I choose, defend and verify.
 
 | Step | What happens | Output |
@@ -43,16 +44,18 @@ Each requirement gets one command that proves it by running it.
 4. **Wrong decision criterion.** For the local container runtime, the AI recommended Colima mainly because it was the option the AI could install by itself, without administrator rights. I rejected that criterion: manual setup steps are mine to do, so options are judged on their merits only. Docker Desktop was chosen ([K0](DECISIONS.md)).
 5. **A prediction disproved by measurement.** The AI predicted (labelled "likely") that the Homebrew install of Docker Desktop would not provide the hyphenated `docker-compose` command that the case uses. After installation, `docker-compose version` returned v5.7.0, so the prediction was wrong. No extra package was needed.
 6. **Decisions recorded without an owner.** The AI wrote the decision log as impersonal fields ("Decision / Why"), which hid who made each choice and on what grounds. I required every entry to state in the first person what I chose and my own reason for it, and had the log rewritten that way before the first pull request was merged.
+7. **An unfair comparison and an unproven capacity claim.** In the queue decision card (K2), Claude warned that River's job state and my notification state could drift apart, but it left out that River can complete a job in the same transaction as my own updates (`JobCompleteTx`). The same card said PostgreSQL "easily" carries 300 messages per second. I gave the card to OpenAI Codex for review. Its findings: the River comparison was unfair, and 3 × 100 = 300 is only the ceiling for sends to the provider, which proves neither the request rate during a campaign nor PostgreSQL's capacity. I had `JobCompleteTx` checked in River's documentation, kept the PostgreSQL table as the queue, recorded River fairly as a close second, and replaced the capacity claim with measurements ([K2](DECISIONS.md)). My later review rounds produced two more fixes: the entry's first wording, "two workers never take the same row", contradicted taking a row back after its lease expires (found by Codex), so I changed it to one valid lease at a time; and K1's comparison mentioned `LISTEN/NOTIFY`, which no decision used (found by Claude), so I removed it, since the first version polls.
 
 ---
 
 # Yapay Zekâ Kullanımı
 
-Bu projeyi bilerek bir yapay zekâ kodlama asistanıyla geliştirdim: rol, yapay zekâ destekli mühendislik. Bu dosya bunu nasıl yaptığımı gösteriyor: yapay zekânın ne ürettiğini, benim bunu nasıl doğruladığımı ve neyi reddettiğimi ya da düzelttiğimi. Her kayıt gerçekten yaşanmış bir olaydır ve iş sürerken yazılmıştır.
+Bu projeyi bilerek yapay zekâ asistanlarıyla geliştirdim: rol, yapay zekâ destekli mühendislik. Bu dosya bunu nasıl yaptığımı gösteriyor: yapay zekânın ne ürettiğini, benim bunu nasıl doğruladığımı ve neyi reddettiğimi ya da düzelttiğimi. Her kayıt gerçekten yaşanmış bir olaydır ve iş sürerken yazılmıştır.
 
 ## 1. İş akışı
 
 - **Asistan:** Claude Code (masaüstü uygulaması), model Claude Opus 5.5.
+- **İkinci gözden geçirici:** OpenAI Codex. Claude'un karar kartlarını ona inceletir, bulgularına göre karar veririm.
 - **Yöntem:** Kendi tanımladığım ve bir Claude Code skill'i olarak paketlediğim bir iş akışı: yapay zekâ case metnini test edilebilir gereksinimlere çevirir, her tasarım kararını sonuçlarıyla birlikte seçenekler halinde sunar ve kodu küçük, açıklanmış parçalar halinde yazar; seçen, savunan ve doğrulayan benim.
 
 | Adım | Ne olur | Çıktı |
@@ -89,3 +92,4 @@ Her gereksinim için, çalıştırınca o gereksinimi kanıtlayan tek bir komut 
 4. **Yanlış karar ölçütü.** Yerel konteyner çalıştırıcısı için yapay zekâ, Colima'yı esas olarak yönetici yetkisi gerektirmeden kendisinin kurabildiği seçenek olduğu için önerdi. Bu ölçütü reddettim: elle yapılacak kurulum adımları bana ait, seçenekler yalnızca kendi değerine göre tartılır. Docker Desktop seçildi ([K0](DECISIONS.md)).
 5. **Ölçümle çürüyen bir tahmin.** Yapay zekâ, Docker Desktop'ın Homebrew kurulumunun case'te kullanılan tireli `docker-compose` komutunu getirmeyeceğini tahmin etti ("muhtemel" etiketiyle). Kurulumdan sonra `docker-compose version` v5.7.0 döndü; tahmin yanlıştı ve ek paket gerekmedi.
 6. **Sahibi belli olmayan karar kayıtları.** Yapay zekâ karar kaydını kişisiz alanlar halinde yazdı ("Decision / Why"); bu, her seçimi kimin hangi gerekçeyle yaptığını gizliyordu. Her kaydın birinci tekil şahısla, neyi seçtiğimi ve kendi gerekçemi söylemesini şart koştum ve kaydı ilk PR birleşmeden önce bu şekilde yeniden yazdırdım.
+7. **Haksız bir karşılaştırma ve kanıtsız bir kapasite iddiası.** Kuyruk kararı kartında (K2) Claude, River'ın iş durumu ile benim bildirim durumumun birbirinden ayrışabileceği uyarısını yaptı; ama River'ın bir işi benim güncellemelerimle aynı transaction'da tamamlayabildiğini (`JobCompleteTx`) atladı. Aynı kart PostgreSQL'in saniyede 300 mesajı "rahat taşıdığını" söyledi. Kartı incelemesi için OpenAI Codex'e verdim. Bulguları: River karşılaştırması haksızdı; 3 × 100 = 300 ise yalnızca provider'a gönderimin tavanıdır ve ne kampanya anındaki istek hızını ne de PostgreSQL'in kapasitesini kanıtlar. `JobCompleteTx`'i River dokümanından kontrol ettirdim, PostgreSQL tablosunu kuyruk olarak tuttum, River'ı yakın ikinci olarak adil biçimde kaydettim ve kapasite iddiasının yerine ölçüm koydum ([K2](DECISIONS.md)). Sonraki inceleme turlarımdan iki düzeltme daha çıktı: kaydın ilk ifadesindeki "iki worker asla aynı satırı almaz" cümlesi, lease'i dolan satırın geri alınmasıyla çelişiyordu (Codex buldu), bu yüzden ifadeyi aynı anda tek geçerli lease olarak değiştirdim; K1'deki karşılaştırma hiçbir kararın kullanmadığı `LISTEN/NOTIFY`'dan söz ediyordu (Claude buldu), ilk sürüm polling kullandığı için o notu çıkardım.
