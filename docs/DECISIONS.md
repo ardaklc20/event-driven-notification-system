@@ -425,6 +425,22 @@ I chose `caarlos0/env` because, with this many durations, numbers and profile se
 - **What it costs:** One more dependency.
 - **How I will prove it:** Table tests that give the parser their own variables through `Options.Environment`: defaults are applied; a missing and an empty `DATABASE_URL` are both rejected; several errors appear in one result; and an unknown profile, a channel limit above 100 and a lease shorter than the timeout plus the result budget are rejected.
 
+## Templates and failure handling
+
+### K33 — Templates (B3): immutable stored templates with `{{name}}` placeholders, rendered at the API
+
+I chose immutable stored templates with `{{name}}` placeholders, rendered at the API, because I want template support solved in the API, so that the worker keeps sending content that is already final.
+
+- **Templates:** `POST /templates` takes `{name, channel, body}` and returns `201`; `GET /templates/{id}` and `GET /templates` read them. A template cannot be changed or deleted in the first version; a changed message is a new template. The placeholder syntax is checked when a template is created: names match `[A-Za-z_][A-Za-z0-9_]*`, and malformed syntax gets `422`.
+- **Using a template:** A create request carries either `content` or `template_id` with `variables`; both or neither get `422`, and so does a template whose channel differs from the request's. Missing or extra variables get `422`.
+- **Rendering:** The API renders the content in one pass and applies the channel's character limit (K11) while rendering. Values are inserted as they are; a `{{x}}` inside a value is not rendered again. PostgreSQL stores the rendered `content` and the `template_id`; the worker sends that content, and a retry uses the same content.
+- **Idempotency (K10):** The request hash includes the normalized `template_id` and variables. A repeat with the same key and content returns the stored first response, and the template is rendered only when a new notification is saved. Templates cannot change, so the same template and variables always stand for the same content.
+- **Batches (K12):** Batch items use templates the same way. If any item's rendered content is invalid, the whole batch is rejected with that item's index.
+- **Also considered:** Go's `text/template` (conditions and loops, and `missingkey=error` stops on a missing variable, but a client's template becomes a small program, its errors are Go-specific, and the case asks only for variable substitution) and a template sent inside each request (nothing to store, but nothing is reused either, so it is hardly a template system).
+- **How my decision changed:** The card I was first offered also stored the variables of each notification. I reviewed it with OpenAI Codex: because templates cannot change, the rendered content and the template ID are enough, so the variables are not stored.
+- **What it costs:** Templates accumulate, because a change means a new template. Conditional or repeated content would need a different syntax.
+- **How I will prove it (B3):** Table tests: placeholders are replaced; missing, extra and channel-mismatched variables get `422`; rendered content over the channel limit gets `422`; a `{{x}}` inside a value is left as it is. API tests: a batch with one invalid rendered item writes nothing; a repeat with the same key and variables returns the first response.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
