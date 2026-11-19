@@ -148,6 +148,17 @@ I chose all-or-nothing batches because a client can then fix the items the error
 - **What it costs:** One invalid item stops the whole batch. Some large batches are refused with `413` before they reach 1,000 items.
 - **How I will prove it (R2, R4):** Three separate tests: 1,000 valid items are saved while 0 or 1,001 are refused; a batch with one invalid item returns `422` with that item's index and writes no rows; a body over the limit returns `413`. A further test checks the R4 counts for a batch with mixed statuses.
 
+### K13 — Listing: filter dates on `created_at`, paginate with a `(created_at, id)` cursor
+
+I chose `created_at` with a cursor because every notification has a creation time that never changes, and a cursor keeps new notifications from shifting the pages.
+
+- **How it works:** `GET /notifications` takes optional `status`, `channel`, `from` and `to` filters, combined with AND, and a `limit` (50 by default, at most 200). The date range is half-open: `from` is included and `to` is not, and both are RFC 3339 timestamps. Results come newest first, ordered by `created_at DESC, id DESC`. The response carries a `next_cursor` built from the last returned row's `created_at` and `id` at full timestamp precision, and the next page reads the rows below it: `WHERE (created_at, id) < (cursor values)`.
+- **What it guarantees:** New notifications do not shift the pages, as they would with offset pagination. The pages are not one snapshot, though: each page is a separate query that sees the data committed when it starts. A notification whose `status` changes between two pages can move into or out of a filtered result, and a notification whose transaction commits after a page has already passed its `created_at` does not appear on later pages.
+- **Indexes:** `(created_at DESC, id DESC)`. Filtered queries are checked with `EXPLAIN`, and `(channel, status, created_at, id)` is added only if they need it.
+- **Also considered:** Offset pagination with `page` and `page_size` (familiar and able to return a total, but new notifications shift the pages, and deep offsets still read the rows they skip) and letting the client choose the date field from `created_at`, `sent_at` and `updated_at` (flexible for reports, but `sent_at` stays empty until a notification is sent, so filtering on it silently hides the rest, and each field needs its own index).
+- **What it costs:** A client cannot jump to a given page; it can only move forward. There is no total count unless I add one as a separate query.
+- **How I will prove it (R6):** Each filter alone and combined; the range edges (`from` included, `to` excluded); with new notifications inserted between page reads, every notification that existed before the first page appears exactly once; a malformed cursor returns `400`.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
