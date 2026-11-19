@@ -319,6 +319,20 @@ I chose PostgreSQL `LISTEN/NOTIFY` because a status change is published only whe
 - **What it costs:** Delivery to a WebSocket is best effort. A slow client is disconnected (K25), events held in the API's memory are lost if it crashes, and a reconnect brings the current state, not the missed events. If PostgreSQL's notification queue fills up, the commits that call `NOTIFY` fail; the documentation puts the queue at 8 GB and notes that a long transaction in a listening session blocks its cleanup, so the listener never opens a transaction. The API holds one more database connection.
 - **How I will prove it (B4):** Tests against a real PostgreSQL (K22): a committed status change reaches the listener and a rolled-back one does not; an update committed while a snapshot is being read is not lost; events older than the snapshot are dropped by `version`; when the listener connection is cut, the affected WebSockets are closed.
 
+### K25 — WebSocket endpoint (B4): `coder/websocket`, one notification or batch per connection
+
+I chose `coder/websocket` because it integrates with `net/http` and supports context-bound writes and control-frame handling for server-pushed updates.
+
+- **Endpoints:** `GET /ws/notifications/{id}` and `GET /ws/batches/{id}` are plain handlers on the K16 `ServeMux`, not Huma operations. OpenAPI 3.1 does not describe WebSocket APIs, so the README documents the messages. An unknown ID gets `404` before the upgrade.
+- **Messages:** Only the server sends. The first message is the current state (one notification, or every notification in the batch); each later message is an update: `{notification_id, batch_id, status, attempts, version, updated_at}`.
+- **One writer per connection:** Each connection has one writer with a bounded queue and a time limit on every write. If a slow client's queue fills, its connection is closed, so other subscribers never wait for it.
+- **Control frames:** The client sends no application messages, but the connection is still read with `CloseRead`, which answers ping, pong and close frames; the library handles control frames only while a connection is being read.
+- **Shutdown:** `http.Server.Shutdown` neither closes nor waits for hijacked connections such as WebSockets. A function registered with `RegisterOnShutdown` starts closing them with a "going away" status, and the API waits for them with its own time limit inside the K6 shutdown budget.
+- **Also considered:** `gorilla/websocket` (the most widely used, but its last release was in June 2024, it has no context support, and only one goroutine may write to a connection at a time) and `golang.org/x/net/websocket` (its own documentation points to more actively maintained packages).
+- **How my decision changed:** The card I was first offered never read the connection, so control frames would not have been handled, and it did not say that `Shutdown` leaves WebSockets open. I reviewed it with OpenAI Codex and researched the `coder/websocket` and `net/http` documentation and source. I added `CloseRead`, one writer with a write time limit, and closing the connections through `RegisterOnShutdown` with a separate wait.
+- **What it costs:** A client that follows several notifications opens several connections. The goroutines of each connection must end when it closes; a mistake there leaks them.
+- **How I will prove it (B4):** With `httptest.Server` and the library's client: connect, receive the snapshot, change a status, receive the update; a client that stops reading is disconnected without delaying another subscriber; an unknown ID gets `404`; on shutdown, open connections receive a close frame; no goroutines remain after the tests.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
