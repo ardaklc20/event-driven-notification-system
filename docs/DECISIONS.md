@@ -33,6 +33,21 @@ I chose to use the `notifications` table itself as the queue because every requi
 - **What it costs:** I write and test crash recovery (the lease and taking the row back) myself; River would have given me that. It is hard to reverse: the queue logic is at the centre of the worker and the repository, so moving to a broker would take an estimated 3–4 hours.
 - **How I will prove it:** 3 channels × 100 messages per second = 300 is only the ceiling for sends to the provider. It says nothing about the request rate during a campaign or about PostgreSQL's capacity, so I claim no capacity number. Instead, with two workers, a real PostgreSQL and a local provider, I measure the per-channel limit, the race between cancel and claim, and taking work back after a worker crash.
 
+### K3 — Delivery guarantee: at-least-once, with crash recovery and bounded retries
+
+I chose to take work back when a worker crashes and to retry temporary failures a limited number of times, because the case puts reliable delivery and intelligent retries first. A repeated API request with the same idempotency key must not create a second notification, so I deduplicate repeated requests in the database. When the provider's outcome is unclear, I accept the risk of a duplicate send in order to keep delivering.
+
+- **Where a duplicate can still happen:** Whenever the provider may have processed a request but the outcome is unclear, a retry can become a second send. Two examples: the provider accepts the request but its response is lost, or the worker receives `202` and crashes before writing the result to PostgreSQL. A `500` or `504` response does not prove that the provider did nothing either. A `202` only means the provider accepted the request, and webhook.site documents no deduplication (for example by an `Idempotency-Key` header); it records every request it receives.
+- **Lease token:** Every claim gets a new `lease_token`, and every status update after the send is conditioned on it, so a worker whose lease has expired cannot overwrite the result written by the worker that took the job back. The lease covers the HTTP call and writing its result.
+- **How my decision changed:** The option I was first offered said the provider would deduplicate retries by an `Idempotency-Key` header. While deciding, I had the card reviewed, saw that webhook.site documents no such deduplication, and changed the decision to say openly when a duplicate is possible. I also turned the entry's first "only in two cases" into examples, because a `500` or `504` does not prove the provider did nothing.
+- **Also considered:** At-most-once (no duplicates, but after an unclear failure the notification may never be sent) and a hybrid that parks unclear outcomes in an `unknown` status (no automatic duplicate, but those notifications wait for someone to review them).
+- **What it costs:** A duplicate send is possible whenever the outcome is unclear. The README states this as a known limit instead of claiming exactly-once delivery.
+- **How I will prove it (R11):** Three separate tests.
+  1. *API repeat:* the same idempotency key with the same content returns the existing notification.
+  2. *Worker race:* a notification has only one valid lease at a time, and a worker whose lease has expired cannot overwrite the state of the job another worker has taken back.
+  3. *Unclear provider outcome:* the mock provider accepts the first request and delays its response; a retry happens and the second call is observed. This test shows where the guarantee ends.
+- **Decided in later cards:** K10 decides whether the idempotency key is required, whether a batch has one key or one per item, the response when the same key arrives with different content, and how long keys are kept; a content hash is one of the options there. K7 decides which errors are retried, how many times and with what backoff.
+
 ## Process
 
 ### K4 — Git workflow: one branch and pull request per slice, merged with a merge commit
