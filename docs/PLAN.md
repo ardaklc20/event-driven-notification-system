@@ -45,7 +45,7 @@ Every slice passes all of these before its pull request is merged.
 
 | # | Slice | Scope | Requirements | Decisions | Depends on | Branch | Status |
 |---|---|---|---|---|---|---|---|
-| 1 | [Walking skeleton](slices/01-walking-skeleton.md) | Core + B6 | R16, D3, D4, D5, D6, B6 | K1, K6, K8, K16, K17, K18, K19, K21, K22, K23, K28, K29, K30, K31, K32, K36, K37, K38, K39 | — | `feat/skeleton` | planned |
+| 1 | [Walking skeleton](slices/01-walking-skeleton.md) | Core + B6 | R16, D3, D4, D5, D6, B6 | K1, K6, K8, K16, K17, K18, K19, K21, K22, K23, K28, K29, K30, K31, K32, K36, K37, K38, K39 | — | `feat/skeleton` | done ([#8](https://github.com/ardaklc20/event-driven-notification-system/pull/8)) |
 | 2 | [Create and read a notification](slices/02-create-and-read.md) | Core | R1, R3, R10, R11, R15, D4 | K2, K9, K10, K11, K16, K17, K19, K21, K36 | 1 | `feat/create-notification` | planned |
 | 3 | [Delivery to the provider](slices/03-delivery.md) | Core | R7, R11, R12, R13, R15, N2, A2 | K2, K3, K6, K9, K14, K15, K21, K23, K31, K32, K39 | 2 | `feat/delivery` | planned |
 | 4 | [Retries and crash recovery](slices/04-retries-and-recovery.md) | Core | R11, R12, R13, N3 | K3, K7, K9, K14, K15, K21, K31, K32, K39, K40, K41 | 3 | `feat/retries-recovery` | planned |

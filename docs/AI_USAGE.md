@@ -28,6 +28,7 @@ The AI proposes; I decide. Every decision, with its reason and its cost, is in [
 |---|---|---|---|
 | Setup | Install commands and environment checks | `go version` → go1.27.4; `docker version` → 29.9.3 (linux/arm64); `docker compose version` and `docker-compose version` → v5.7.0 | Container runtime: the AI first recommended Colima; changed to Docker Desktop (see section 5) |
 | Plan review | Claude's plan corrections and Codex's final review | `git diff --check` passed; 412 local links and anchors checked; all 22 shell blocks passed `bash -n`; no application tests were run | Codex replaced the claim test's remaining 1-second timing assumption with a 1-minute permit and a shared 5-second context for both claims; a timeout fails explicitly |
+| 1 — Walking skeleton | Go module; configuration; first migration; test database helper; health endpoints and OpenAPI generation; `api` and `migrate` entry points; Dockerfile, Compose, lint configuration, CI workflow and wait script | `golangci-lint run` (v2.15.0) → `0 issues.`; `go test -count=1 ./...` twice and `-race` once → every package `ok`, no `(cached)`, no data race; the ten targeted tests of the slice note each printed `--- PASS`; stack, port, version, migration, image and failure checks as listed in section 4 | `bodyclose` flagged a test helper that returned a response whose body it had already closed; the helper now returns only the status code and headers. Compose names no fixed image, so the broken-migration check's separate project builds its own image instead of overwriting the main stack's |
 
 ## 4. Requirement → evidence
 
@@ -35,7 +36,13 @@ Each requirement gets one command that proves it by running it.
 
 | ID | Evidence (command) | Status |
 |---|---|---|
-| R1–R16, N1–N3 | — | Pending; filled as slices are built |
+| R16 | `go test -count=1 -v -run '^(TestHealthEndpoints\|TestReadyzDuringShutdown\|TestHealthcheckCommand)$' ./internal/httpapi/`; `docker compose stop postgres`, then `scripts/wait-health.sh api unhealthy 60` and `curl -s -w '\n%{http_code}\n' http://localhost:8080/readyz` | Passed (slice 1): three `--- PASS` lines. With PostgreSQL stopped the API stayed `running`, turned `unhealthy`, `/readyz` answered `503` with `checks.database` and `/healthz` `200`; after `docker compose start postgres` it was `healthy` again |
+| D3 | `docker compose up -d --build`, `scripts/wait-health.sh api healthy 60`, `docker compose ps -a` | Passed (slice 1): `api=healthy`; `postgres` running healthy, `migrate` exited 0, `api` running healthy; ports `127.0.0.1:8080` and `127.0.0.1:5433`; `postgres (PostgreSQL) 18.7`; image user `65532`; `docker compose stop api` → exited 0 with readiness turned off before the server stopped |
+| D4 | `go test -count=1 -v -run '^TestOpenAPIUpToDate$' ./internal/httpapi/`; `go run ./cmd/api openapi \| diff -u api/openapi.yaml -` | Passed (slice 1): `--- PASS: TestOpenAPIUpToDate`; no difference |
+| D5 | `go test -count=1 -v -run '^(TestMigrations\|TestLeaseMatchesStatus)$' ./migrations/`; `docker compose run --rm migrate`; broken-migration check in [slice 1](slices/01-walking-skeleton.md#broken-migration) | Passed (slice 1): both `--- PASS`; second run exit 0 with `no migrations to apply`; with `99999_broken.sql`, `migrate` exited 1 naming the file, `api` stayed `created`, version 1 stayed applied |
+| D6 | `go test -count=1 ./...` | Passed (slice 1): every package `ok` or `[no test files]`, run twice without `(cached)` |
+| B6 | `gh pr checks 8`; `gh run view <run> --log \| grep tested-sha` | Passed (slice 1, [#8](https://github.com/ardaklc20/event-driven-notification-system/pull/8)): `lint` 46 s (`0 issues.`), `test` 59 s (`go test -count=1 -race ./...`, every package `ok`), `openapi` 28 s, `docker` 39 s, all `pass`; all four jobs logged `tested-sha=d56d42da3e7a809fc3277a3b1a61959f1d09287f`, the pull request's head commit |
+| R1–R15, N1–N3 | — | Pending; filled as slices are built |
 
 ## 5. Rejected or corrected AI output
 
@@ -104,6 +111,7 @@ Yapay zekâ önerir, ben karar veririm. Her kararın gerekçesi ve bedeli [`DECI
 |---|---|---|---|
 | Kurulum | Kurulum komutları ve ortam kontrolleri | `go version` → go1.27.4; `docker version` → 29.9.3 (linux/arm64); `docker compose version` ve `docker-compose version` → v5.7.0 | Konteyner çalıştırıcısı: yapay zekâ önce Colima önerdi; Docker Desktop'a geçildi (bkz. bölüm 5) |
 | Plan incelemesi | Claude'un plan düzeltmeleri ve Codex'in son incelemesi | `git diff --check` geçti; 412 yerel bağlantı ve anchor denetlendi; 22 shell bloğunun tamamı `bash -n` kontrolünden geçti; uygulama testi çalıştırılmadı | Codex, claim testinde kalan 1 saniyelik zamanlama varsayımını 1 dakikalık permit ve iki claim'in paylaştığı 5 saniyelik context ile değiştirdi; süre aşımı testi açıkça başarısız yapar |
+| 1 — Walking skeleton | Go modülü; yapılandırma; ilk migration; test veritabanı yardımcısı; health endpoint'leri ve OpenAPI üretimi; `api` ve `migrate` giriş noktaları; Dockerfile, Compose, lint yapılandırması, CI workflow'u ve bekleme script'i | `golangci-lint run` (v2.15.0) → `0 issues.`; `go test -count=1 ./...` iki kez, `-race` bir kez → her paket `ok`, `(cached)` yok, data race yok; dilim notundaki on hedefli testin her biri `--- PASS` yazdı; stack, port, sürüm, migration, imaj ve arıza kontrolleri bölüm 4'teki gibi | `bodyclose`, gövdesini kendisi kapatmış bir yanıt döndüren bir test yardımcısını işaretledi; yardımcı artık yalnızca durum kodunu ve header'ları döndürüyor. Compose sabit bir imaj adı vermiyor; böylece bozuk migration kontrolünün ayrı projesi ana stack'in imajının üzerine yazmak yerine kendi imajını derliyor |
 
 ## 4. Gereksinim → kanıt
 
@@ -111,7 +119,13 @@ Her gereksinim için, çalıştırınca o gereksinimi kanıtlayan tek bir komut 
 
 | ID | Kanıt (komut) | Durum |
 |---|---|---|
-| R1–R16, N1–N3 | — | Bekliyor; dilimler yapıldıkça doldurulacak |
+| R16 | `go test -count=1 -v -run '^(TestHealthEndpoints\|TestReadyzDuringShutdown\|TestHealthcheckCommand)$' ./internal/httpapi/`; `docker compose stop postgres`, ardından `scripts/wait-health.sh api unhealthy 60` ve `curl -s -w '\n%{http_code}\n' http://localhost:8080/readyz` | Geçti (dilim 1): üç `--- PASS` satırı. PostgreSQL durdurulunca API `running` kaldı, `unhealthy` oldu, `/readyz` `checks.database` ile `503`, `/healthz` `200` döndü; `docker compose start postgres` sonrasında yeniden `healthy` oldu |
+| D3 | `docker compose up -d --build`, `scripts/wait-health.sh api healthy 60`, `docker compose ps -a` | Geçti (dilim 1): `api=healthy`; `postgres` running healthy, `migrate` exited 0, `api` running healthy; portlar `127.0.0.1:8080` ve `127.0.0.1:5433`; `postgres (PostgreSQL) 18.7`; imaj kullanıcısı `65532`; `docker compose stop api` → exited 0, readiness sunucu durmadan önce kapandı |
+| D4 | `go test -count=1 -v -run '^TestOpenAPIUpToDate$' ./internal/httpapi/`; `go run ./cmd/api openapi \| diff -u api/openapi.yaml -` | Geçti (dilim 1): `--- PASS: TestOpenAPIUpToDate`; fark yok |
+| D5 | `go test -count=1 -v -run '^(TestMigrations\|TestLeaseMatchesStatus)$' ./migrations/`; `docker compose run --rm migrate`; [dilim 1](slices/01-walking-skeleton.md#broken-migration)'deki bozuk migration kontrolü | Geçti (dilim 1): iki `--- PASS`; ikinci çalıştırma `no migrations to apply` ile 0 çıkışı; `99999_broken.sql` ile `migrate` dosyayı adlandırarak 1 ile çıktı, `api` `created` kaldı, sürüm 1 uygulanmış kaldı |
+| D6 | `go test -count=1 ./...` | Geçti (dilim 1): her paket `ok` ya da `[no test files]`, iki çalıştırmada da `(cached)` yok |
+| B6 | `gh pr checks 8`; `gh run view <run> --log \| grep tested-sha` | Geçti (dilim 1, [#8](https://github.com/ardaklc20/event-driven-notification-system/pull/8)): `lint` 46 sn (`0 issues.`), `test` 59 sn (`go test -count=1 -race ./...`, her paket `ok`), `openapi` 28 sn, `docker` 39 sn, hepsi `pass`; dört job'ın dördü de pull request'in head commit'i olan `tested-sha=d56d42da3e7a809fc3277a3b1a61959f1d09287f` değerini logladı |
+| R1–R15, N1–N3 | — | Bekliyor; dilimler yapıldıkça doldurulacak |
 
 ## 5. Reddedilen ya da düzeltilen yapay zekâ çıktıları
 
