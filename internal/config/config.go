@@ -49,6 +49,14 @@ type API struct {
 	// BatchMaxBodyBytes is the largest POST /notifications/batch body; a larger
 	// one gets 413 (K12). 16 MiB by default.
 	BatchMaxBodyBytes int64 `env:"BATCH_MAX_BODY_BYTES" envDefault:"16777216"`
+
+	// Real-time status WebSockets (K25). WSSendQueue is each connection's
+	// send queue in messages; a full queue closes the connection.
+	// WSWriteTimeout bounds one write. WSCloseTimeout bounds the wait for
+	// open WebSockets at shutdown, inside SHUTDOWN_TIMEOUT.
+	WSSendQueue    int           `env:"WS_SEND_QUEUE" envDefault:"16"`
+	WSWriteTimeout time.Duration `env:"WS_WRITE_TIMEOUT" envDefault:"5s"`
+	WSCloseTimeout time.Duration `env:"WS_CLOSE_TIMEOUT" envDefault:"5s"`
 }
 
 // Limits returns the content limits as the domain type.
@@ -76,6 +84,15 @@ func (c API) Validate() error {
 	}
 	if c.BatchMaxBodyBytes <= 0 {
 		errs = append(errs, fmt.Errorf("BATCH_MAX_BODY_BYTES must be positive, got %d", c.BatchMaxBodyBytes))
+	}
+	if c.WSSendQueue < 1 {
+		errs = append(errs, fmt.Errorf("WS_SEND_QUEUE must be at least 1, got %d", c.WSSendQueue))
+	}
+	if c.WSWriteTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("WS_WRITE_TIMEOUT must be positive, got %s", c.WSWriteTimeout))
+	}
+	if c.WSCloseTimeout <= 0 || c.WSCloseTimeout >= c.ShutdownTimeout {
+		errs = append(errs, fmt.Errorf("WS_CLOSE_TIMEOUT must be positive and below SHUTDOWN_TIMEOUT (%s), got %s", c.ShutdownTimeout, c.WSCloseTimeout))
 	}
 	return errors.Join(errs...)
 }
