@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v11"
+
+	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 )
 
 // Listen holds the HTTP listen address. The API's healthcheck subcommand reads
@@ -35,6 +37,17 @@ type API struct {
 	Listen
 	LogLevel        slog.Level    `env:"LOG_LEVEL" envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+
+	// Content limits in Unicode code points, checked for new notifications
+	// only (K10, K11).
+	SMSContentLimit   int `env:"SMS_CONTENT_LIMIT" envDefault:"160"`
+	EmailContentLimit int `env:"EMAIL_CONTENT_LIMIT" envDefault:"10000"`
+	PushContentLimit  int `env:"PUSH_CONTENT_LIMIT" envDefault:"1000"`
+}
+
+// Limits returns the content limits as the domain type.
+func (c API) Limits() domain.Limits {
+	return domain.Limits{SMS: c.SMSContentLimit, Email: c.EmailContentLimit, Push: c.PushContentLimit}
 }
 
 // Validate checks what the struct tags cannot.
@@ -45,6 +58,15 @@ func (c API) Validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive, got %s", c.ShutdownTimeout))
+	}
+	for name, limit := range map[string]int{
+		"SMS_CONTENT_LIMIT":   c.SMSContentLimit,
+		"EMAIL_CONTENT_LIMIT": c.EmailContentLimit,
+		"PUSH_CONTENT_LIMIT":  c.PushContentLimit,
+	} {
+		if limit <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be positive, got %d", name, limit))
+		}
 	}
 	return errors.Join(errs...)
 }

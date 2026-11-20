@@ -8,6 +8,8 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
+
+	"github.com/ardaklc20/event-driven-notification-system/internal/service"
 )
 
 const (
@@ -20,14 +22,19 @@ type Deps struct {
 	Logger    *slog.Logger
 	Readiness *Readiness
 	// Checks run on every GET /readyz (K30).
-	Checks []Check
+	Checks        []Check
+	Notifications *service.Notifications
 }
 
 // New returns the API's handler: the router with every operation registered,
 // wrapped in the middleware.
 func New(deps Deps) http.Handler {
 	mux, _ := newAPI(deps)
-	return logRequests(deps.Logger, mux)
+	var h http.Handler = mux
+	h = recoverPanics(deps.Logger, h)
+	h = logRequests(deps.Logger, h)
+	h = withCorrelationID(deps.Logger, h)
+	return h
 }
 
 // OpenAPIYAML returns the generated OpenAPI 3.1 document. api/openapi.yaml is
@@ -44,6 +51,7 @@ func newAPI(deps Deps) (*http.ServeMux, huma.API) {
 	mux := http.NewServeMux()
 	api := humago.New(mux, apiConfig())
 	registerHealth(api, deps)
+	registerNotifications(api, deps)
 	return mux, api
 }
 
@@ -53,5 +61,20 @@ func apiConfig() huma.Config {
 	// The default create hook adds a `$schema` field to every response body and
 	// a Link header; responses stay plain JSON without it.
 	cfg.CreateHooks = nil
+	cfg.Transformers = append(cfg.Transformers, dropEchoedValues)
 	return cfg
+}
+
+// dropEchoedValues removes the `value` of every error detail. Huma copies the
+// raw request body there when JSON cannot be parsed, and the offending value
+// for schema errors; a request body is never echoed back (K19).
+func dropEchoedValues(_ huma.Context, _ string, v any) (any, error) {
+	if m, ok := v.(*huma.ErrorModel); ok {
+		for _, d := range m.Errors {
+			if d != nil {
+				d.Value = nil
+			}
+		}
+	}
+	return v, nil
 }

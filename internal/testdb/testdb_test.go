@@ -21,8 +21,8 @@ func TestDatabaseIsolation(t *testing.T) {
 	t.Run("writer", func(t *testing.T) {
 		pool := testdb.New(t)
 		err := pool.QueryRow(t.Context(),
-			`INSERT INTO notifications (recipient, channel, content, priority)
-			 VALUES ('+905551234567', 'sms', 'hello', 'normal')
+			`INSERT INTO notifications (recipient, channel, content, priority, correlation_id)
+			 VALUES ('+905551234567', 'sms', 'hello', 'normal', 'test')
 			 RETURNING id::text`).Scan(&writtenID)
 		if err != nil {
 			t.Fatalf("insert: %v", err)
