@@ -109,9 +109,9 @@ type givenBack struct {
 	permit time.Time
 }
 
-func (g *giveBackSpy) GiveBack(ctx context.Context, id, leaseToken string) (bool, error) {
-	given, err := g.Store.GiveBack(ctx, id, leaseToken)
-	g.after <- givenBack{given: given, row: readRow(g.t, g.pool, id), permit: readNextPermit(g.t, g.pool, domain.ChannelSMS)}
+func (g *giveBackSpy) GiveBack(ctx context.Context, a domain.Attempt) (bool, error) {
+	given, err := g.Store.GiveBack(ctx, a)
+	g.after <- givenBack{given: given, row: readRow(g.t, g.pool, a.ID), permit: readNextPermit(g.t, g.pool, domain.ChannelSMS)}
 	return given, err
 }
 

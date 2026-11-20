@@ -325,7 +325,7 @@ func TestMissedStartGivesBack(t *testing.T) {
 			t.Fatalf("claim: %+v err=%v", res, err)
 		}
 		permit := nextPermit(t, pool, domain.ChannelSMS)
-		given, err := store.GiveBack(t.Context(), id, res.Claim.LeaseToken)
+		given, err := store.GiveBack(t.Context(), domain.AttemptOf(res.Claim))
 		if err != nil || !given {
 			t.Fatalf("give back: %v err=%v, want one row changed", given, err)
 		}
@@ -336,7 +336,7 @@ func TestMissedStartGivesBack(t *testing.T) {
 		if after := nextPermit(t, pool, domain.ChannelSMS); !after.Equal(permit) {
 			t.Fatalf("give-back moved next_permit_at from %s to %s", permit, after)
 		}
-		given, err = store.GiveBack(t.Context(), id, res.Claim.LeaseToken)
+		given, err = store.GiveBack(t.Context(), domain.AttemptOf(res.Claim))
 		if err != nil || given {
 			t.Fatalf("second give back: %v err=%v, want 0 rows", given, err)
 		}
@@ -349,7 +349,7 @@ func TestMissedStartGivesBack(t *testing.T) {
 		pool, store, id := setup(t)
 		c := mustClaim(t, store)
 		expire(t, pool, id)
-		if given, err := store.GiveBack(t.Context(), id, c.LeaseToken); err != nil || given {
+		if given, err := store.GiveBack(t.Context(), domain.AttemptOf(c)); err != nil || given {
 			t.Fatalf("give back: %v err=%v, want 0 rows", given, err)
 		}
 		if r := readLease(t, pool, id); r.status != "processing" || r.attempts != 1 {
@@ -363,7 +363,7 @@ func TestMissedStartGivesBack(t *testing.T) {
 		expire(t, pool, id)
 		recoverAll(t, store)
 		b := mustClaim(t, store)
-		if given, err := store.GiveBack(t.Context(), id, a.LeaseToken); err != nil || given {
+		if given, err := store.GiveBack(t.Context(), domain.AttemptOf(a)); err != nil || given {
 			t.Fatalf("give back with the old token: %v err=%v, want 0 rows", given, err)
 		}
 		if r := readLease(t, pool, id); r.attempts != 2 || r.token == nil || *r.token != b.LeaseToken {

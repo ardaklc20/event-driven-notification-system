@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 	"github.com/ardaklc20/event-driven-notification-system/internal/postgres"
 	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
 	"github.com/ardaklc20/event-driven-notification-system/internal/testdb"
@@ -57,6 +58,9 @@ func defaults() settings {
 			RecoveryBatch:    100,
 			PermitInterval:   11 * time.Millisecond,
 			PermitGrace:      100 * time.Millisecond,
+			// A threshold no other test reaches: only the breaker tests
+			// open the breaker (K34).
+			Breaker: domain.BreakerPolicy{Threshold: 1000, Cooldown: time.Second, MaxCooldown: time.Second},
 		},
 	}
 }
@@ -223,6 +227,7 @@ type recorder struct {
 func (rec *recorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	at := time.Now()
 	body, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body)) // answer may read it too
 	rec.mu.Lock()
 	rec.arrivals = append(rec.arrivals, arrival{at: at, header: r.Header.Clone(), body: body})
 	rec.mu.Unlock()

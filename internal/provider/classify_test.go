@@ -76,6 +76,52 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestClassifyBreakerFlags: timeouts, network errors, 408 and the retried 5xx
+// are outage failures; a 429 and permanent or terminal errors are not. Only
+// the test profile that states a shared quota marks its 429 (K34).
+func TestClassifyBreakerFlags(t *testing.T) {
+	timeout := &provider.TransportError{Err: context.DeadlineExceeded}
+	refused := &provider.TransportError{Err: errors.New("connection refused")}
+	profiles := []provider.Profile{provider.ProfileStandard, provider.ProfileWebhookSiteFree, provider.ProfileSharedQuotaTest}
+	for _, r := range []struct {
+		name   string
+		code   int
+		err    error
+		outage bool
+	}{
+		{name: "timeout", err: timeout, outage: true},
+		{name: "network error", err: refused, outage: true},
+		{name: "408", code: 408, outage: true},
+		{name: "500", code: 500, outage: true},
+		{name: "502", code: 502, outage: true},
+		{name: "503", code: 503, outage: true},
+		{name: "504", code: 504, outage: true},
+		{name: "202", code: 202},
+		{name: "400", code: 400},
+		{name: "404", code: 404},
+		{name: "429", code: 429},
+		{name: "501", code: 501},
+		{name: "505", code: 505},
+		{name: "request not built", err: errors.New("encode request: x")},
+	} {
+		for _, profile := range profiles {
+			t.Run(string(profile)+"/"+r.name, func(t *testing.T) {
+				got := provider.Classify(provider.Response{StatusCode: r.code}, r.err, profile)
+				if got.Outage != r.outage {
+					t.Errorf("outage %v, want %v", got.Outage, r.outage)
+				}
+				wantShared := r.code == 429 && profile == provider.ProfileSharedQuotaTest
+				if got.SharedQuota != wantShared {
+					t.Errorf("shared quota %v, want %v", got.SharedQuota, wantShared)
+				}
+			})
+		}
+	}
+	if provider.ProfileSharedQuotaTest.Valid() {
+		t.Error("the test profile is accepted by the configuration")
+	}
+}
+
 func newServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(h)

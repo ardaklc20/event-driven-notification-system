@@ -1,7 +1,9 @@
 // Package worker claims queued notifications under a lease and a channel
 // permit, delivers them to the provider, retries temporary failures and takes
-// back expired leases (K2, K3, K5, K6, K7, K8, K21, K40, K42). It defines the store it needs; internal/postgres
-// implements it without importing this package (K23).
+// back expired leases (K2, K3, K5, K6, K7, K8, K21, K40, K42). While the
+// provider's circuit breaker is open, it claims nothing but the one probe
+// (K34). It defines the store it needs; internal/postgres implements it
+// without importing this package (K23).
 package worker
 
 import (
@@ -20,13 +22,12 @@ import (
 
 // Store is what the worker needs from the database. Every result write is
 // conditioned on the claim's lease and reports false when the lease was no
-// longer valid (K3).
+// longer valid (K3). Finish also applies the circuit breaker's rules to the
+// result, and GiveBack frees a probe's slot (K34).
 type Store interface {
 	ClaimNext(ctx context.Context, req domain.ClaimRequest) (domain.ClaimResult, error)
-	MarkSent(ctx context.Context, id, leaseToken string, acc domain.Acceptance) (bool, error)
-	MarkRetry(ctx context.Context, id, leaseToken, lastError string, wait time.Duration) (bool, error)
-	MarkFailed(ctx context.Context, id, leaseToken, lastError string) (bool, error)
-	GiveBack(ctx context.Context, id, leaseToken string) (bool, error)
+	Finish(ctx context.Context, f domain.Finish) (domain.Finished, error)
+	GiveBack(ctx context.Context, a domain.Attempt) (bool, error)
 	RecoverExpired(ctx context.Context, maxAttempts, batch int) ([]domain.Recovered, error)
 }
 
@@ -58,6 +59,8 @@ type Config struct {
 	// PermitGrace how long after its time a permit may start a send (K5, K42).
 	PermitInterval time.Duration
 	PermitGrace    time.Duration
+	// Breaker holds the circuit breaker's settings (K34).
+	Breaker domain.BreakerPolicy
 }
 
 // queryTimeout bounds one claim or recovery statement.
@@ -122,8 +125,11 @@ type attempt struct {
 // Run claims on each channel when its next try has come and a call slot is
 // free. Each claim attempt sets that channel's next try from its outcome: at
 // once after a claim, after the returned wait (at most PermitInterval, counted
-// from when the claim was sent) when the permit is not due, after PermitInterval when another worker holds the
-// channel's limiter row, and after IdleWait when the channel has no due work.
+// from when the claim was sent) when the permit is not due, after
+// PermitInterval when another worker holds the channel's limiter row, after
+// IdleWait when the channel has no due work, and, while the circuit breaker
+// is open, when its cooldown ends, or after IdleWait once the cooldown is
+// over and the probe is someone else's (K34).
 // The loop always takes the channel whose next try comes first, so one
 // channel's wait never delays another's claims. Beside the claim loop it runs
 // the recovery step every RecoveryInterval (K40). When ctx ends it stops
@@ -136,7 +142,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		slog.String("lease", w.cfg.LeaseDuration.String()), slog.Int("max_attempts", w.cfg.MaxAttempts),
 		slog.String("permit_interval", w.cfg.PermitInterval.String()),
 		slog.String("permit_grace", w.cfg.PermitGrace.String()),
-		slog.String("profile", string(w.cfg.Profile)))
+		slog.String("profile", string(w.cfg.Profile)),
+		slog.Int("breaker_threshold", w.cfg.Breaker.Threshold),
+		slog.String("breaker_cooldown", w.cfg.Breaker.Cooldown.String()),
+		slog.String("breaker_max_cooldown", w.cfg.Breaker.MaxCooldown.String()))
 	background.Go(func() { w.recoverLoop(ctx) })
 
 	// nextTry holds each channel's next claim attempt; the zero time is now.
@@ -186,6 +195,14 @@ loop:
 			nextTry[ch] = a.sent.Add(min(a.Wait, w.cfg.PermitInterval))
 		case domain.ClaimBusy:
 			nextTry[ch] = now.Add(w.cfg.PermitInterval)
+		case domain.ClaimPaused:
+			if a.Wait > 0 {
+				// As for a throttled claim: the database read the cooldown's
+				// end after t0.
+				nextTry[ch] = a.sent.Add(a.Wait)
+			} else {
+				nextTry[ch] = now.Add(w.cfg.IdleWait)
+			}
 		default:
 			nextTry[ch] = now.Add(w.cfg.IdleWait)
 		}
@@ -296,12 +313,16 @@ func (w *Worker) recoverOnce(ctx context.Context) {
 // deliver sends one claimed notification and writes its result. Its contexts
 // do not come from Run's: a stop lets the call finish.
 func (w *Worker) deliver(c claimed) {
-	log := w.logger.With(
+	attrs := []any{
 		slog.String("correlation_id", c.CorrelationID),
 		slog.String("notification_id", c.ID),
 		slog.String("channel", string(c.Channel)),
 		slog.Int("attempt", c.Attempt),
-	)
+	}
+	if c.Probe {
+		attrs = append(attrs, slog.Bool("breaker_probe", true))
+	}
+	log := w.logger.With(attrs...)
 	if w.hooks.afterClaim != nil {
 		w.hooks.afterClaim(c.Claim)
 	}
@@ -354,16 +375,20 @@ func (w *Worker) deliver(c claimed) {
 	dbCtx, cancelDB := context.WithDeadline(context.Background(), c.deadline)
 	defer cancelDB()
 
-	attrs := []slog.Attr{
+	result := domain.Result{Outage: outcome.Outage}
+	if outcome.SharedQuota {
+		// A shared quota's 429 pauses every channel until its Retry-After
+		// (K34); without a valid one it delays only its notification.
+		if pause, ok := provider.ParseRetryAfter(resp.RetryAfter, time.Now()); ok && pause > 0 {
+			result.QuotaPause = pause
+		}
+	}
+	callAttrs := []slog.Attr{
 		slog.Int("status_code", resp.StatusCode),
 		slog.Float64("duration_ms", float64(duration.Microseconds())/1000),
 		slog.String("class", string(outcome.Class)),
 	}
-	var (
-		status   domain.Status
-		written  bool
-		writeErr error
-	)
+	var status domain.Status
 	switch {
 	case outcome.Class == provider.ClassAccepted:
 		if resp.BodyProblem != "" {
@@ -371,43 +396,75 @@ func (w *Worker) deliver(c claimed) {
 				slog.String("problem", resp.BodyProblem))
 		}
 		status = domain.StatusSent
-		written, writeErr = w.store.MarkSent(dbCtx, c.ID, c.LeaseToken, resp.Acceptance)
+		result.Kind = domain.ResultSent
+		result.Acceptance = resp.Acceptance
 	case outcome.Class == provider.ClassTemporary && c.Attempt < w.cfg.MaxAttempts:
 		retryAfter, hasRetryAfter := provider.ParseRetryAfter(resp.RetryAfter, time.Now())
 		wait := NextWait(c.Attempt, w.cfg.BackoffBase, w.cfg.BackoffCap, retryAfter, hasRetryAfter)
 		status = domain.StatusQueued
-		attrs = append(attrs, slog.Float64("retry_in_ms", float64(wait.Microseconds())/1000))
-		written, writeErr = w.store.MarkRetry(dbCtx, c.ID, c.LeaseToken, outcome.Error, wait)
+		callAttrs = append(callAttrs, slog.Float64("retry_in_ms", float64(wait.Microseconds())/1000))
+		result.Kind = domain.ResultRetry
+		result.LastError = outcome.Error
+		result.Wait = wait
 	default:
 		// Permanent, terminal (K41), or temporary on the last attempt.
 		status = domain.StatusFailed
-		written, writeErr = w.store.MarkFailed(dbCtx, c.ID, c.LeaseToken, outcome.Error)
+		result.Kind = domain.ResultFailed
+		result.LastError = outcome.Error
 	}
+	fin, writeErr := w.store.Finish(dbCtx, domain.Finish{
+		Attempt: domain.AttemptOf(c.Claim),
+		Result:  result,
+		Policy:  w.cfg.Breaker,
+	})
 
-	attrs = append(attrs, slog.String("outcome", string(status)))
+	callAttrs = append(callAttrs, slog.String("outcome", string(status)))
 	if outcome.Error != "" {
-		attrs = append(attrs, slog.String("error", outcome.Error))
+		callAttrs = append(callAttrs, slog.String("error", outcome.Error))
 	}
 	switch {
+	case writeErr != nil && fin.Written:
+		log.LogAttrs(dbCtx, slog.LevelError, "provider call finished, breaker not updated",
+			append(callAttrs, slog.String("write_error", writeErr.Error()))...)
 	case writeErr != nil:
 		log.LogAttrs(dbCtx, slog.LevelError, "provider call finished, result not written",
-			append(attrs, slog.String("write_error", writeErr.Error()))...)
-	case !written:
-		log.LogAttrs(dbCtx, slog.LevelWarn, "provider call finished, lease lost, result not written", attrs...)
+			append(callAttrs, slog.String("write_error", writeErr.Error()))...)
+	case !fin.Written:
+		log.LogAttrs(dbCtx, slog.LevelWarn, "provider call finished, lease lost, result not written", callAttrs...)
 	default:
-		log.LogAttrs(dbCtx, slog.LevelInfo, "provider call finished", attrs...)
+		log.LogAttrs(dbCtx, slog.LevelInfo, "provider call finished", callAttrs...)
+	}
+	logBreaker(dbCtx, log, fin)
+}
+
+// logBreaker writes the breaker's change, if the result write made one (K21,
+// K34).
+func logBreaker(ctx context.Context, log *slog.Logger, fin domain.Finished) {
+	attrs := []slog.Attr{
+		slog.Int64("generation", fin.Generation),
+		slog.String("cooldown", fin.Cooldown.String()),
+	}
+	switch fin.Breaker {
+	case domain.BreakerOpened:
+		log.LogAttrs(ctx, slog.LevelWarn, "breaker opened",
+			append(attrs, slog.String("open_for", fin.OpenFor.Round(time.Millisecond).String()))...)
+	case domain.BreakerReopened:
+		log.LogAttrs(ctx, slog.LevelWarn, "breaker reopened",
+			append(attrs, slog.String("open_for", fin.OpenFor.Round(time.Millisecond).String()))...)
+	case domain.BreakerClosed:
+		log.LogAttrs(ctx, slog.LevelInfo, "breaker closed", attrs...)
 	}
 }
 
 // giveBack returns a claim whose send never started because its start
 // deadline had passed (K42). No start line was written. The row goes back to
 // queued with its attempt returned, once, under the lease and token check;
-// the permit is not given back.
+// the permit is not given back. A probe's give-back frees its slot (K34).
 func (w *Worker) giveBack(log *slog.Logger, c claimed) {
 	ctx, cancel := context.WithDeadline(context.Background(), c.deadline)
 	defer cancel()
 	late := slog.Float64("late_ms", float64(time.Since(c.startBy).Microseconds())/1000)
-	given, err := w.store.GiveBack(ctx, c.ID, c.LeaseToken)
+	given, err := w.store.GiveBack(ctx, domain.AttemptOf(c.Claim))
 	switch {
 	case err != nil:
 		log.LogAttrs(ctx, slog.LevelError, "start deadline missed, no request sent, attempt not given back",

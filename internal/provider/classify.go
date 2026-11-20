@@ -30,6 +30,13 @@ type Outcome struct {
 	Class Class
 	// Error is the last_error text, "<class>: <detail>"; empty when accepted.
 	Error string
+	// Outage marks a failure that counts towards the circuit breaker (K34):
+	// a network error, a timeout, 408 and the 5xx codes K7 retries. A 429
+	// and permanent errors concern the request, not the provider.
+	Outage bool
+	// SharedQuota marks a 429 under a profile that states that its quota
+	// covers the whole URL; with a valid Retry-After it opens the breaker.
+	SharedQuota bool
 }
 
 // Classify sorts an attempt's result into its class (K7, K41). err is the
@@ -38,7 +45,7 @@ func Classify(resp Response, err error, profile Profile) Outcome {
 	if err != nil {
 		var transport *TransportError
 		if errors.As(err, &transport) {
-			return Outcome{Class: ClassTemporary, Error: "temporary: " + err.Error()}
+			return Outcome{Class: ClassTemporary, Error: "temporary: " + err.Error(), Outage: true}
 		}
 		// The request could not even be built; another attempt would fail the
 		// same way.
@@ -51,14 +58,14 @@ func Classify(resp Response, err error, profile Profile) Outcome {
 		return Outcome{Class: ClassAccepted}
 	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway,
 		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return Outcome{Class: ClassTemporary, Error: fmt.Sprintf("temporary: status %d", code)}
+		return Outcome{Class: ClassTemporary, Error: fmt.Sprintf("temporary: status %d", code), Outage: true}
 	case http.StatusTooManyRequests:
 		// A free webhook.site URL answers 429 only when its request quota is
 		// used up, and waiting does not reopen it (K7).
 		if profile == ProfileWebhookSiteFree {
 			return Outcome{Class: ClassPermanent, Error: "permanent: status 429 (webhook.site quota used up)"}
 		}
-		return Outcome{Class: ClassTemporary, Error: "temporary: status 429"}
+		return Outcome{Class: ClassTemporary, Error: "temporary: status 429", SharedQuota: profile.SharedQuota()}
 	case http.StatusBadRequest, http.StatusNotImplemented:
 		return Outcome{Class: ClassPermanent, Error: fmt.Sprintf("permanent: status %d", code)}
 	default:
