@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"strings"
 	"testing"
 
@@ -194,5 +195,63 @@ func TestValidateBatch(t *testing.T) {
 	}
 	if _, errs := domain.NormalizeBatch(items[1:7]); len(errs) != 0 {
 		t.Errorf("valid items gave errors %+v", errs)
+	}
+}
+
+// TestScheduledAtParsing: scheduled_at is RFC 3339 with an offset; Z and
+// +03:00 are accepted and rewritten in UTC, a time without an offset and
+// garbage are refused. The same instant written with two offsets hashes the
+// same, and a request without scheduled_at hashes as before the field
+// existed (K10, K26).
+func TestScheduledAtParsing(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string // want "": refused
+	}{
+		{"2026-11-22T09:00:00Z", "2026-11-22T09:00:00Z"},
+		{"2026-11-22T12:00:00+03:00", "2026-11-22T09:00:00Z"},
+		{"2026-11-22T12:00:00.25+03:00", "2026-11-22T09:00:00.25Z"},
+		{"2026-11-22T09:00:00", ""},
+		{"2026-11-22 09:00:00Z", ""},
+		{"tomorrow at nine", ""},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			n := valid(domain.ChannelSMS)
+			n.ScheduledAt = tc.in
+			got, errs := domain.Normalize(n)
+			if tc.want == "" {
+				if len(errs) != 1 || errs[0].Field != "scheduled_at" || errs[0].Code != domain.CodeFormat {
+					t.Fatalf("errors %+v, want one format error on scheduled_at", errs)
+				}
+				return
+			}
+			if len(errs) != 0 || got.ScheduledAt != tc.want {
+				t.Fatalf("scheduled_at %q, errors %+v; want %q", got.ScheduledAt, errs, tc.want)
+			}
+		})
+	}
+
+	hash := func(at string) []byte {
+		n := valid(domain.ChannelSMS)
+		n.ScheduledAt = at
+		norm, errs := domain.Normalize(n)
+		if len(errs) != 0 {
+			t.Fatal(errs)
+		}
+		return domain.RequestHash(domain.OperationCreate, []domain.NewNotification{norm})
+	}
+	if !bytes.Equal(hash("2026-11-22T09:00:00Z"), hash("2026-11-22T12:00:00+03:00")) {
+		t.Error("one instant with two offsets hashed differently")
+	}
+	if bytes.Equal(hash("2026-11-22T09:00:00Z"), hash("2026-11-22T09:00:01Z")) {
+		t.Error("two times hashed the same")
+	}
+	if bytes.Equal(hash(""), hash("2026-11-22T09:00:00Z")) {
+		t.Error("a scheduled and an unscheduled request hashed the same")
+	}
+	// The encoding of an unscheduled item is unchanged: no scheduled_at key.
+	n, _ := domain.Normalize(valid(domain.ChannelSMS))
+	before := sha256.Sum256([]byte(`{"operation":"create","items":[{"recipient":"+905551234567","channel":"sms","content":"hello","priority":"high"}]}`))
+	if !bytes.Equal(domain.RequestHash(domain.OperationCreate, []domain.NewNotification{n}), before[:]) {
+		t.Error("an unscheduled request no longer hashes as before")
 	}
 }

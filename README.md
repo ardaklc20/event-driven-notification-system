@@ -6,7 +6,7 @@ A notification service in Go that queues SMS, email and push notifications in Po
 
 One image holds four programs, each a Compose service: `api` (the HTTP API), `worker` (claims and delivers notifications; several can run), `migrate` (applies the database migrations and exits) and `mockprovider` (a local stand-in for the external provider). There is no message broker: the `notifications` table in PostgreSQL is the queue.
 
-**Current state (core complete; circuit breaker, slice 11):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume.
+**Current state (core complete; circuit breaker and scheduling, slice 12):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it.
 
 ## Requirements
 
@@ -259,6 +259,23 @@ curl -s "http://localhost:8080/batches/$BATCH_ID?limit=50"
 
 `counts` lists all five statuses, zeros included. `items` are the batch's own notifications in the listing order, paged with `limit` (50 by default, 1 to 200) and `next_cursor` exactly as in [List notifications](#list-notifications). The counts and the page are read in one snapshot, so they agree with each other; the next page is a new read. An unknown batch gets `404`.
 
+### Scheduled notifications
+
+```bash
+AT=$(date -u -v+10S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+10 seconds' +%Y-%m-%dT%H:%M:%SZ)
+RESP=$(curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d "{\"recipient\":\"+905551234567\",\"channel\":\"sms\",\"content\":\"later\",\"scheduled_at\":\"$AT\"}")
+echo "$RESP"; ID=$(echo "$RESP" | jq -r .id)
+curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at}'   # queued until then
+```
+
+`scheduled_at` is optional on `POST /notifications` and on every batch item ([K26](docs/DECISIONS.md#k26--scheduled-notifications-b2-an-optional-absolute-scheduled_at)). It is an absolute time in RFC 3339 **with an offset**, `Z` or `±hh:mm`; a time without an offset gets `422`, because it would mean a different moment on every server. The time is stored in UTC, and the notification is not claimed before it: it waits in `queued` and counts as `deferred` in the metrics.
+
+- **Past times.** A new request whose time is at or before the database clock gets `422` naming `body.scheduled_at` (in a batch `body.notifications[i].scheduled_at`), and nothing is saved. A client whose clock runs ahead or behind should leave a margin. There is no upper limit.
+- **Repeats.** `scheduled_at` is part of the idempotency request hash, normalized to UTC: the same key with another time gets `422`, while the same instant written with another offset is the same request. The past-time rule runs only for a new key, so a repeat after the time has passed still returns the first `202`.
+- **Everything else as usual.** A scheduled notification can be cancelled while it is `queued`; once due it follows priority and the rate limit like any other notification, and retries move only `available_at`, never `scheduled_at`. Within a batch, items of the same channel and priority go out in `scheduled_at` order; other channels and priorities follow the rate limit and priority first.
+- **Latency.** `GET /metrics` measures scheduled notifications from `scheduled_at` (`scheduled_latency`), not from `created_at`, so a planned wait never shows as delivery latency.
+
 ### Metrics
 
 ```bash
@@ -269,7 +286,8 @@ curl -s http://localhost:8080/metrics | jq '{as_of, sms: .channels.sms}'
 {"as_of":"2026-11-20T17:23:07.414075Z","sms":{"queue":{"high":{"ready":0,"deferred":0,"oldest_ready_age_seconds":null},"normal":{…},"low":{…}},
  "processing":0,
  "completed":{"window_seconds":60,"sent":5,"failed":0,"sent_per_second":0.0833,"failed_per_second":0,"success_ratio":1},
- "latency":{"samples":5,"p50_ms":193.341,"p95_ms":197.05,"p99_ms":197.569}}}
+ "latency":{"samples":5,"p50_ms":193.341,"p95_ms":197.05,"p99_ms":197.569},
+ "scheduled_latency":{"samples":0,"p50_ms":null,"p95_ms":null,"p99_ms":null}}}
 ```
 
 Every value is read in one database snapshot, taken at `as_of` (the database clock, RFC 3339 with microseconds), so the numbers of one response agree with each other. `channels` always holds `sms`, `email` and `push`, and `queue` always holds `high`, `normal` and `low`.
@@ -277,13 +295,14 @@ Every value is read in one database snapshot, taken at `as_of` (the database clo
 | Field | What it counts |
 |---|---|
 | `queue.<priority>.ready` | `queued` notifications whose `available_at` is at or before `as_of` |
-| `queue.<priority>.deferred` | `queued` notifications waiting for a later `available_at`, such as a retry |
+| `queue.<priority>.deferred` | `queued` notifications waiting for a later `available_at`: a retry or a scheduled notification |
 | `queue.<priority>.oldest_ready_age_seconds` | `as_of` minus the earliest `available_at` of the ready ones; `null` when none is ready. A growing age for `low` while `high` keeps arriving shows starvation |
 | `processing` | Notifications a worker holds at `as_of`; high while nothing completes means a stalled worker |
 | `completed.sent`, `completed.failed` | Notifications that became `sent` or `failed` with `completed_at` after `as_of − 60 s` and at or before `as_of` |
 | `completed.sent_per_second`, `completed.failed_per_second` | The counts divided by 60; `0` when nothing completed |
 | `completed.success_ratio` | `sent / (sent + failed)`; `null` when nothing completed |
-| `latency.samples`, `latency.p50_ms`, `p95_ms`, `p99_ms` | `created_at → sent_at` of the notifications sent in the window, with `percentile_cont`; `null` without samples |
+| `latency.samples`, `latency.p50_ms`, `p95_ms`, `p99_ms` | `created_at → sent_at` of the notifications sent in the window without `scheduled_at`, with `percentile_cont`; `null` without samples |
+| `scheduled_latency.samples`, `p50_ms`, `p95_ms`, `p99_ms` | `scheduled_at → sent_at` of the scheduled notifications sent in the window; `null` without samples |
 
 Cancellations and retries that are still waiting are not completions. `sent` means the provider accepted the request. The latency includes queue waiting and retries; in the Compose stack it also includes the worker's idle wait (`IDLE_WAIT`, 200 ms) before it claims a new notification. The endpoint summarizes completed notifications: it is not the proof of the rate limit, which counts the actual send starts ([Rate limit and priority](#rate-limit-and-priority)). With 100,000 notifications the whole call took about 11 ms; the `processing` count is a sequential scan (about 5 ms), the queue counts read the claim index and the completions the `completed_at` index.
 
@@ -477,7 +496,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 |---|---|
 | B6 — GitHub Actions pipeline for tests and linting | Done ([CI](#ci)) |
 | B1 — Failure handling: a circuit breaker | Done ([Provider outage](#provider-outage)) |
-| B2 — Scheduled notifications | Planned ([slice 12](docs/slices/12-scheduled-notifications.md)) |
+| B2 — Scheduled notifications | Done ([Scheduled notifications](#scheduled-notifications)) |
 | B4 — Real-time status updates over WebSocket | Planned ([slice 13](docs/slices/13-realtime-status.md)) |
 | B3 — Message templates | Planned ([slice 14](docs/slices/14-templates.md)) |
 | B5 — Distributed tracing | Planned ([slice 15](docs/slices/15-distributed-tracing.md)) |
@@ -523,7 +542,7 @@ SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başın
 
 Tek bir imaj, her biri bir Compose servisi olan dört program taşır: `api` (HTTP API), `worker` (bildirimleri claim edip teslim eder; birden fazla çalışabilir), `migrate` (veritabanı migration'larını uygulayıp çıkar) ve `mockprovider` (harici provider'ın yerel yerine geçeni). Mesaj kuyruğu sunucusu yoktur: kuyruk, PostgreSQL'deki `notifications` tablosudur.
 
-**Şu anki durum (çekirdek tamam; devre kesici, dilim 11):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener.
+**Şu anki durum (çekirdek tamam; devre kesici ve zamanlama, dilim 12):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez.
 
 ## Gereksinimler
 
@@ -776,6 +795,23 @@ curl -s "http://localhost:8080/batches/$BATCH_ID?limit=50"
 
 `counts` beş durumun hepsini, sıfırlar dahil, listeler. `items` toplu isteğin kendi bildirimleridir; listeleme sırasıyla gelir ve [Bildirimleri listeleme](#bildirimleri-listeleme) bölümündeki gibi `limit` (varsayılan 50, 1 ile 200 arası) ve `next_cursor` ile sayfalanır. Sayılar ve sayfa tek bir anlık görüntüden okunur, bu yüzden birbiriyle tutarlıdır; sonraki sayfa yeni bir okumadır. Bilinmeyen bir toplu istek `404` alır.
 
+### Zamanlanmış bildirimler
+
+```bash
+AT=$(date -u -v+10S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+10 seconds' +%Y-%m-%dT%H:%M:%SZ)
+RESP=$(curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d "{\"recipient\":\"+905551234567\",\"channel\":\"sms\",\"content\":\"later\",\"scheduled_at\":\"$AT\"}")
+echo "$RESP"; ID=$(echo "$RESP" | jq -r .id)
+curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at}'   # o zamana kadar queued
+```
+
+`scheduled_at`, `POST /notifications`'ta ve her toplu istek öğesinde isteğe bağlıdır ([K26](docs/DECISIONS.md#k26--scheduled-notifications-b2-an-optional-absolute-scheduled_at)). **Ofsetli** RFC 3339 biçiminde mutlak bir zamandır: `Z` ya da `±hh:mm`; ofsetsiz bir zaman `422` alır, çünkü her sunucuda başka bir anı ifade eder. Zaman UTC olarak saklanır ve bildirim o zamandan önce claim edilmez: `queued` olarak bekler ve metriklerde `deferred` sayılır.
+
+- **Geçmiş zamanlar.** Zamanı veritabanı saatinde ya da öncesinde olan yeni bir istek `body.scheduled_at`'i (toplu istekte `body.notifications[i].scheduled_at`'i) gösteren `422` alır ve hiçbir şey kaydedilmez. Saati ileri ya da geri olan bir istemci pay bırakmalıdır. Üst sınır yoktur.
+- **Tekrarlar.** `scheduled_at`, UTC'ye çevrilmiş haliyle idempotency istek özetine dahildir: aynı anahtar başka bir zamanla `422` alır; aynı an başka bir ofsetle yazılırsa aynı istektir. Geçmiş zaman kuralı yalnızca yeni bir anahtar için çalışır; bu yüzden zaman geçtikten sonra gelen bir tekrar yine ilk `202`'yi döndürür.
+- **Geri kalan her şey aynı.** Zamanlanmış bir bildirim `queued` iken iptal edilebilir; zamanı gelince diğer bildirimler gibi önceliğe ve hız sınırına uyar; tekrar denemeler yalnızca `available_at`'i taşır, `scheduled_at`'i asla. Bir toplu istekte aynı kanal ve öncelikteki öğeler `scheduled_at` sırasıyla gider; farklı kanal ve öncelikler önce hız sınırına ve önceliğe uyar.
+- **Gecikme.** `GET /metrics` zamanlanmış bildirimleri `created_at`'ten değil `scheduled_at`'ten ölçer (`scheduled_latency`); böylece planlı bekleme asla teslim gecikmesi olarak görünmez.
+
 ### Metrikler
 
 ```bash
@@ -786,7 +822,8 @@ curl -s http://localhost:8080/metrics | jq '{as_of, sms: .channels.sms}'
 {"as_of":"2026-11-20T17:23:07.414075Z","sms":{"queue":{"high":{"ready":0,"deferred":0,"oldest_ready_age_seconds":null},"normal":{…},"low":{…}},
  "processing":0,
  "completed":{"window_seconds":60,"sent":5,"failed":0,"sent_per_second":0.0833,"failed_per_second":0,"success_ratio":1},
- "latency":{"samples":5,"p50_ms":193.341,"p95_ms":197.05,"p99_ms":197.569}}}
+ "latency":{"samples":5,"p50_ms":193.341,"p95_ms":197.05,"p99_ms":197.569},
+ "scheduled_latency":{"samples":0,"p50_ms":null,"p95_ms":null,"p99_ms":null}}}
 ```
 
 Bütün değerler `as_of` anında (veritabanı saati, mikrosaniyeli RFC 3339) alınan tek bir veritabanı anlık görüntüsünden okunur; bu yüzden bir yanıttaki sayılar birbiriyle tutarlıdır. `channels` her zaman `sms`, `email` ve `push`'u, `queue` da her zaman `high`, `normal` ve `low`'u taşır.
@@ -794,13 +831,14 @@ Bütün değerler `as_of` anında (veritabanı saati, mikrosaniyeli RFC 3339) al
 | Alan | Neyi sayar |
 |---|---|
 | `queue.<priority>.ready` | `available_at`'i `as_of`'ta ya da öncesinde olan `queued` bildirimler |
-| `queue.<priority>.deferred` | Tekrar deneme gibi, daha sonraki bir `available_at`'i bekleyen `queued` bildirimler |
+| `queue.<priority>.deferred` | Daha sonraki bir `available_at`'i bekleyen `queued` bildirimler: bir tekrar deneme ya da zamanlanmış bir bildirim |
 | `queue.<priority>.oldest_ready_age_seconds` | `as_of` eksi hazır olanların en erken `available_at`'i; hazır yoksa `null`. `high` gelmeye devam ederken `low` için büyüyen yaş açlığı gösterir |
 | `processing` | `as_of` anında bir worker'ın tuttuğu bildirimler; hiçbir şey tamamlanmazken yüksekse takılmış bir worker vardır |
 | `completed.sent`, `completed.failed` | `completed_at`'i `as_of − 60 s`'den sonra ve `as_of`'ta ya da öncesinde olup `sent` ya da `failed` olan bildirimler |
 | `completed.sent_per_second`, `completed.failed_per_second` | Sayıların 60'a bölümü; hiçbir şey tamamlanmadıysa `0` |
 | `completed.success_ratio` | `sent / (sent + failed)`; hiçbir şey tamamlanmadıysa `null` |
-| `latency.samples`, `latency.p50_ms`, `p95_ms`, `p99_ms` | Pencerede gönderilen bildirimlerin `created_at → sent_at` süresi, `percentile_cont` ile; örnek yoksa `null` |
+| `latency.samples`, `latency.p50_ms`, `p95_ms`, `p99_ms` | Pencerede `scheduled_at` olmadan gönderilen bildirimlerin `created_at → sent_at` süresi, `percentile_cont` ile; örnek yoksa `null` |
+| `scheduled_latency.samples`, `p50_ms`, `p95_ms`, `p99_ms` | Pencerede gönderilen zamanlanmış bildirimlerin `scheduled_at → sent_at` süresi; örnek yoksa `null` |
 
 İptaller ve hâlâ bekleyen tekrar denemeler tamamlanma sayılmaz. `sent`, provider'ın isteği kabul ettiği anlamına gelir. Gecikme kuyrukta bekleme ve tekrar denemeleri de içerir; Compose stack'inde worker'ın yeni bir bildirim claim etmeden önceki boş bekleme süresini de (`IDLE_WAIT`, 200 ms) içerir. Endpoint tamamlanan bildirimleri özetler: hız sınırının kanıtı değildir; o kanıt gerçek gönderim başlangıçlarını sayar ([Hız sınırı ve öncelik](#hız-sınırı-ve-öncelik)). 100.000 bildirimle bütün çağrı yaklaşık 11 ms sürdü; `processing` sayısı sıralı bir taramadır (yaklaşık 5 ms), kuyruk sayıları claim index'ini, tamamlananlar `completed_at` index'ini okur.
 
@@ -994,7 +1032,7 @@ docker compose run --rm migrate
 |---|---|
 | B6 — Testler ve lint için GitHub Actions hattı | Tamam ([CI](#ci-1)) |
 | B1 — Hata yönetimi: devre kesici | Tamam ([Provider kesintisi](#provider-kesintisi)) |
-| B2 — Zamanlanmış bildirimler | Planlandı ([dilim 12](docs/slices/12-scheduled-notifications.md)) |
+| B2 — Zamanlanmış bildirimler | Tamam ([Zamanlanmış bildirimler](#zamanlanmış-bildirimler)) |
 | B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Planlandı ([dilim 13](docs/slices/13-realtime-status.md)) |
 | B3 — Mesaj şablonları | Planlandı ([dilim 14](docs/slices/14-templates.md)) |
 | B5 — Dağıtık izleme | Planlandı ([dilim 15](docs/slices/15-distributed-tracing.md)) |

@@ -31,7 +31,9 @@ type ChannelMetricsBody struct {
 	Queue      QueueBody     `json:"queue"`
 	Processing int           `json:"processing" minimum:"0" doc:"Notifications a worker holds at as_of; high while nothing completes means a stalled worker"`
 	Completed  CompletedBody `json:"completed"`
-	Latency    LatencyBody   `json:"latency"`
+	Latency    LatencyBody   `json:"latency" doc:"created_at → sent_at of the window's sent notifications that were not scheduled, queue waiting and retries included"`
+	// K26: a planned wait is not delivery latency.
+	ScheduledLatency LatencyBody `json:"scheduled_latency" doc:"scheduled_at → sent_at of the window's sent notifications that were scheduled"`
 }
 
 // QueueBody holds every priority.
@@ -59,10 +61,10 @@ type CompletedBody struct {
 	SuccessRatio    *float64 `json:"success_ratio" nullable:"true" minimum:"0" maximum:"1" doc:"sent / (sent + failed); null when nothing completed. Cancellations are not completions"`
 }
 
-// LatencyBody summarizes created_at → sent_at of the window's sent
-// notifications, queue waiting and retries included.
+// LatencyBody summarizes the time to sent_at of one group of the window's
+// sent notifications.
 type LatencyBody struct {
-	Samples int      `json:"samples" minimum:"0" doc:"Notifications sent in the window"`
+	Samples int      `json:"samples" minimum:"0" doc:"Notifications of this group sent in the window"`
 	P50Ms   *float64 `json:"p50_ms" nullable:"true" doc:"null when samples is 0"`
 	P95Ms   *float64 `json:"p95_ms" nullable:"true" doc:"null when samples is 0"`
 	P99Ms   *float64 `json:"p99_ms" nullable:"true" doc:"null when samples is 0"`
@@ -81,7 +83,8 @@ func registerMetrics(api huma.API, deps Deps) {
 		Description: "Reads every value in one database snapshot taken at as_of: per channel and priority the queued " +
 			"notifications that are ready and deferred and the age of the oldest ready one; the processing count; the " +
 			"notifications sent and failed in the last 60 seconds with their rates and success ratio; and the p50, p95 " +
-			"and p99 of created_at → sent_at for those sent. It summarizes completed notifications; the rate limit is " +
+			"and p99 of created_at → sent_at for those sent without scheduled_at and of scheduled_at → sent_at for the " +
+			"scheduled ones. It summarizes completed notifications; the rate limit is " +
 			"proven by counting send starts, not by these numbers.",
 		Tags: []string{"Metrics"},
 	}, func(ctx context.Context, _ *struct{}) (*metricsOutput, error) {
@@ -116,8 +119,13 @@ func channelBody(c domain.ChannelMetrics) ChannelMetricsBody {
 			FailedPerSecond: c.Completed.FailedPerSecond(),
 			SuccessRatio:    c.Completed.SuccessRatio(),
 		},
-		Latency: LatencyBody{Samples: c.Latency.Samples, P50Ms: c.Latency.P50, P95Ms: c.Latency.P95, P99Ms: c.Latency.P99},
+		Latency:          latencyBody(c.Latency),
+		ScheduledLatency: latencyBody(c.ScheduledLatency),
 	}
+}
+
+func latencyBody(l domain.Latency) LatencyBody {
+	return LatencyBody{Samples: l.Samples, P50Ms: l.P50, P95Ms: l.P95, P99Ms: l.P99}
 }
 
 func queueBody(q domain.QueueDepth) PriorityQueueBody {

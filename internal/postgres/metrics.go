@@ -31,13 +31,20 @@ const (
 		GROUP BY channel`
 
 	// The window is half-open: after as_of − window, at or before as_of.
+	// Latency is split (K26): created_at → sent_at for the notifications sent
+	// without scheduled_at, scheduled_at → sent_at for the scheduled ones.
 	metricsCompletedSQL = `
 		SELECT channel,
 		       count(*) FILTER (WHERE status = 'sent'),
 		       count(*) FILTER (WHERE status = 'failed'),
+		       count(*) FILTER (WHERE status = 'sent' AND scheduled_at IS NULL),
 		       percentile_cont(ARRAY[0.5, 0.95, 0.99]::float8[]) WITHIN GROUP (
 		           ORDER BY (extract(epoch FROM sent_at - created_at) * 1000)::float8
-		       ) FILTER (WHERE status = 'sent')
+		       ) FILTER (WHERE status = 'sent' AND scheduled_at IS NULL),
+		       count(*) FILTER (WHERE status = 'sent' AND scheduled_at IS NOT NULL),
+		       percentile_cont(ARRAY[0.5, 0.95, 0.99]::float8[]) WITHIN GROUP (
+		           ORDER BY (extract(epoch FROM sent_at - scheduled_at) * 1000)::float8
+		       ) FILTER (WHERE status = 'sent' AND scheduled_at IS NOT NULL)
 		FROM notifications
 		WHERE completed_at > $1::timestamptz - $2::bigint * interval '1 microsecond'
 		  AND completed_at <= $1::timestamptz
@@ -109,18 +116,15 @@ func metricsAt(ctx context.Context, db querier, asOf time.Time) (domain.Metrics,
 	}
 
 	var (
-		sent, failed int
-		percentiles  []float64
+		sent, failed, immediate, scheduled int
+		immediateP, scheduledP             []float64
 	)
 	if err := forEach(ctx, db, metricsCompletedSQL, []any{asOf, domain.MetricsWindow.Microseconds()},
-		[]any{&channel, &sent, &failed, &percentiles}, func() error {
+		[]any{&channel, &sent, &failed, &immediate, &immediateP, &scheduled, &scheduledP}, func() error {
 			cm := channels[domain.Channel(channel)]
 			cm.Completed = domain.Completions{Sent: sent, Failed: failed}
-			cm.Latency = domain.Latency{Samples: sent}
-			if len(percentiles) == 3 {
-				p50, p95, p99 := percentiles[0], percentiles[1], percentiles[2]
-				cm.Latency.P50, cm.Latency.P95, cm.Latency.P99 = &p50, &p95, &p99
-			}
+			cm.Latency = latency(immediate, immediateP)
+			cm.ScheduledLatency = latency(scheduled, scheduledP)
 			return nil
 		}); err != nil {
 		return domain.Metrics{}, fmt.Errorf("metrics completed: %w", err)
@@ -141,4 +145,15 @@ func forEach(ctx context.Context, db querier, query string, args, dest []any, fn
 	}
 	_, err = pgx.ForEachRow(rows, dest, fn)
 	return err
+}
+
+// latency builds a Latency from its sample count and the three percentiles,
+// which are null without samples.
+func latency(samples int, p []float64) domain.Latency {
+	l := domain.Latency{Samples: samples}
+	if len(p) == 3 {
+		p50, p95, p99 := p[0], p[1], p[2]
+		l.P50, l.P95, l.P99 = &p50, &p95, &p99
+	}
+	return l
 }

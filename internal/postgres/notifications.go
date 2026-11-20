@@ -29,7 +29,7 @@ func NewStore(pool *pgxpool.Pool) *Store {
 
 const notificationColumns = `id::text, recipient, channel, content, priority::text, status::text,
 	attempts, last_error, correlation_id, batch_id::text, provider_message_id, provider_timestamp, sent_at,
-	created_at, updated_at`
+	created_at, updated_at, scheduled_at`
 
 const (
 	reserveKeySQL = `
@@ -38,10 +38,20 @@ const (
 		ON CONFLICT (key) DO NOTHING
 		RETURNING key`
 
+	// A scheduled notification is first available at its scheduled time
+	// (K26); any other at once, as the column default would make it.
 	insertNotificationSQL = `
-		INSERT INTO notifications (recipient, channel, content, priority, correlation_id)
-		VALUES ($1, $2, $3, $4::text::notification_priority, $5)
+		INSERT INTO notifications (recipient, channel, content, priority, correlation_id, scheduled_at, available_at)
+		VALUES ($1, $2, $3, $4::text::notification_priority, $5, $6::timestamptz, coalesce($6::timestamptz, now()))
 		RETURNING ` + notificationColumns
+
+	// pastScheduledSQL returns the zero-based positions of the times ($1, in
+	// request order, null for an unscheduled item) that are at or before the
+	// database clock (K26).
+	pastScheduledSQL = `
+		SELECT coalesce(array_agg(u.i - 1 ORDER BY u.i), '{}')::int[]
+		FROM unnest($1::text[]::timestamptz[]) WITH ORDINALITY AS u(at, i)
+		WHERE u.at <= clock_timestamp()`
 
 	completeKeySQL = `
 		UPDATE idempotency_keys
@@ -95,8 +105,11 @@ func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand
 	}
 
 	n := cmd.Notification
+	if err := checkScheduled(ctx, tx, []domain.NewNotification{n}, func(int) string { return "scheduled_at" }); err != nil {
+		return domain.CreateResult{}, err
+	}
 	created, err := scanNotification(tx.QueryRow(ctx, insertNotificationSQL,
-		n.Recipient, string(n.Channel), n.Content, string(n.Priority), cmd.CorrelationID))
+		n.Recipient, string(n.Channel), n.Content, string(n.Priority), cmd.CorrelationID, scheduledArg(n)))
 	if err != nil {
 		return domain.CreateResult{}, fmt.Errorf("insert notification: %w", err)
 	}
@@ -116,6 +129,45 @@ func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand
 		return domain.CreateResult{}, fmt.Errorf("commit: %w", err)
 	}
 	return domain.CreateResult{NotificationID: created.ID, Status: http.StatusAccepted, Body: body}, nil
+}
+
+// checkScheduled applies K26's past-time rule to the items about to be
+// saved: a scheduled_at at or before the database clock gives a validation
+// error, which rolls the transaction back and leaves the key free. It runs
+// only for a new key, so a repeat after the scheduled time still replays.
+func checkScheduled(ctx context.Context, tx pgx.Tx, items []domain.NewNotification, field func(int) string) error {
+	times := make([]*string, len(items))
+	scheduled := false
+	for i := range items {
+		if items[i].ScheduledAt != "" {
+			times[i] = &items[i].ScheduledAt
+			scheduled = true
+		}
+	}
+	if !scheduled {
+		return nil
+	}
+	var past []int32
+	if err := tx.QueryRow(ctx, pastScheduledSQL, times).Scan(&past); err != nil {
+		return fmt.Errorf("check scheduled_at: %w", err)
+	}
+	if len(past) == 0 {
+		return nil
+	}
+	errs := make([]domain.FieldError, len(past))
+	for i, pos := range past {
+		errs[i] = domain.PastError(field(int(pos)))
+	}
+	return &domain.ValidationError{Errors: errs}
+}
+
+// scheduledArg is the scheduled_at parameter: nil for an unscheduled
+// notification.
+func scheduledArg(n domain.NewNotification) *string {
+	if n.ScheduledAt == "" {
+		return nil
+	}
+	return &n.ScheduledAt
 }
 
 // reserveKey inserts the key row as the reservation. false means a committed
@@ -182,7 +234,7 @@ func scanNotification(row pgx.Row) (domain.Notification, error) {
 	)
 	err := row.Scan(&n.ID, &n.Recipient, &channel, &n.Content, &priority, &status,
 		&n.Attempts, &n.LastError, &n.CorrelationID, &n.BatchID, &n.ProviderMessageID, &n.ProviderTimestamp, &n.SentAt,
-		&n.CreatedAt, &n.UpdatedAt)
+		&n.CreatedAt, &n.UpdatedAt, &n.ScheduledAt)
 	if err != nil {
 		return domain.Notification{}, err
 	}

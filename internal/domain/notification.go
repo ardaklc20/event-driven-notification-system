@@ -59,6 +59,10 @@ type NewNotification struct {
 	Channel   Channel
 	Content   string
 	Priority  Priority
+	// ScheduledAt is the time the notification may first be sent, as RFC
+	// 3339 with an offset; "" when it is not scheduled (K26). Normalize
+	// rewrites it in UTC.
+	ScheduledAt string
 }
 
 // Notification is a saved notification.
@@ -82,6 +86,8 @@ type Notification struct {
 	SentAt    *time.Time
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// ScheduledAt is the planned first send time, or nil (K26).
+	ScheduledAt *time.Time
 }
 
 // Claim is a notification a worker holds under a lease (K3). The worker needs

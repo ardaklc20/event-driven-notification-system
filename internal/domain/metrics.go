@@ -24,7 +24,11 @@ type ChannelMetrics struct {
 	// Processing counts the notifications a worker holds.
 	Processing int
 	Completed  Completions
-	Latency    Latency
+	// Latency covers the notifications sent without scheduled_at, from
+	// created_at; ScheduledLatency the scheduled ones, from scheduled_at, so a
+	// planned wait never counts as delivery latency (K26).
+	Latency          Latency
+	ScheduledLatency Latency
 }
 
 // QueueDepth counts the queued notifications of one channel and priority.
@@ -64,7 +68,7 @@ func (c Completions) SuccessRatio() *float64 {
 	return &r
 }
 
-// Latency summarizes created_at → sent_at of the notifications sent in the
+// Latency summarizes the time to sent_at of the notifications sent in the
 // window, in milliseconds. The percentiles are nil when Samples is 0.
 type Latency struct {
 	Samples       int

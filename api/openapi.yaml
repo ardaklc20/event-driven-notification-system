@@ -169,6 +169,7 @@ components:
           $ref: "#/components/schemas/CompletedBody"
         latency:
           $ref: "#/components/schemas/LatencyBody"
+          description: created_at → sent_at of the window's sent notifications that were not scheduled, queue waiting and retries included
         processing:
           description: Notifications a worker holds at as_of; high while nothing completes means a stalled worker
           format: int64
@@ -176,11 +177,15 @@ components:
           type: integer
         queue:
           $ref: "#/components/schemas/QueueBody"
+        scheduled_latency:
+          $ref: "#/components/schemas/LatencyBody"
+          description: scheduled_at → sent_at of the window's sent notifications that were scheduled
       required:
         - queue
         - processing
         - completed
         - latency
+        - scheduled_latency
       type: object
     ChannelsMetricsBody:
       additionalProperties: false
@@ -311,7 +316,7 @@ components:
             - number
             - "null"
         samples:
-          description: Notifications sent in the window
+          description: Notifications of this group sent in the window
           format: int64
           minimum: 0
           type: integer
@@ -413,6 +418,12 @@ components:
             - "null"
         recipient:
           type: string
+        scheduled_at:
+          description: The earliest send time the request asked for, in UTC, or null when the notification was not scheduled. Retries never change it
+          format: date-time
+          type:
+            - string
+            - "null"
         sent_at:
           description: When the provider's acceptance was recorded; set together with status sent
           format: date-time
@@ -445,6 +456,7 @@ components:
         - sent_at
         - created_at
         - updated_at
+        - scheduled_at
       type: object
     NotificationRequest:
       additionalProperties: false
@@ -475,6 +487,12 @@ components:
           examples:
             - "+905551234567"
           minLength: 1
+          type: string
+        scheduled_at:
+          description: Optional. The earliest time the notification may be sent, RFC 3339 with an offset (Z or ±hh:mm); a time without an offset gets 422. A new request whose time is at or before the server's clock gets 422; there is no upper limit. Without it the notification is sent as soon as possible.
+          examples:
+            - "2026-11-22T09:00:00Z"
+          format: date-time
           type: string
       required:
         - recipient
@@ -629,7 +647,7 @@ paths:
         - Health
   /metrics:
     get:
-      description: "Reads every value in one database snapshot taken at as_of: per channel and priority the queued notifications that are ready and deferred and the age of the oldest ready one; the processing count; the notifications sent and failed in the last 60 seconds with their rates and success ratio; and the p50, p95 and p99 of created_at → sent_at for those sent. It summarizes completed notifications; the rate limit is proven by counting send starts, not by these numbers."
+      description: "Reads every value in one database snapshot taken at as_of: per channel and priority the queued notifications that are ready and deferred and the age of the oldest ready one; the processing count; the notifications sent and failed in the last 60 seconds with their rates and success ratio; and the p50, p95 and p99 of created_at → sent_at for those sent without scheduled_at and of scheduled_at → sent_at for the scheduled ones. It summarizes completed notifications; the rate limit is proven by counting send starts, not by these numbers."
       operationId: get-metrics
       responses:
         "200":
