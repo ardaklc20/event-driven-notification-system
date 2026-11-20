@@ -1,7 +1,9 @@
 # One command starts the stack: docker compose up (D3).
-# Start order (K6): postgres healthy -> migrate exits 0 -> api.
+# Start order (K6): postgres healthy -> migrate exits 0 -> api and worker.
 # Host ports are bound to 127.0.0.1 by default and can be changed with
-# BIND_ADDRESS, API_PORT and POSTGRES_PORT (K39).
+# BIND_ADDRESS, API_PORT, MOCK_PORT and POSTGRES_PORT (K39).
+# The worker sends to the mock provider unless PROVIDER_URL and
+# PROVIDER_PROFILE are set in the shell (K14).
 
 services:
   postgres:
@@ -60,6 +62,41 @@ services:
       start_interval: 1s
     # Above the API's 10-second shutdown budget (K6).
     stop_grace_period: 15s
+
+  worker:
+    build: .
+    command: ["/app/worker"]
+    environment:
+      DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
+      PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}
+      PROVIDER_PROFILE: ${PROVIDER_PROFILE:-standard}
+      HTTP_TIMEOUT: 5s
+      RESULT_BUDGET: 5s
+      LEASE_DURATION: 30s
+      IN_FLIGHT: "20"
+      IDLE_WAIT: 200ms
+      SHUTDOWN_BUDGET: 10s
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      # Started first so the first claim does not meet a closed port.
+      mockprovider:
+        condition: service_started
+    # Above the worker's 10-second shutdown budget (K6).
+    stop_grace_period: 15s
+
+  mockprovider:
+    build: .
+    command: ["/app/mockprovider"]
+    environment:
+      HTTP_ADDR: ":8081"
+      MOCK_DELAY: ${MOCK_DELAY:-0s}
+      LOG_LEVEL: info
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${MOCK_PORT:-8081}:8081"
 
 volumes:
   pgdata:

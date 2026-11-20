@@ -35,8 +35,13 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 2 || first[0].Source.Version != 1 || first[1].Source.Version != 2 {
-		t.Fatalf("first up applied %d migrations, want versions 1 and 2", len(first))
+	if len(first) != 3 {
+		t.Fatalf("first up applied %d migrations, want 3", len(first))
+	}
+	for i, r := range first {
+		if r.Source.Version != int64(i+1) {
+			t.Fatalf("migration %d has version %d, want %d", i, r.Source.Version, i+1)
+		}
 	}
 
 	second, err := provider.Up(ctx)
@@ -103,6 +108,33 @@ func TestMigrations(t *testing.T) {
 		}
 		if status != "queued" || attempts != 0 {
 			t.Errorf("status=%s attempts=%d, want queued 0", status, attempts)
+		}
+	})
+
+	t.Run("provider result columns are nullable and not unique", func(t *testing.T) {
+		for column, typ := range map[string]string{
+			"provider_message_id": "text",
+			"provider_timestamp":  "timestamp with time zone",
+			"sent_at":             "timestamp with time zone",
+		} {
+			var gotType, nullable string
+			err := db.QueryRowContext(ctx,
+				`SELECT data_type, is_nullable FROM information_schema.columns
+				 WHERE table_name = 'notifications' AND column_name = $1`, column).Scan(&gotType, &nullable)
+			if err != nil {
+				t.Fatalf("%s: %v", column, err)
+			}
+			if gotType != typ || nullable != "YES" {
+				t.Errorf("%s: %s nullable=%s, want %s nullable=YES", column, gotType, nullable, typ)
+			}
+		}
+		// Two notifications may store the same messageId (K15).
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO notifications (recipient, channel, content, priority, correlation_id, provider_message_id)
+			 VALUES ('+905551234567', 'sms', 'a', 'normal', 'test', 'same-id'),
+			        ('+905551234567', 'sms', 'b', 'normal', 'test', 'same-id')`)
+		if err != nil {
+			t.Errorf("two rows with the same provider_message_id: %v", err)
 		}
 	})
 

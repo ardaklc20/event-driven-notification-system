@@ -120,16 +120,20 @@ type rawJSONOutput struct {
 
 // NotificationBody is a notification as GET returns it.
 type NotificationBody struct {
-	ID        string    `json:"id" format:"uuid"`
-	Recipient string    `json:"recipient"`
-	Channel   string    `json:"channel" enum:"sms,email,push"`
-	Content   string    `json:"content"`
-	Priority  string    `json:"priority" enum:"high,normal,low"`
-	Status    string    `json:"status" enum:"queued,processing,sent,failed,cancelled"`
-	Attempts  int       `json:"attempts" minimum:"0" doc:"Attempts started so far; an attempt counts when a worker claims the notification"`
-	LastError *string   `json:"last_error" nullable:"true" doc:"The last delivery error, or null"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        string  `json:"id" format:"uuid"`
+	Recipient string  `json:"recipient"`
+	Channel   string  `json:"channel" enum:"sms,email,push"`
+	Content   string  `json:"content"`
+	Priority  string  `json:"priority" enum:"high,normal,low"`
+	Status    string  `json:"status" enum:"queued,processing,sent,failed,cancelled"`
+	Attempts  int     `json:"attempts" minimum:"0" doc:"Attempts started so far; an attempt counts when a worker claims the notification"`
+	LastError *string `json:"last_error" nullable:"true" doc:"The last delivery error, or null"`
+	// K15: what the provider answered with its 202.
+	ProviderMessageID *string    `json:"provider_message_id" nullable:"true" doc:"The provider's messageId from its 202 response; null before sent, or when the response body was not usable. Not unique: a provider with a static response gives every notification the same ID."`
+	ProviderTimestamp *time.Time `json:"provider_timestamp" nullable:"true" doc:"The time the provider reported in its 202 response, or null"`
+	SentAt            *time.Time `json:"sent_at" nullable:"true" doc:"When the provider's acceptance was recorded; set together with status sent"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type notificationOutput struct {
@@ -192,16 +196,19 @@ func registerNotifications(api huma.API, deps Deps) {
 			return nil, problemFor(ctx, loggerFrom(ctx, deps.Logger), err)
 		}
 		return &notificationOutput{Body: NotificationBody{
-			ID:        n.ID,
-			Recipient: n.Recipient,
-			Channel:   string(n.Channel),
-			Content:   n.Content,
-			Priority:  string(n.Priority),
-			Status:    string(n.Status),
-			Attempts:  n.Attempts,
-			LastError: n.LastError,
-			CreatedAt: n.CreatedAt,
-			UpdatedAt: n.UpdatedAt,
+			ID:                n.ID,
+			Recipient:         n.Recipient,
+			Channel:           string(n.Channel),
+			Content:           n.Content,
+			Priority:          string(n.Priority),
+			Status:            string(n.Status),
+			Attempts:          n.Attempts,
+			LastError:         n.LastError,
+			ProviderMessageID: n.ProviderMessageID,
+			ProviderTimestamp: n.ProviderTimestamp,
+			SentAt:            n.SentAt,
+			CreatedAt:         n.CreatedAt,
+			UpdatedAt:         n.UpdatedAt,
 		}}, nil
 	})
 }

@@ -112,8 +112,25 @@ components:
             - normal
             - low
           type: string
+        provider_message_id:
+          description: "The provider's messageId from its 202 response; null before sent, or when the response body was not usable. Not unique: a provider with a static response gives every notification the same ID."
+          type:
+            - string
+            - "null"
+        provider_timestamp:
+          description: The time the provider reported in its 202 response, or null
+          format: date-time
+          type:
+            - string
+            - "null"
         recipient:
           type: string
+        sent_at:
+          description: When the provider's acceptance was recorded; set together with status sent
+          format: date-time
+          type:
+            - string
+            - "null"
         status:
           enum:
             - queued
@@ -134,6 +151,9 @@ components:
         - status
         - attempts
         - last_error
+        - provider_message_id
+        - provider_timestamp
+        - sent_at
         - created_at
         - updated_at
       type: object

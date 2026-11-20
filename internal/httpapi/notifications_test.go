@@ -126,8 +126,10 @@ func TestGetNotification(t *testing.T) {
 		n.Priority != "high" || n.Status != "queued" || n.Attempts != 0 || n.LastError != nil || n.CreatedAt.IsZero() {
 		t.Errorf("GET body = %s", body)
 	}
-	if !bytes.Contains(body, []byte(`"last_error":null`)) {
-		t.Errorf("last_error is not null in %s", body)
+	for _, field := range []string{"last_error", "provider_message_id", "provider_timestamp", "sent_at"} {
+		if !bytes.Contains(body, []byte(`"`+field+`":null`)) {
+			t.Errorf("%s is not null in %s", field, body)
+		}
 	}
 
 	if resp, _ := do(t, http.MethodGet, base+"/notifications/01900000-0000-7000-8000-000000000000"); resp.StatusCode != http.StatusNotFound {

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"time"
 
 	"github.com/caarlos0/env/v11"
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
+	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
 )
 
 // Listen holds the HTTP listen address. The API's healthcheck subcommand reads
@@ -74,6 +76,89 @@ func (c API) Validate() error {
 // Migrate is the configuration of cmd/migrate.
 type Migrate struct {
 	DatabaseURL string `env:"DATABASE_URL,required,notEmpty"`
+}
+
+// Worker is the configuration of cmd/worker.
+type Worker struct {
+	DatabaseURL string `env:"DATABASE_URL,required,notEmpty"`
+	// One URL for every channel; the channel travels in the body (A2, K14).
+	ProviderURL     string           `env:"PROVIDER_URL,required,notEmpty"`
+	ProviderProfile provider.Profile `env:"PROVIDER_PROFILE" envDefault:"standard"`
+	HTTPTimeout     time.Duration    `env:"HTTP_TIMEOUT" envDefault:"5s"`
+	// ResultBudget is the part of the lease kept for writing a result.
+	ResultBudget   time.Duration `env:"RESULT_BUDGET" envDefault:"5s"`
+	LeaseDuration  time.Duration `env:"LEASE_DURATION" envDefault:"30s"`
+	InFlight       int           `env:"IN_FLIGHT" envDefault:"20"`
+	IdleWait       time.Duration `env:"IDLE_WAIT" envDefault:"200ms"`
+	ShutdownBudget time.Duration `env:"SHUTDOWN_BUDGET" envDefault:"10s"`
+	LogLevel       slog.Level    `env:"LOG_LEVEL" envDefault:"info"`
+}
+
+// Validate checks what the struct tags cannot (K32).
+func (c Worker) Validate() error {
+	var errs []error
+	if u, err := url.Parse(c.ProviderURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		// The URL itself is not repeated: a webhook.site URL holds its token.
+		errs = append(errs, errors.New("PROVIDER_URL must be an absolute http or https URL"))
+	}
+	if !c.ProviderProfile.Valid() {
+		errs = append(errs, fmt.Errorf("PROVIDER_PROFILE must be %s or %s, got %q",
+			provider.ProfileStandard, provider.ProfileWebhookSiteFree, c.ProviderProfile))
+	}
+	for name, d := range map[string]time.Duration{
+		"HTTP_TIMEOUT":    c.HTTPTimeout,
+		"RESULT_BUDGET":   c.ResultBudget,
+		"LEASE_DURATION":  c.LeaseDuration,
+		"IDLE_WAIT":       c.IdleWait,
+		"SHUTDOWN_BUDGET": c.ShutdownBudget,
+	} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be positive, got %s", name, d))
+		}
+	}
+	// The lease covers the HTTP call and writing its result (K3, K9).
+	if c.LeaseDuration < c.HTTPTimeout+c.ResultBudget {
+		errs = append(errs, fmt.Errorf("LEASE_DURATION (%s) must be at least HTTP_TIMEOUT + RESULT_BUDGET (%s)",
+			c.LeaseDuration, c.HTTPTimeout+c.ResultBudget))
+	}
+	if c.InFlight < 1 {
+		errs = append(errs, fmt.Errorf("IN_FLIGHT must be at least 1, got %d", c.InFlight))
+	}
+	return errors.Join(errs...)
+}
+
+// LoadWorker parses and validates the worker configuration.
+func LoadWorker(opts env.Options) (Worker, error) {
+	cfg, err := env.ParseAsWithOptions[Worker](opts)
+	if err != nil {
+		return Worker{}, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return Worker{}, err
+	}
+	return cfg, nil
+}
+
+// MockProvider is the configuration of cmd/mockprovider (K14).
+type MockProvider struct {
+	HTTPAddr string        `env:"HTTP_ADDR" envDefault:":8081"`
+	Delay    time.Duration `env:"MOCK_DELAY" envDefault:"0s"`
+	LogLevel slog.Level    `env:"LOG_LEVEL" envDefault:"info"`
+}
+
+// LoadMockProvider parses and validates the mock provider configuration.
+func LoadMockProvider(opts env.Options) (MockProvider, error) {
+	cfg, err := env.ParseAsWithOptions[MockProvider](opts)
+	if err != nil {
+		return MockProvider{}, err
+	}
+	if cfg.Delay < 0 {
+		return MockProvider{}, fmt.Errorf("MOCK_DELAY must not be negative, got %s", cfg.Delay)
+	}
+	if _, err := (Listen{HTTPAddr: cfg.HTTPAddr}).Port(); err != nil {
+		return MockProvider{}, err
+	}
+	return cfg, nil
 }
 
 // LoadAPI parses and validates the API configuration. With a zero opts it reads
