@@ -21,3 +21,8 @@ const MarkRetrySQL = markRetrySQL
 func CancelIn(ctx context.Context, tx pgx.Tx, id string) (domain.Notification, error) {
 	return cancelIn(ctx, tx, id)
 }
+
+// ListQuery is the listing query for f, for the test that inspects its plan.
+func ListQuery(f domain.ListFilter) (string, []any) {
+	return listQuery(f)
+}

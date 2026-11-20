@@ -144,6 +144,25 @@ type getNotificationInput struct {
 	ID string `path:"id" format:"uuid" doc:"Notification ID"`
 }
 
+type listNotificationsInput struct {
+	Status  string    `query:"status" enum:"queued,processing,sent,failed,cancelled" doc:"Only notifications with this status"`
+	Channel string    `query:"channel" enum:"sms,email,push" doc:"Only notifications on this channel"`
+	From    time.Time `query:"from" doc:"Only notifications created at or after this time (RFC 3339, included)"`
+	To      time.Time `query:"to" doc:"Only notifications created before this time (RFC 3339, excluded)"`
+	Limit   int       `query:"limit" default:"50" minimum:"1" maximum:"200" doc:"Page size; outside 1 to 200 gets 422"`
+	Cursor  string    `query:"cursor" doc:"The next_cursor of the previous page, unchanged"`
+}
+
+// ListBody is one page of GET /notifications.
+type ListBody struct {
+	Items      []NotificationBody `json:"items" doc:"Newest first: created_at descending, then ID descending"`
+	NextCursor string             `json:"next_cursor,omitempty" doc:"Pass as cursor to read the next page; absent on the last page"`
+}
+
+type listOutput struct {
+	Body ListBody
+}
+
 // CancelConflictBody is the 409 answer of a cancel: an RFC 9457 problem with
 // the status the notification has now (K9). The problem's own status member
 // is the HTTP status, so the notification's is current_status.
@@ -229,6 +248,41 @@ func registerNotifications(api huma.API, deps Deps) {
 		return &notificationOutput{Body: toBody(n)}, nil
 	})
 
+	huma.Register(api, huma.Operation{
+		OperationID: "list-notifications",
+		Method:      http.MethodGet,
+		Path:        "/notifications",
+		Summary:     "List notifications",
+		Description: "Lists notifications newest first. status, channel, from and to filter with AND; the created_at range is " +
+			"half-open, from included and to excluded. Follow next_cursor to read further pages; notifications created " +
+			"meanwhile do not shift them. Each page is a separate query, so a notification whose status changes between " +
+			"pages can move into or out of a filtered list. A cursor that was not produced by a previous page gets 400.",
+		Tags:   []string{"Notifications"},
+		Errors: []int{http.StatusBadRequest, http.StatusUnprocessableEntity},
+	}, func(ctx context.Context, in *listNotificationsInput) (*listOutput, error) {
+		list := service.ListInput{
+			Status:  domain.Status(in.Status),
+			Channel: domain.Channel(in.Channel),
+			Cursor:  in.Cursor,
+			Limit:   in.Limit,
+		}
+		if !in.From.IsZero() {
+			list.From = &in.From
+		}
+		if !in.To.IsZero() {
+			list.To = &in.To
+		}
+		page, err := deps.Notifications.List(ctx, list)
+		if err != nil {
+			return nil, problemFor(ctx, loggerFrom(ctx, deps.Logger), err)
+		}
+		items := make([]NotificationBody, len(page.Items))
+		for i, n := range page.Items {
+			items[i] = toBody(n)
+		}
+		return &listOutput{Body: ListBody{Items: items, NextCursor: page.NextCursor}}, nil
+	})
+
 	conflictSchema := registry.Schema(reflect.TypeFor[CancelConflictBody](), true, "CancelConflictBody")
 	huma.Register(api, huma.Operation{
 		OperationID: "cancel-notification",
@@ -281,6 +335,9 @@ func problemFor(ctx context.Context, logger *slog.Logger, err error) error {
 			&huma.ErrorDetail{Location: "header." + IdempotencyKeyHeader, Message: "already used with a different request"})
 	case errors.Is(err, domain.ErrNotFound):
 		return huma.Error404NotFound("notification not found")
+	case errors.Is(err, domain.ErrInvalidCursor):
+		return huma.Error400BadRequest("cursor is not valid",
+			&huma.ErrorDetail{Location: "query.cursor", Message: "is not the next_cursor of a previous page"})
 	case errors.As(err, &conflict):
 		return &CancelConflictBody{
 			ErrorModel: huma.ErrorModel{

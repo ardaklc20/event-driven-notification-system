@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 4 {
-		t.Fatalf("first up applied %d migrations, want 4", len(first))
+	if len(first) != 5 {
+		t.Fatalf("first up applied %d migrations, want 5", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -191,6 +191,18 @@ func TestMigrations(t *testing.T) {
 		}
 		const want = "CREATE INDEX notifications_claim_idx ON public.notifications USING btree " +
 			"(channel, priority, available_at, id) WHERE (status = 'queued'::notification_status)"
+		if def != want {
+			t.Errorf("index = %s, want %s", def, want)
+		}
+	})
+
+	t.Run("listing index", func(t *testing.T) {
+		var def string
+		if err := db.QueryRowContext(ctx,
+			`SELECT pg_get_indexdef('notifications_list_idx'::regclass)`).Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		const want = "CREATE INDEX notifications_list_idx ON public.notifications USING btree (created_at DESC, id DESC)"
 		if def != want {
 			t.Errorf("index = %s, want %s", def, want)
 		}

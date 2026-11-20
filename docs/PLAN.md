@@ -51,7 +51,7 @@ Every slice passes all of these before its pull request is merged.
 | 4 | [Retries and crash recovery](slices/04-retries-and-recovery.md) | Core | R11, R12, R13, N3 | K3, K7, K9, K14, K15, K21, K31, K32, K39, K40, K41 | 3 | `feat/retries-recovery` | done ([#11](https://github.com/ardaklc20/event-driven-notification-system/pull/11)) |
 | 5 | [Rate limit and priority](slices/05-rate-limit-and-priority.md) | Core | R8, R9, N1, N2 | K2, K5, K6, K8, K14, K21, K32, K42, K43 | 4 | `feat/rate-limit-priority` | done ([#12](https://github.com/ardaklc20/event-driven-notification-system/pull/12)) |
 | 6 | [Cancellation](slices/06-cancellation.md) | Core | R5 | K5, K9, K22 | 5 | `feat/cancel` | done ([#13](https://github.com/ardaklc20/event-driven-notification-system/pull/13)) |
-| 7 | [Listing](slices/07-listing.md) | Core | R6 | K13, K17, K19, K44 | 2 | `feat/listing` | planned |
+| 7 | [Listing](slices/07-listing.md) | Core | R6 | K13, K17, K19, K44 | 2 | `feat/listing` | done ([#14](https://github.com/ardaklc20/event-driven-notification-system/pull/14)) |
 | 8 | [Batches](slices/08-batches.md) | Core | R2, R4, R10, R11, R15 | K10, K11, K12, K13, K17, K19, K21 | 2, 7 | `feat/batches` | planned |
 | 9 | [Metrics](slices/09-metrics.md) | Core | R14 | K8, K19, K20, K30 | 4 | `feat/metrics` | planned |
 | 10 | [Core release check](slices/10-core-release-check.md) | Core | D1–D6, A1, R13 | K3, K4, K10, K11, K14, K18, K19, K29, K31, K32, K39 | 1–9 | `docs/core-readme` | planned |

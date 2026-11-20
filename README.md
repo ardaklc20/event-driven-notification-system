@@ -4,7 +4,7 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 6):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled.
+**Current state (slice 7):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, and notifications can be listed with filters and a cursor.
 
 ## Requirements
 
@@ -149,6 +149,32 @@ curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
 ```
 
 Returns `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` and `updated_at`. An unknown ID gets `404`, a malformed one `422`. The three provider fields are filled when the notification is `sent`: `provider_message_id` and `provider_timestamp` come from the provider's `202` body, `sent_at` is when the acceptance was recorded. `provider_message_id` is not unique: a provider with a static response, such as a free webhook.site URL, gives every notification the same ID.
+
+### List notifications
+
+```bash
+curl -s 'http://localhost:8080/notifications?channel=sms&status=sent&from=2026-11-20T00:00:00Z&limit=20'
+```
+
+Returns `{"items": [...], "next_cursor": "..."}`, newest first (`created_at`, then ID, both descending). Each item has the same fields as a single read.
+
+| Parameter | Rule |
+|---|---|
+| `status` | `queued`, `processing`, `sent`, `failed` or `cancelled` |
+| `channel` | `sms`, `email` or `push` |
+| `from`, `to` | RFC 3339 times on `created_at`; `from` is included, `to` is not |
+| `limit` | Page size, 50 by default, 1 to 200; `0` or `201` gets `422` |
+| `cursor` | The `next_cursor` of the previous page, unchanged |
+
+Filters combine with AND. To read every page, pass each `next_cursor` back until it is absent:
+
+```bash
+CURSOR=$(curl -s 'http://localhost:8080/notifications?channel=sms&limit=50' | jq -r '.next_cursor // empty')
+curl -s -G http://localhost:8080/notifications --data-urlencode channel=sms --data-urlencode limit=50 \
+  --data-urlencode "cursor=$CURSOR"
+```
+
+The cursor holds the last row's `created_at` and ID, so notifications created meanwhile do not shift the pages: every notification that existed when the first page was read appears exactly once. Each page is a separate query, though, not one snapshot: a notification whose status changes between pages can move into or out of a filtered list. A cursor that did not come from a previous page gets `400`. There is no total count and no jumping to a page.
 
 ### Cancel a notification
 
@@ -346,9 +372,9 @@ cmd/loadgen/            sends the rate-limit load through the API
 cmd/ratecount/          counts send starts per one-second window from worker logs
 internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
-internal/service/       create, read and cancel rules
+internal/service/       create, read, cancel and list rules; the listing cursor
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, read, cancel, claim with permit, result writes, give-back, recovery
+internal/postgres/      connection pool and all SQL: create, read, list, cancel, claim with permit, result writes, give-back, recovery
 internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery
 internal/provider/      provider HTTP client, start gate, response classification, Retry-After
 internal/ratecheck/     largest count in a half-open one-second window
@@ -374,7 +400,7 @@ docs/                   requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 6):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir.
+**Şu anki durum (dilim 7):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir.
 
 ## Gereksinimler
 
@@ -519,6 +545,32 @@ curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
 ```
 
 `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` ve `updated_at` döner. Bilinmeyen bir ID `404`, bozuk biçimli bir ID `422` alır. Üç provider alanı bildirim `sent` olduğunda dolar: `provider_message_id` ve `provider_timestamp` provider'ın `202` gövdesinden gelir, `sent_at` kabulün kaydedildiği andır. `provider_message_id` benzersiz değildir: ücretsiz bir webhook.site URL'i gibi sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
+
+### Bildirimleri listeleme
+
+```bash
+curl -s 'http://localhost:8080/notifications?channel=sms&status=sent&from=2026-11-20T00:00:00Z&limit=20'
+```
+
+En yeniden eskiye (`created_at`, sonra ID, ikisi de azalan) `{"items": [...], "next_cursor": "..."}` döner. Her öğe tekil okumayla aynı alanları taşır.
+
+| Parametre | Kural |
+|---|---|
+| `status` | `queued`, `processing`, `sent`, `failed` ya da `cancelled` |
+| `channel` | `sms`, `email` ya da `push` |
+| `from`, `to` | `created_at` üzerinde RFC 3339 zamanları; `from` dahildir, `to` değildir |
+| `limit` | Sayfa boyutu, varsayılan 50, 1 ile 200 arası; `0` ya da `201` `422` alır |
+| `cursor` | Önceki sayfanın `next_cursor`'ı, değiştirilmeden |
+
+Filtreler AND ile birleşir. Bütün sayfaları okumak için her `next_cursor` gelmeyene kadar geri gönderilir:
+
+```bash
+CURSOR=$(curl -s 'http://localhost:8080/notifications?channel=sms&limit=50' | jq -r '.next_cursor // empty')
+curl -s -G http://localhost:8080/notifications --data-urlencode channel=sms --data-urlencode limit=50 \
+  --data-urlencode "cursor=$CURSOR"
+```
+
+Cursor son satırın `created_at`'ini ve ID'sini taşır; bu yüzden arada oluşturulan bildirimler sayfaları kaydırmaz: ilk sayfa okunduğunda var olan her bildirim tam olarak bir kez görünür. Ancak her sayfa ayrı bir sorgudur, tek bir anlık görüntü değildir: durumu iki sayfa arasında değişen bir bildirim filtreli bir listeye girebilir ya da listeden çıkabilir. Önceki bir sayfadan gelmeyen bir cursor `400` alır. Toplam sayı ve bir sayfaya atlama yoktur.
 
 ### Bildirim iptal etme
 
@@ -716,9 +768,9 @@ cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
 cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
 internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
-internal/service/       oluşturma, okuma ve iptal kuralları
+internal/service/       oluşturma, okuma, iptal ve listeleme kuralları; listeleme cursor'ı
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, iptal, izinli claim, sonuç yazma, geri verme, kurtarma
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, listeleme, iptal, izinli claim, sonuç yazma, geri verme, kurtarma
 internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma
 internal/provider/      provider HTTP istemcisi, başlatma kapısı, cevap sınıflandırması, Retry-After
 internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı
