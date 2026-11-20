@@ -119,7 +119,7 @@ go test -count=1 -v -run '^(TestSendStartsWithPausedWorker|TestRateLimitTwoWorke
 R8_IN_FLIGHT=30 R8_PROVIDER_DELAY=200ms go test -count=1 -v -run '^TestRateLimitTwoWorkers$' ./internal/worker/
 ```
 
-On the stack, in its own Compose project with two workers (free the host ports first with `docker compose stop`):
+On the stack, in its own Compose project with two workers (free the host ports first with `docker compose stop`, and run `docker compose start` afterwards):
 
 ```bash
 P="nsys-r8-$(date +%s)"
@@ -140,10 +140,11 @@ A run on 2026-11-20: 3,000 creates accepted in 630 ms; all `sent` 16 seconds aft
 ### Create a notification
 
 ```bash
-curl -s -X POST http://localhost:8080/notifications \
+RESP=$(curl -s -X POST http://localhost:8080/notifications \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: order-1234-sms' \
-  -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 123456","priority":"high"}'
+  -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 123456","priority":"high"}')
+echo "$RESP"; ID=$(echo "$RESP" | jq -r .id)
 ```
 
 ```json
@@ -155,10 +156,10 @@ The API answers `202 Accepted` as soon as the notification is saved; delivery ha
 ### Read a notification
 
 ```bash
-curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
+curl -s "http://localhost:8080/notifications/$ID"
 ```
 
-Returns `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `batch_id` (`null` for a single create), `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` and `updated_at`. An unknown ID gets `404`, a malformed one `422`. The three provider fields are filled when the notification is `sent`: `provider_message_id` and `provider_timestamp` come from the provider's `202` body, `sent_at` is when the acceptance was recorded. `provider_message_id` is not unique: a provider with a static response, such as a free webhook.site URL, gives every notification the same ID.
+`ID` is the one the create above printed. Returns `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `batch_id` (`null` for a single create), `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` and `updated_at`. An unknown ID gets `404`, a malformed one `422`. The three provider fields are filled when the notification is `sent`: `provider_message_id` and `provider_timestamp` come from the provider's `202` body, `sent_at` is when the acceptance was recorded. `provider_message_id` is not unique: a provider with a static response, such as a free webhook.site URL, gives every notification the same ID.
 
 ### List notifications
 
@@ -189,7 +190,7 @@ The cursor holds the last row's `created_at` and ID, so notifications created me
 ### Cancel a notification
 
 ```bash
-curl -s -X POST http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40/cancel
+curl -s -X POST "http://localhost:8080/notifications/$ID/cancel"
 ```
 
 Only a **pending** notification can be cancelled, and pending means `queued`: waiting for its first attempt, for its channel's rate limit or for its retry time. No worker holds it then, so stopping it is safe.
@@ -212,13 +213,14 @@ The cancel locks the row and decides from the status it reads under the lock. A 
 ### Batches
 
 ```bash
-curl -s -X POST http://localhost:8080/notifications/batch \
+RESP=$(curl -s -X POST http://localhost:8080/notifications/batch \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: campaign-42' \
   -d '{"notifications":[
         {"recipient":"+905551234567","channel":"sms","content":"one","priority":"high"},
         {"recipient":"a@example.com","channel":"email","content":"two"},
-        {"recipient":"device-token-1","channel":"push","content":"three","priority":"low"}]}'
+        {"recipient":"device-token-1","channel":"push","content":"three","priority":"low"}]}')
+echo "$RESP"; BATCH_ID=$(echo "$RESP" | jq -r .batch_id)
 ```
 
 ```json
@@ -230,7 +232,7 @@ A batch holds 1 to 1,000 notifications, each with its own channel and priority, 
 There are two separate limits: the item count (1 to 1,000; `0` or `1001` gets `422`) and the request body size: 16 MiB by default, set with `BATCH_MAX_BODY_BYTES`, answered with `413`. The body limit is not derived from the content limits, because escaped JSON can take 12 bytes for one emoji (`\ud83d\ude00`). So a batch of large items can get `413` with fewer than 1,000 items; split it into smaller batches.
 
 ```bash
-curl -s 'http://localhost:8080/batches/01a1f9f2-5de8-77ce-bd30-03a9e9616567?limit=50'
+curl -s "http://localhost:8080/batches/$BATCH_ID?limit=50"
 ```
 
 ```json
@@ -612,7 +614,7 @@ go test -count=1 -v -run '^(TestSendStartsWithPausedWorker|TestRateLimitTwoWorke
 R8_IN_FLIGHT=30 R8_PROVIDER_DELAY=200ms go test -count=1 -v -run '^TestRateLimitTwoWorkers$' ./internal/worker/
 ```
 
-Stack üzerinde, iki worker'lı kendi Compose projesinde (önce `docker compose stop` ile host portları boşaltılır):
+Stack üzerinde, iki worker'lı kendi Compose projesinde (önce `docker compose stop` ile host portları boşaltılır, sonra `docker compose start` çalıştırılır):
 
 ```bash
 P="nsys-r8-$(date +%s)"
@@ -633,10 +635,11 @@ docker compose -p "$P" down -v
 ### Bildirim oluşturma
 
 ```bash
-curl -s -X POST http://localhost:8080/notifications \
+RESP=$(curl -s -X POST http://localhost:8080/notifications \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: order-1234-sms' \
-  -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 123456","priority":"high"}'
+  -d '{"recipient":"+905551234567","channel":"sms","content":"Your code is 123456","priority":"high"}')
+echo "$RESP"; ID=$(echo "$RESP" | jq -r .id)
 ```
 
 ```json
@@ -648,10 +651,10 @@ API, bildirim kaydedilir kaydedilmez `202 Accepted` döner; teslim daha sonra bi
 ### Bildirim okuma
 
 ```bash
-curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
+curl -s "http://localhost:8080/notifications/$ID"
 ```
 
-`id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `batch_id` (tekil oluşturmada `null`), `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` ve `updated_at` döner. Bilinmeyen bir ID `404`, bozuk biçimli bir ID `422` alır. Üç provider alanı bildirim `sent` olduğunda dolar: `provider_message_id` ve `provider_timestamp` provider'ın `202` gövdesinden gelir, `sent_at` kabulün kaydedildiği andır. `provider_message_id` benzersiz değildir: ücretsiz bir webhook.site URL'i gibi sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
+`ID`, yukarıdaki oluşturmanın yazdığı ID'dir. `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `batch_id` (tekil oluşturmada `null`), `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` ve `updated_at` döner. Bilinmeyen bir ID `404`, bozuk biçimli bir ID `422` alır. Üç provider alanı bildirim `sent` olduğunda dolar: `provider_message_id` ve `provider_timestamp` provider'ın `202` gövdesinden gelir, `sent_at` kabulün kaydedildiği andır. `provider_message_id` benzersiz değildir: ücretsiz bir webhook.site URL'i gibi sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
 
 ### Bildirimleri listeleme
 
@@ -682,7 +685,7 @@ Cursor son satırın `created_at`'ini ve ID'sini taşır; bu yüzden arada oluş
 ### Bildirim iptal etme
 
 ```bash
-curl -s -X POST http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40/cancel
+curl -s -X POST "http://localhost:8080/notifications/$ID/cancel"
 ```
 
 Yalnızca **bekleyen** bir bildirim iptal edilebilir ve bekleyen, `queued` demektir: ilk denemesini, kanalının hız sınırını ya da tekrar deneme zamanını bekliyordur. O sırada onu hiçbir worker tutmaz; bu yüzden durdurmak güvenlidir.
@@ -705,13 +708,14 @@ Yalnızca **bekleyen** bir bildirim iptal edilebilir ve bekleyen, `queued` demek
 ### Toplu bildirim
 
 ```bash
-curl -s -X POST http://localhost:8080/notifications/batch \
+RESP=$(curl -s -X POST http://localhost:8080/notifications/batch \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: campaign-42' \
   -d '{"notifications":[
         {"recipient":"+905551234567","channel":"sms","content":"one","priority":"high"},
         {"recipient":"a@example.com","channel":"email","content":"two"},
-        {"recipient":"device-token-1","channel":"push","content":"three","priority":"low"}]}'
+        {"recipient":"device-token-1","channel":"push","content":"three","priority":"low"}]}')
+echo "$RESP"; BATCH_ID=$(echo "$RESP" | jq -r .batch_id)
 ```
 
 ```json
@@ -723,7 +727,7 @@ Bir toplu istek her biri kendi kanalı ve önceliğiyle 1 ile 1.000 arası bildi
 İki ayrı sınır vardır: öğe sayısı (1 ile 1.000 arası; `0` ya da `1001` `422` alır) ve istek gövdesinin boyutu: varsayılan 16 MiB, `BATCH_MAX_BODY_BYTES` ile ayarlanır, aşılınca `413` döner. Gövde sınırı içerik sınırlarından türetilmez, çünkü kaçışlı JSON'da tek bir emoji 12 bayt tutabilir (`\ud83d\ude00`). Bu yüzden büyük öğelerden oluşan bir toplu istek 1.000 öğeye varmadan `413` alabilir; daha küçük toplu isteklere bölünmelidir.
 
 ```bash
-curl -s 'http://localhost:8080/batches/01a1f9f2-5de8-77ce-bd30-03a9e9616567?limit=50'
+curl -s "http://localhost:8080/batches/$BATCH_ID?limit=50"
 ```
 
 ```json
