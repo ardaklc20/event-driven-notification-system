@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 7 {
-		t.Fatalf("first up applied %d migrations, want 7", len(first))
+	if len(first) != 8 {
+		t.Fatalf("first up applied %d migrations, want 8", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -90,6 +90,32 @@ func TestMigrations(t *testing.T) {
 				t.Errorf("constraint %s: count=%d err=%v", name, n, err)
 			}
 		}
+	})
+
+	t.Run("provider breaker has one closed row", func(t *testing.T) {
+		var (
+			rows, generation, failures int
+			open, probe                bool
+		)
+		if err := db.QueryRowContext(ctx,
+			`SELECT count(*), max(generation), max(consecutive_failures),
+			        bool_or(open_until IS NOT NULL), bool_or(probe_token IS NOT NULL)
+			 FROM provider_breaker`).Scan(&rows, &generation, &failures, &open, &probe); err != nil {
+			t.Fatal(err)
+		}
+		if rows != 1 || generation != 0 || failures != 0 || open || probe {
+			t.Fatalf("rows=%d generation=%d failures=%d open=%v probe=%v, want one closed row",
+				rows, generation, failures, open, probe)
+		}
+		_, err := db.ExecContext(ctx, `INSERT INTO provider_breaker DEFAULT VALUES`)
+		assertSQLState(t, "second row", err, "23505")
+		_, err = db.ExecContext(ctx, `INSERT INTO provider_breaker (id) VALUES (false)`)
+		assertConstraint(t, "row with key false", err, "provider_breaker_single_row")
+		_, err = db.ExecContext(ctx, `UPDATE provider_breaker SET probe_token = gen_random_uuid()`)
+		assertConstraint(t, "probe token without its end", err, "provider_breaker_probe_complete")
+		_, err = db.ExecContext(ctx,
+			`UPDATE provider_breaker SET probe_token = gen_random_uuid(), probe_expires_at = now()`)
+		assertConstraint(t, "probe while closed", err, "provider_breaker_probe_only_open")
 	})
 
 	t.Run("generated id is UUIDv7 and defaults apply", func(t *testing.T) {

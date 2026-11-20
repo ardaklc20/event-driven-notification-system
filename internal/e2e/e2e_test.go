@@ -146,6 +146,7 @@ func (s *stack) startWorker(t *testing.T) {
 		RecoveryBatch:    100,
 		PermitInterval:   11 * time.Millisecond,
 		PermitGrace:      100 * time.Millisecond,
+		Breaker:          domain.BreakerPolicy{Threshold: 5, Cooldown: 30 * time.Second, MaxCooldown: 5 * time.Minute},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

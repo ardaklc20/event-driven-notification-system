@@ -21,15 +21,25 @@ import (
 // Profile decides how the provider's 429 is handled (K7, K14).
 type Profile string
 
-// The two profiles.
+// The two profiles the configuration accepts, and one only tests use.
 const (
 	ProfileStandard        Profile = "standard"
 	ProfileWebhookSiteFree Profile = "webhook_site_free"
+	// ProfileSharedQuotaTest states that the provider's quota covers the
+	// whole URL, so a 429 with Retry-After opens the circuit breaker (K34).
+	// No real provider is known to state this; PROVIDER_PROFILE rejects it.
+	ProfileSharedQuotaTest Profile = "shared_quota_test"
 )
 
-// Valid reports whether p is a known profile.
+// Valid reports whether p is a profile the configuration accepts.
 func (p Profile) Valid() bool {
 	return p == ProfileStandard || p == ProfileWebhookSiteFree
+}
+
+// SharedQuota reports whether the profile states that a 429's quota covers
+// the whole URL (K34). Neither configurable profile does.
+func (p Profile) SharedQuota() bool {
+	return p == ProfileSharedQuotaTest
 }
 
 // CorrelationIDHeader carries the notification's correlation ID to the

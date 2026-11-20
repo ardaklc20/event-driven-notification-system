@@ -150,6 +150,10 @@ func TestWorkerConfig(t *testing.T) {
 			RecoveryBatch:    100,
 			PermitInterval:   11 * time.Millisecond,
 			PermitGrace:      100 * time.Millisecond,
+
+			BreakerThreshold:   5,
+			BreakerCooldown:    30 * time.Second,
+			BreakerMaxCooldown: 5 * time.Minute,
 		}
 		if cfg != want {
 			t.Errorf("got %+v\nwant %+v", cfg, want)
@@ -198,6 +202,10 @@ func TestWorkerConfig(t *testing.T) {
 			"zero attempts":                       {"MAX_ATTEMPTS": "0"},
 			"backoff cap below base":              {"BACKOFF_BASE": "10s", "BACKOFF_CAP": "5s"},
 			"negative backoff base":               {"BACKOFF_BASE": "-1s"},
+			"breaker threshold below 1":           {"BREAKER_THRESHOLD": "0"},
+			"zero breaker cooldown":               {"BREAKER_COOLDOWN": "0s"},
+			"breaker cooldown above its maximum":  {"BREAKER_COOLDOWN": "10m", "BREAKER_MAX_COOLDOWN": "5m"},
+			"test-only shared-quota profile":      {"PROVIDER_PROFILE": "shared_quota_test"},
 		} {
 			vars := map[string]string{"DATABASE_URL": testURL, "PROVIDER_URL": testProviderURL}
 			for k, v := range extra {
@@ -206,6 +214,20 @@ func TestWorkerConfig(t *testing.T) {
 			if _, err := config.LoadWorker(env.Options{Environment: vars}); err == nil {
 				t.Errorf("%s: LoadWorker accepted %v", name, extra)
 			}
+		}
+	})
+
+	t.Run("breaker cooldown equal to its maximum", func(t *testing.T) {
+		cfg, err := config.LoadWorker(env.Options{Environment: map[string]string{
+			"DATABASE_URL": testURL, "PROVIDER_URL": testProviderURL,
+			"BREAKER_THRESHOLD": "1", "BREAKER_COOLDOWN": "2s", "BREAKER_MAX_COOLDOWN": "2s",
+		}})
+		if err != nil {
+			t.Fatalf("LoadWorker: %v", err)
+		}
+		want := domain.BreakerPolicy{Threshold: 1, Cooldown: 2 * time.Second, MaxCooldown: 2 * time.Second}
+		if got := cfg.Breaker(); got != want {
+			t.Errorf("Breaker() = %+v, want %+v", got, want)
 		}
 	})
 

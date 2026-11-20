@@ -83,6 +83,11 @@ services:
       RECOVERY_BATCH: "100"
       PERMIT_INTERVAL: 11ms
       PERMIT_GRACE: 100ms
+      # Circuit breaker (K34); a value set on the docker compose command
+      # reaches the container.
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-5}
+      BREAKER_COOLDOWN: ${BREAKER_COOLDOWN:-30s}
+      BREAKER_MAX_COOLDOWN: ${BREAKER_MAX_COOLDOWN:-5m}
       LOG_LEVEL: info
     depends_on:
       postgres:

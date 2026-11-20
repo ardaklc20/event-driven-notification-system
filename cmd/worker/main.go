@@ -68,6 +68,7 @@ func run() int {
 		RecoveryBatch:    cfg.RecoveryBatch,
 		PermitInterval:   cfg.PermitInterval,
 		PermitGrace:      cfg.PermitGrace,
+		Breaker:          cfg.Breaker(),
 	})
 
 	// After the first signal, a second one terminates the process at once.

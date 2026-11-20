@@ -53,14 +53,16 @@ func claimOn(t *testing.T, tx pgx.Tx) (id, token string) {
 	t.Helper()
 	req := request(domain.ChannelSMS)
 	var (
-		waitUS                                       int64
+		generation, openUS, waitUS                   *int64
+		hasPermit                                    bool
 		gotID, recipient, channel, content, corr, tk *string
 		attempt                                      *int
 		leaseUS, permitUS                            *int64
 	)
 	err := tx.QueryRow(t.Context(), postgres.ClaimSQL, string(req.Channel), req.MaxAttempts, req.Lease.Microseconds(),
 		req.PermitInterval.Microseconds(), req.PermitGrace.Microseconds()).Scan(
-		&waitUS, &gotID, &recipient, &channel, &content, &corr, &attempt, &tk, &leaseUS, &permitUS)
+		&generation, &openUS, &hasPermit, &waitUS,
+		&gotID, &recipient, &channel, &content, &corr, &attempt, &tk, &leaseUS, &permitUS)
 	if err != nil {
 		t.Fatalf("claim on the held transaction: %v", err)
 	}

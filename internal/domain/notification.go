@@ -104,6 +104,11 @@ type Claim struct {
 	// computed by the database in the same way (K42). The send must start
 	// before that deadline.
 	PermitRemaining time.Duration
+	// Generation is the circuit breaker's generation the claim read (K34).
+	// Only a result of the current generation moves the breaker.
+	Generation int64
+	// Probe is true for the one claim taken after the breaker's cooldown.
+	Probe bool
 }
 
 // ClaimRequest is one claim attempt on one channel (K5, K42).
@@ -120,7 +125,7 @@ type ClaimRequest struct {
 // ClaimOutcome is what a claim attempt found (K5).
 type ClaimOutcome string
 
-// The four claim outcomes.
+// The claim outcomes.
 const (
 	// ClaimClaimed: a notification and a permit.
 	ClaimClaimed ClaimOutcome = "claimed"
@@ -131,6 +136,9 @@ const (
 	// ClaimEmpty: the permit is due, but no notification is; the permit was
 	// not used.
 	ClaimEmpty ClaimOutcome = "empty"
+	// ClaimPaused: the circuit breaker is open, so no channel gets a permit
+	// (K34).
+	ClaimPaused ClaimOutcome = "paused"
 )
 
 // ClaimResult is the answer to one claim attempt.
@@ -139,7 +147,9 @@ type ClaimResult struct {
 	// Claim is set when Outcome is ClaimClaimed.
 	Claim Claim
 	// Wait is the time until the next permit is due, computed by the
-	// database, when Outcome is ClaimThrottled.
+	// database, when Outcome is ClaimThrottled. When Outcome is ClaimPaused,
+	// it is the time until the breaker's cooldown ends, or zero when the
+	// cooldown is over and another claim holds or is taking the probe slot.
 	Wait time.Duration
 }
 

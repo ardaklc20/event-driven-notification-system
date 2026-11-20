@@ -114,6 +114,21 @@ type Worker struct {
 	// channel, and how long after its time a permit may start a send.
 	PermitInterval time.Duration `env:"PERMIT_INTERVAL" envDefault:"11ms"`
 	PermitGrace    time.Duration `env:"PERMIT_GRACE" envDefault:"100ms"`
+
+	// Circuit breaker (K34): outage failures in a row that open it, the
+	// first pause, and the cap of its doubling.
+	BreakerThreshold   int           `env:"BREAKER_THRESHOLD" envDefault:"5"`
+	BreakerCooldown    time.Duration `env:"BREAKER_COOLDOWN" envDefault:"30s"`
+	BreakerMaxCooldown time.Duration `env:"BREAKER_MAX_COOLDOWN" envDefault:"5m"`
+}
+
+// Breaker returns the circuit breaker's settings as the domain type.
+func (c Worker) Breaker() domain.BreakerPolicy {
+	return domain.BreakerPolicy{
+		Threshold:   c.BreakerThreshold,
+		Cooldown:    c.BreakerCooldown,
+		MaxCooldown: c.BreakerMaxCooldown,
+	}
 }
 
 // rateWindow and rateLimit are the case's limit: 100 send starts per channel
@@ -142,6 +157,7 @@ func (c Worker) Validate() error {
 		"SHUTDOWN_BUDGET":   c.ShutdownBudget,
 		"RECOVERY_INTERVAL": c.RecoveryInterval,
 		"PERMIT_GRACE":      c.PermitGrace,
+		"BREAKER_COOLDOWN":  c.BreakerCooldown,
 	} {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %s", name, d))
@@ -164,6 +180,13 @@ func (c Worker) Validate() error {
 	}
 	if c.RecoveryBatch < 1 {
 		errs = append(errs, fmt.Errorf("RECOVERY_BATCH must be at least 1, got %d", c.RecoveryBatch))
+	}
+	if c.BreakerThreshold < 1 {
+		errs = append(errs, fmt.Errorf("BREAKER_THRESHOLD must be at least 1, got %d", c.BreakerThreshold))
+	}
+	if c.BreakerMaxCooldown < c.BreakerCooldown {
+		errs = append(errs, fmt.Errorf("BREAKER_COOLDOWN (%s) must not be above BREAKER_MAX_COOLDOWN (%s)",
+			c.BreakerCooldown, c.BreakerMaxCooldown))
 	}
 	// K42's bound: 101 starts need 101 permits, the first and the last at
 	// least 100 × PERMIT_INTERVAL apart, and a start comes at most

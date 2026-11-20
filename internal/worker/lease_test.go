@@ -20,19 +20,11 @@ func (unusedStore) ClaimNext(context.Context, domain.ClaimRequest) (domain.Claim
 	return domain.ClaimResult{}, errNotUsed
 }
 
-func (unusedStore) MarkSent(context.Context, string, string, domain.Acceptance) (bool, error) {
-	return false, errNotUsed
+func (unusedStore) Finish(context.Context, domain.Finish) (domain.Finished, error) {
+	return domain.Finished{}, errNotUsed
 }
 
-func (unusedStore) MarkFailed(context.Context, string, string, string) (bool, error) {
-	return false, errNotUsed
-}
-
-func (unusedStore) MarkRetry(context.Context, string, string, string, time.Duration) (bool, error) {
-	return false, errNotUsed
-}
-
-func (unusedStore) GiveBack(context.Context, string, string) (bool, error) {
+func (unusedStore) GiveBack(context.Context, domain.Attempt) (bool, error) {
 	return false, errNotUsed
 }
 
