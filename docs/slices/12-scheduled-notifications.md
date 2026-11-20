@@ -83,15 +83,17 @@ ID=$(curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: appli
   -d "{\"recipient\":\"+905551234567\",\"channel\":\"sms\",\"content\":\"later\",\"scheduled_at\":\"$AT\"}" | jq -r .id)
 sleep 5;  curl -s "http://localhost:8080/notifications/$ID" | jq -r .status
 sleep 10; curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at, sent_at}'
+SCHED=$(curl -s "http://localhost:8080/notifications/$ID" | jq -r .scheduled_at)
+START=$(docker compose logs --no-log-prefix worker \
+  | jq -rR --arg id "$ID" 'fromjson? | select(.notification_id == $id and has("started_at")) | .started_at' | head -1)
+echo "scheduled_at=$SCHED started_at=$START"
+jq -n --arg s "$SCHED" --arg t "$START" \
+  '($t | sub("\\.[0-9]+"; "") | fromdateiso8601) >= ($s | sub("\\.[0-9]+"; "") | fromdateiso8601)'
 ```
 
-**Expected observation:** `queued` after 5 seconds; `sent` after 15 seconds, with `sent_at` not before `scheduled_at`.
+`sent_at` is written when the answer arrives, so `sent_at` after `scheduled_at` would not show that the POST left on time. The check therefore reads the send start from the worker's start line (`started_at`, slice 5, [K42]). The mock's `/stats` holds counts only, not one notification's arrival time. Fractions of a second are cut before the comparison; `scheduled_at` is in whole seconds here, so cutting them cannot turn an early start into a pass. `TestScheduledNotClaimedEarly` stays the repository proof.
 
-## Review items to apply before this slice starts
-
-Found in the plan review; this note is updated with them in the slice's own pull request.
-
-1. **Early sends in the stack check:** `sent_at` is written when the answer arrives, so `sent_at >= scheduled_at` does not show that the POST did not leave early. Compare `scheduled_at` with the mock's recorded arrival time or the worker's start line instead. `TestScheduledNotClaimedEarly` stays as the repository proof.
+**Expected observation:** `queued` after 5 seconds; `sent` after 15 seconds; the start line exists, and the last command prints `true`: the send started at or after `scheduled_at`.
 
 ## Evidence for the pull request
 
@@ -109,3 +111,4 @@ Found in the plan review; this note is updated with them in the slice's own pull
 [K20]: ../DECISIONS.md#k20--metrics-a-json-endpoint-computed-from-postgresql
 [K24]: ../DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify
 [K26]: ../DECISIONS.md#k26--scheduled-notifications-b2-an-optional-absolute-scheduled_at
+[K42]: ../DECISIONS.md#k42--send-starts-a-permit-with-a-start-deadline
