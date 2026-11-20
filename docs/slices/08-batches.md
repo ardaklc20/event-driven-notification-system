@@ -40,6 +40,7 @@
 | `notifications.batch_id` | Null for a single create; references `batches(id)` |
 | `notifications.batch_position` | Null for a single create; the item's 0-based index in the request; unique together with `batch_id` |
 | Index | `notifications (batch_id, created_at DESC, id DESC)` where `batch_id` is not null |
+| Checks | `item_count` between 1 and 1,000; `batch_id` and `batch_position` both null or both set |
 
 `batch_position` stores the request order. PostgreSQL documents no order for the rows `RETURNING` gives back, so the `202` response orders its IDs by `batch_position`, not by the order rows come back.
 
@@ -50,14 +51,14 @@
 3. Item count 0 or above 1,000 → `422`.
 4. Check the structure rules of every item (slice 2); collect every error with `{index, field, message}`; any error → `422`, nothing written, key untouched.
 5. Apply defaults to every item; compute the request hash over the normalized items plus the operation `batch`.
-6. One transaction: reserve the key (if any) as in slice 2. A repeat returns the stored response. Only the owner checks every item's configurable content limit (a violation rolls back: `422` naming the items' indexes, nothing stored, key free), then inserts the batch row, then all items with one multi-row parameterized `INSERT` (about 6,000 parameters for 1,000 items, below the protocol's limit, [K17]), then stores the `202` response bytes on the key, then commits.
+6. One transaction: reserve the key (if any) as in slice 2. A repeat returns the stored response. Only the owner checks every item's configurable content limit (a violation rolls back: `422` naming the items' indexes, nothing stored, key free), then inserts the batch row, then all items with one multi-row parameterized `INSERT` (the correlation ID and the batch ID are shared parameters and each item adds five, so 1,000 items use 5,002 parameters, below the protocol's 65,535, [K17]), then stores the `202` response bytes on the key, then commits.
 7. The `202` body: `{batch_id, notification_ids: [... in request order]}`.
 
 ## Batch status ([K12], [K13])
 
 - `GET /batches/{id}`: `404` for an unknown batch.
-- `counts`: one entry per status, zeros included, computed in the same statement snapshot as the first page.
-- `items`: the batch's notifications with the listing order and cursor of slice 7, `limit` default 50.
+- `counts`: one entry per status, zeros included, read in the same snapshot as the page: the batch row, the counts and the page run in one `REPEATABLE READ READ ONLY` transaction.
+- `items`: the batch's notifications with the listing order and cursor of slice 7, `limit` default 50. Each notification body now carries `batch_id` (`null` for a single create), also in `GET /notifications/{id}` and the listing.
 
 ## Steps
 
@@ -84,6 +85,8 @@
 | `TestBatchStatusCounts` | `internal/httpapi` | HTTP + database | Subtest *all*: a batch of 12 with statuses set to 3 `queued`, 2 `processing`, 4 `sent`, 2 `failed`, 1 `cancelled`. Subtest *missing*: a batch of 5 with 2 `queued` and 3 `sent` only | *All*: counts match exactly. *Missing*: `processing`, `failed` and `cancelled` are present in the response with `0` |
 | `TestBatchStatusPages` | `internal/httpapi` | HTTP + database | Batch A with 25 items; batch B with 10 items created in between | Walking A with `limit=7` until no `next_cursor` returns each of A's 25 IDs exactly once, every item carries A's batch ID, and none of B's rows appear |
 | `TestBatchCorrelationID` | `internal/httpapi` | HTTP + database | Batch with `X-Correlation-ID: batch-1` | Every row stores `batch-1`; `notification_id`s differ |
+| `TestGetBatchErrors` | `internal/httpapi` | HTTP + database | One batch | Unknown ID `404`; malformed ID `422`; broken cursor `400`; `limit=201` `422` |
+| `TestBatchPageQueryPlan` | `internal/postgres` | Database | Two batches of 1,000 among 5,000 single notifications, statistics updated | The first page and a page after a cursor read `notifications_batch_idx` with no sort |
 
 ## Acceptance checks
 
@@ -91,9 +94,9 @@
 |---|---|---|
 | Item validation ([R10]) | `go test -count=1 -v -run '^TestValidateBatch$' ./internal/domain/` | `--- PASS: TestValidateBatch` |
 | Create ([R2]) | `go test -count=1 -v -run '^(TestBatchSizeLimits\|TestBatchInvalidItem\|TestBatchBodyLimit\|TestBatchResponseOrder)$' ./internal/httpapi/` | Four `--- PASS` lines |
-| Atomicity ([K17]) | `go test -count=1 -v -run '^TestBatchInsertFailureLeavesNothing$' ./internal/postgres/` | `--- PASS: TestBatchInsertFailureLeavesNothing` |
+| Atomicity ([K17]) | `go test -count=1 -v -run '^(TestBatchInsertFailureLeavesNothing\|TestBatchPageQueryPlan)$' ./internal/postgres/` | Two `--- PASS` lines |
 | Idempotency ([R11]) | `go test -count=1 -v -run '^(TestBatchIdempotentRepeat\|TestKeyReusedAcrossOperations)$' ./internal/httpapi/` | Two `--- PASS` lines |
-| Status ([R4]) | `go test -count=1 -v -run '^(TestBatchStatusCounts\|TestBatchStatusPages)$' ./internal/httpapi/` | Two `--- PASS` lines |
+| Status ([R4]) | `go test -count=1 -v -run '^(TestBatchStatusCounts\|TestBatchStatusPages\|TestGetBatchErrors)$' ./internal/httpapi/` | Three `--- PASS` lines |
 | Correlation ID ([R15]) | `go test -count=1 -v -run '^TestBatchCorrelationID$' ./internal/httpapi/` | `--- PASS: TestBatchCorrelationID` |
 | Through the stack | [Stack check](#stack-check) | As described there |
 

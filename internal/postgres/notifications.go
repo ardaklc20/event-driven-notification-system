@@ -24,7 +24,7 @@ func NewStore(pool *pgxpool.Pool) *Store {
 }
 
 const notificationColumns = `id::text, recipient, channel, content, priority::text, status::text,
-	attempts, last_error, correlation_id, provider_message_id, provider_timestamp, sent_at,
+	attempts, last_error, correlation_id, batch_id::text, provider_message_id, provider_timestamp, sent_at,
 	created_at, updated_at`
 
 const (
@@ -72,16 +72,15 @@ func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after Commit
 
 	if cmd.Key != "" {
-		var reserved string
-		err := tx.QueryRow(ctx, reserveKeySQL, cmd.Key, string(cmd.Operation), cmd.RequestHash).Scan(&reserved)
-		if errors.Is(err, pgx.ErrNoRows) {
+		reserved, err := reserveKey(ctx, tx, cmd.Key, cmd.Operation, cmd.RequestHash)
+		if err != nil {
+			return domain.CreateResult{}, err
+		}
+		if !reserved {
 			if err := tx.Rollback(ctx); err != nil {
 				return domain.CreateResult{}, fmt.Errorf("rollback: %w", err)
 			}
-			return s.replay(ctx, cmd)
-		}
-		if err != nil {
-			return domain.CreateResult{}, fmt.Errorf("reserve key: %w", err)
+			return s.replay(ctx, cmd.Key, cmd.Operation, cmd.RequestHash)
 		}
 	}
 
@@ -115,9 +114,24 @@ func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand
 	return domain.CreateResult{NotificationID: created.ID, Status: http.StatusAccepted, Body: body}, nil
 }
 
+// reserveKey inserts the key row as the reservation. false means a committed
+// request already completed the key; if another transaction holds it,
+// PostgreSQL makes this insert wait until that transaction ends (K10).
+func reserveKey(ctx context.Context, tx pgx.Tx, key string, op domain.Operation, hash []byte) (bool, error) {
+	var reserved string
+	err := tx.QueryRow(ctx, reserveKeySQL, key, string(op), hash).Scan(&reserved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reserve key: %w", err)
+	}
+	return true, nil
+}
+
 // replay reads the response stored with a completed key. The SELECT is a new
 // statement, so under Read Committed it sees the committed row.
-func (s *Store) replay(ctx context.Context, cmd domain.CreateCommand) (domain.CreateResult, error) {
+func (s *Store) replay(ctx context.Context, key string, op domain.Operation, requestHash []byte) (domain.CreateResult, error) {
 	var (
 		operation      string
 		hash           []byte
@@ -125,11 +139,11 @@ func (s *Store) replay(ctx context.Context, cmd domain.CreateCommand) (domain.Cr
 		body           []byte
 		notificationID *string
 	)
-	err := s.pool.QueryRow(ctx, readKeySQL, cmd.Key).Scan(&operation, &hash, &status, &body, &notificationID)
+	err := s.pool.QueryRow(ctx, readKeySQL, key).Scan(&operation, &hash, &status, &body, &notificationID)
 	if err != nil {
 		return domain.CreateResult{}, fmt.Errorf("read stored response: %w", err)
 	}
-	if operation != string(cmd.Operation) || !bytes.Equal(hash, cmd.RequestHash) {
+	if operation != string(op) || !bytes.Equal(hash, requestHash) {
 		return domain.CreateResult{}, domain.ErrIdempotencyConflict
 	}
 	if status == nil {
@@ -163,7 +177,7 @@ func scanNotification(row pgx.Row) (domain.Notification, error) {
 		status   string
 	)
 	err := row.Scan(&n.ID, &n.Recipient, &channel, &n.Content, &priority, &status,
-		&n.Attempts, &n.LastError, &n.CorrelationID, &n.ProviderMessageID, &n.ProviderTimestamp, &n.SentAt,
+		&n.Attempts, &n.LastError, &n.CorrelationID, &n.BatchID, &n.ProviderMessageID, &n.ProviderTimestamp, &n.SentAt,
 		&n.CreatedAt, &n.UpdatedAt)
 	if err != nil {
 		return domain.Notification{}, err

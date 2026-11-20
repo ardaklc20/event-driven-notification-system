@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 5 {
-		t.Fatalf("first up applied %d migrations, want 5", len(first))
+	if len(first) != 6 {
+		t.Fatalf("first up applied %d migrations, want 6", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -206,6 +206,38 @@ func TestMigrations(t *testing.T) {
 		if def != want {
 			t.Errorf("index = %s, want %s", def, want)
 		}
+	})
+
+	t.Run("batch schema", func(t *testing.T) {
+		var def string
+		if err := db.QueryRowContext(ctx,
+			`SELECT pg_get_indexdef('notifications_batch_idx'::regclass)`).Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		const want = "CREATE INDEX notifications_batch_idx ON public.notifications USING btree " +
+			"(batch_id, created_at DESC, id DESC) WHERE (batch_id IS NOT NULL)"
+		if def != want {
+			t.Errorf("index = %s, want %s", def, want)
+		}
+
+		var batchID string
+		if err := db.QueryRowContext(ctx,
+			`INSERT INTO batches (item_count, correlation_id) VALUES (2, 'test') RETURNING id::text`).Scan(&batchID); err != nil {
+			t.Fatal(err)
+		}
+		insert := `INSERT INTO notifications (recipient, channel, content, priority, correlation_id, batch_id, batch_position)
+			VALUES ('+905551234567', 'sms', 'x', 'normal', 'test', $1::uuid, $2)`
+		if _, err := db.ExecContext(ctx, insert, batchID, 0); err != nil {
+			t.Fatalf("first item: %v", err)
+		}
+		_, err := db.ExecContext(ctx, insert, batchID, 0)
+		assertSQLState(t, "same position twice", err, "23505") // unique_violation
+		_, err = db.ExecContext(ctx, insert, batchID, nil)
+		assertSQLState(t, "batch without position", err, "23514")
+		_, err = db.ExecContext(ctx, insert, "01a1f9e9-6831-7926-8408-d50f412669df", 1)
+		assertSQLState(t, "unknown batch", err, "23503") // foreign_key_violation
+		_, err = db.ExecContext(ctx, `INSERT INTO batches (item_count, correlation_id) VALUES (1001, 'test')`)
+		assertSQLState(t, "1,001 items", err, "23514")
 	})
 
 	t.Run("unknown channel and negative attempts are rejected", func(t *testing.T) {

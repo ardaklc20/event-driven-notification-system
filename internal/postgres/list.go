@@ -30,6 +30,9 @@ func listQuery(f domain.ListFilter) (string, []any) {
 	if f.Channel != "" {
 		where = append(where, "channel = "+param(string(f.Channel)))
 	}
+	if f.BatchID != "" {
+		where = append(where, "notifications.batch_id = "+param(f.BatchID)+"::text::uuid")
+	}
 	if f.From != nil {
 		where = append(where, "created_at >= "+param(*f.From))
 	}
@@ -53,8 +56,17 @@ func listQuery(f domain.ListFilter) (string, []any) {
 // ListNotifications returns at most f.Limit notifications that match f,
 // newest first by (created_at, id); with f.After, only those below it.
 func (s *Store) ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error) {
+	return listOn(ctx, s.pool, f)
+}
+
+// querier is a pool or a transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func listOn(ctx context.Context, db querier, f domain.ListFilter) ([]domain.Notification, error) {
 	q, args := listQuery(f)
-	rows, err := s.pool.Query(ctx, q, args...)
+	rows, err := db.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list notifications: %w", err)
 	}

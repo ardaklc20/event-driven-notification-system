@@ -66,7 +66,8 @@ func runServer() int {
 			Name: "database",
 			Run:  func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
 		}},
-		Notifications: service.NewNotifications(postgres.NewStore(pool), cfg.Limits()),
+		Notifications:     service.NewNotifications(postgres.NewStore(pool), cfg.Limits()),
+		BatchMaxBodyBytes: cfg.BatchMaxBodyBytes,
 	})
 	srv := &http.Server{
 		Handler:           handler,

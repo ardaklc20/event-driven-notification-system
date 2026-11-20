@@ -24,7 +24,13 @@ type Deps struct {
 	// Checks run on every GET /readyz (K30).
 	Checks        []Check
 	Notifications *service.Notifications
+	// BatchMaxBodyBytes is the largest batch body; 0 means
+	// DefaultBatchMaxBodyBytes (K12).
+	BatchMaxBodyBytes int64
 }
+
+// DefaultBatchMaxBodyBytes is the default batch body limit, 16 MiB (K12).
+const DefaultBatchMaxBodyBytes = 16 << 20
 
 // New returns the API's handler: the router with every operation registered,
 // wrapped in the middleware.
@@ -52,6 +58,7 @@ func newAPI(deps Deps) (*http.ServeMux, huma.API) {
 	api := humago.New(mux, apiConfig())
 	registerHealth(api, deps)
 	registerNotifications(api, deps)
+	registerBatches(api, deps)
 	return mux, api
 }
 

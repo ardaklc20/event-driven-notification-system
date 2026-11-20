@@ -1,5 +1,5 @@
-// Package service holds the create, read and (later) cancel, list and metrics
-// rules. It defines the store interface it needs; internal/postgres implements
+// Package service holds the create, read, cancel, list, batch and (later)
+// metrics rules. It defines the store interface it needs; internal/postgres implements
 // it without importing this package (K23).
 package service
 
@@ -16,6 +16,8 @@ type Store interface {
 	GetNotification(ctx context.Context, id string) (domain.Notification, error)
 	CancelNotification(ctx context.Context, id string) (domain.Notification, error)
 	ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error)
+	CreateBatch(ctx context.Context, cmd domain.BatchCommand) (domain.CreateResult, error)
+	GetBatch(ctx context.Context, id string, f domain.ListFilter) (domain.Batch, []domain.Notification, error)
 }
 
 // Notifications creates, reads, cancels and lists notifications.
@@ -96,22 +98,102 @@ type ListResult struct {
 // the last returned row. A cursor that does not decode gives
 // domain.ErrInvalidCursor.
 func (s *Notifications) List(ctx context.Context, in ListInput) (ListResult, error) {
-	f := domain.ListFilter{Status: in.Status, Channel: in.Channel, From: in.From, To: in.To, Limit: in.Limit + 1}
-	if in.Cursor != "" {
-		c, err := DecodeCursor(in.Cursor)
-		if err != nil {
-			return ListResult{}, err
-		}
-		f.After = &c
+	f, err := listFilter(in.Cursor, in.Limit)
+	if err != nil {
+		return ListResult{}, err
 	}
+	f.Status, f.Channel, f.From, f.To = in.Status, in.Channel, in.From, in.To
 	items, err := s.store.ListNotifications(ctx, f)
 	if err != nil {
 		return ListResult{}, err
 	}
-	if len(items) <= in.Limit {
-		return ListResult{Items: items}, nil
+	return page(items, in.Limit), nil
+}
+
+// listFilter returns the filter that reads one row more than limit, after
+// the decoded cursor.
+func listFilter(cursor string, limit int) (domain.ListFilter, error) {
+	f := domain.ListFilter{Limit: limit + 1}
+	if cursor != "" {
+		c, err := DecodeCursor(cursor)
+		if err != nil {
+			return domain.ListFilter{}, err
+		}
+		f.After = &c
 	}
-	items = items[:in.Limit]
+	return f, nil
+}
+
+// page cuts the extra row read to learn whether another page exists and
+// builds the next cursor from the last returned row.
+func page(items []domain.Notification, limit int) ListResult {
+	if len(items) <= limit {
+		return ListResult{Items: items}
+	}
+	items = items[:limit]
 	last := items[len(items)-1]
-	return ListResult{Items: items, NextCursor: EncodeCursor(domain.Cursor{CreatedAt: last.CreatedAt, ID: last.ID})}, nil
+	return ListResult{Items: items, NextCursor: EncodeCursor(domain.Cursor{CreatedAt: last.CreatedAt, ID: last.ID})}
+}
+
+// BatchInput is one batch create request (K12).
+type BatchInput struct {
+	Items         []domain.NewNotification
+	Key           string
+	CorrelationID string
+}
+
+// CreateBatch follows the order of Create for every item: structure rules and
+// defaults for all items with every error collected, the request hash over
+// all normalized items, then the store's transaction, which checks the
+// content limits of every item only when it is about to save them. respond
+// builds the 202 body from the batch ID and the IDs in request order.
+func (s *Notifications) CreateBatch(ctx context.Context, in BatchInput,
+	respond func(batchID string, ids []string) ([]byte, error)) (domain.CreateResult, error) {
+	if len(in.Items) == 0 || len(in.Items) > domain.MaxBatchItems {
+		return domain.CreateResult{}, &domain.ValidationError{Errors: []domain.FieldError{{
+			Field: "notifications", Code: domain.CodeUnknownValue, Message: "must hold 1 to 1000 items",
+		}}}
+	}
+	items, errs := domain.NormalizeBatch(in.Items)
+	if len(errs) > 0 {
+		return domain.CreateResult{}, &domain.ValidationError{Errors: errs}
+	}
+	return s.store.CreateBatch(ctx, domain.BatchCommand{
+		Items:         items,
+		CorrelationID: in.CorrelationID,
+		Key:           in.Key,
+		RequestHash:   domain.RequestHash(domain.OperationBatch, items),
+		CheckLimits: func() error {
+			var errs []domain.FieldError
+			for i, n := range items {
+				errs = append(errs, domain.ItemErrors(i, s.limits.Check(n))...)
+			}
+			if len(errs) > 0 {
+				return &domain.ValidationError{Errors: errs}
+			}
+			return nil
+		},
+		Respond: respond,
+	})
+}
+
+// BatchResult is a batch with one page of its notifications.
+type BatchResult struct {
+	Batch domain.Batch
+	Page  ListResult
+}
+
+// GetBatch returns the batch's counts per status and one page of its
+// notifications in the listing order (K12, K13); domain.ErrBatchNotFound for
+// an unknown ID, domain.ErrInvalidCursor for a cursor no page produced.
+func (s *Notifications) GetBatch(ctx context.Context, id, cursor string, limit int) (BatchResult, error) {
+	f, err := listFilter(cursor, limit)
+	if err != nil {
+		return BatchResult{}, err
+	}
+	b, items, err := s.store.GetBatch(ctx, id, f)
+	if err != nil {
+		return BatchResult{}, err
+	}
+	return BatchResult{Batch: b, Page: page(items, limit)}, nil
 }

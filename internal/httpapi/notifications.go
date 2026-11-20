@@ -61,9 +61,15 @@ type createNotificationInput struct {
 	Body           NotificationRequest
 }
 
-// Resolve checks every raw value of the Idempotency-Key header, so a repeated
-// header is seen too. A bad key gets 400 and nothing is written (K10).
+// Resolve checks the Idempotency-Key header.
 func (in *createNotificationInput) Resolve(ctx huma.Context) []error {
+	return resolveIdempotencyKey(ctx)
+}
+
+// resolveIdempotencyKey checks every raw value of the Idempotency-Key header,
+// so a repeated header is seen too. A bad key gets 400 and nothing is written
+// (K10).
+func resolveIdempotencyKey(ctx huma.Context) []error {
 	var values []string
 	ctx.EachHeader(func(name, value string) {
 		if http.CanonicalHeaderKey(name) == IdempotencyKeyHeader {
@@ -128,6 +134,7 @@ type NotificationBody struct {
 	Status    string  `json:"status" enum:"queued,processing,sent,failed,cancelled"`
 	Attempts  int     `json:"attempts" minimum:"0" doc:"Attempts started so far; an attempt counts when a worker claims the notification"`
 	LastError *string `json:"last_error" nullable:"true" doc:"The last delivery error, or null"`
+	BatchID   *string `json:"batch_id" nullable:"true" format:"uuid" doc:"The batch the notification was created in, or null for a single create"`
 	// K15: what the provider answered with its 202.
 	ProviderMessageID *string    `json:"provider_message_id" nullable:"true" doc:"The provider's messageId from its 202 response; null before sent, or when the response body was not usable. Not unique: a provider with a static response gives every notification the same ID."`
 	ProviderTimestamp *time.Time `json:"provider_timestamp" nullable:"true" doc:"The time the provider reported in its 202 response, or null"`
@@ -186,6 +193,7 @@ func toBody(n domain.Notification) NotificationBody {
 		Status:            string(n.Status),
 		Attempts:          n.Attempts,
 		LastError:         n.LastError,
+		BatchID:           n.BatchID,
 		ProviderMessageID: n.ProviderMessageID,
 		ProviderTimestamp: n.ProviderTimestamp,
 		SentAt:            n.SentAt,
@@ -335,6 +343,8 @@ func problemFor(ctx context.Context, logger *slog.Logger, err error) error {
 			&huma.ErrorDetail{Location: "header." + IdempotencyKeyHeader, Message: "already used with a different request"})
 	case errors.Is(err, domain.ErrNotFound):
 		return huma.Error404NotFound("notification not found")
+	case errors.Is(err, domain.ErrBatchNotFound):
+		return huma.Error404NotFound("batch not found")
 	case errors.Is(err, domain.ErrInvalidCursor):
 		return huma.Error400BadRequest("cursor is not valid",
 			&huma.ErrorDetail{Location: "query.cursor", Message: "is not the next_cursor of a previous page"})

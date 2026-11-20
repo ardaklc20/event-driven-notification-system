@@ -45,6 +45,10 @@ type API struct {
 	SMSContentLimit   int `env:"SMS_CONTENT_LIMIT" envDefault:"160"`
 	EmailContentLimit int `env:"EMAIL_CONTENT_LIMIT" envDefault:"10000"`
 	PushContentLimit  int `env:"PUSH_CONTENT_LIMIT" envDefault:"1000"`
+
+	// BatchMaxBodyBytes is the largest POST /notifications/batch body; a larger
+	// one gets 413 (K12). 16 MiB by default.
+	BatchMaxBodyBytes int64 `env:"BATCH_MAX_BODY_BYTES" envDefault:"16777216"`
 }
 
 // Limits returns the content limits as the domain type.
@@ -69,6 +73,9 @@ func (c API) Validate() error {
 		if limit <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %d", name, limit))
 		}
+	}
+	if c.BatchMaxBodyBytes <= 0 {
+		errs = append(errs, fmt.Errorf("BATCH_MAX_BODY_BYTES must be positive, got %d", c.BatchMaxBodyBytes))
 	}
 	return errors.Join(errs...)
 }

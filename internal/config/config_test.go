@@ -37,19 +37,24 @@ func TestAPIConfig(t *testing.T) {
 		if cfg.Limits() != domain.DefaultLimits() {
 			t.Errorf("Limits = %+v, want %+v", cfg.Limits(), domain.DefaultLimits())
 		}
+		if cfg.BatchMaxBodyBytes != 16<<20 {
+			t.Errorf("BatchMaxBodyBytes = %d, want 16 MiB", cfg.BatchMaxBodyBytes)
+		}
 	})
 
 	t.Run("explicit values", func(t *testing.T) {
 		cfg, err := config.LoadAPI(env.Options{Environment: map[string]string{
-			"DATABASE_URL":     testURL,
-			"HTTP_ADDR":        "127.0.0.1:9090",
-			"LOG_LEVEL":        "debug",
-			"SHUTDOWN_TIMEOUT": "3s",
+			"DATABASE_URL":         testURL,
+			"HTTP_ADDR":            "127.0.0.1:9090",
+			"LOG_LEVEL":            "debug",
+			"SHUTDOWN_TIMEOUT":     "3s",
+			"BATCH_MAX_BODY_BYTES": "1048576",
 		}})
 		if err != nil {
 			t.Fatalf("LoadAPI: %v", err)
 		}
-		if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.LogLevel != slog.LevelDebug || cfg.ShutdownTimeout != 3*time.Second {
+		if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.LogLevel != slog.LevelDebug || cfg.ShutdownTimeout != 3*time.Second ||
+			cfg.BatchMaxBodyBytes != 1<<20 {
 			t.Errorf("got %+v", cfg)
 		}
 	})
@@ -90,6 +95,7 @@ func TestAPIConfig(t *testing.T) {
 			"zero shutdown":        {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "0s"},
 			"zero sms limit":       {"DATABASE_URL": testURL, "SMS_CONTENT_LIMIT": "0"},
 			"negative push limit":  {"DATABASE_URL": testURL, "PUSH_CONTENT_LIMIT": "-1"},
+			"zero batch body":      {"DATABASE_URL": testURL, "BATCH_MAX_BODY_BYTES": "0"},
 		} {
 			if _, err := config.LoadAPI(env.Options{Environment: vars}); err == nil {
 				t.Errorf("%s: LoadAPI accepted %v", name, vars)
