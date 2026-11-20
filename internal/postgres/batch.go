@@ -31,29 +31,30 @@ const (
 )
 
 // insertItemsSQL returns one multi-row INSERT for n items. $1 is the
-// correlation ID and $2 the batch ID, shared by every row; each item adds six
-// parameters, so 1,000 items use 6,002, below the protocol's 65,535 (K17). A
-// scheduled item is first available at its scheduled time (K26).
+// correlation ID and $2 the batch ID, shared by every row; each item adds
+// seven parameters, so 1,000 items use 7,002, below the protocol's 65,535
+// (K17). A scheduled item is first available at its scheduled time (K26).
 func insertItemsSQL(n int) string {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO notifications
-		(recipient, channel, content, priority, batch_position, scheduled_at, available_at, correlation_id, batch_id)
+		(recipient, channel, content, priority, batch_position, scheduled_at, available_at, template_id, correlation_id, batch_id)
 		VALUES `)
 	for i := range n {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		p := 3 + i*6
+		p := 3 + i*7
 		fmt.Fprintf(&b, "($%d, $%d, $%d, $%d::text::notification_priority, $%d, $%d::timestamptz, "+
-			"coalesce($%d::timestamptz, now()), $1, $2::text::uuid)",
-			p, p+1, p+2, p+3, p+4, p+5, p+5)
+			"coalesce($%d::timestamptz, now()), $%d::text::uuid, $1, $2::text::uuid)",
+			p, p+1, p+2, p+3, p+4, p+5, p+5, p+6)
 	}
 	b.WriteString(" RETURNING id::text, batch_position")
 	return b.String()
 }
 
 // CreateBatch saves a batch under the K10 and K12 rules, in one transaction:
-// reserve the key, check the content limits, insert the batch row, insert
+// reserve the key, load the items' templates with one query and let Prepare
+// render and check every item (K33), insert the batch row, insert
 // every item with one statement, store the 202 bytes with the key, commit.
 // Any failure rolls everything back: no batch, no notification, no key.
 func (s *Store) CreateBatch(ctx context.Context, cmd domain.BatchCommand) (domain.CreateResult, error) {
@@ -76,12 +77,20 @@ func (s *Store) CreateBatch(ctx context.Context, cmd domain.BatchCommand) (domai
 		}
 	}
 
-	if cmd.CheckLimits != nil {
-		if err := cmd.CheckLimits(); err != nil {
+	items := cmd.Items
+	if cmd.Prepare != nil {
+		templates, err := loadTemplates(ctx, tx, items)
+		if err != nil {
 			return domain.CreateResult{}, err
 		}
+		if items, err = cmd.Prepare(templates); err != nil {
+			return domain.CreateResult{}, err
+		}
+		if len(items) != len(cmd.Items) {
+			return domain.CreateResult{}, fmt.Errorf("prepare returned %d items for %d", len(items), len(cmd.Items))
+		}
 	}
-	if err := checkScheduled(ctx, tx, cmd.Items, func(i int) string {
+	if err := checkScheduled(ctx, tx, items, func(i int) string {
 		return fmt.Sprintf("notifications[%d].scheduled_at", i)
 	}); err != nil {
 		return domain.CreateResult{}, err
@@ -92,12 +101,12 @@ func (s *Store) CreateBatch(ctx context.Context, cmd domain.BatchCommand) (domai
 		return domain.CreateResult{}, fmt.Errorf("insert batch: %w", err)
 	}
 
-	args := make([]any, 0, 2+6*len(cmd.Items))
+	args := make([]any, 0, 2+7*len(items))
 	args = append(args, cmd.CorrelationID, batchID)
-	for i, n := range cmd.Items {
-		args = append(args, n.Recipient, string(n.Channel), n.Content, string(n.Priority), i, scheduledArg(n))
+	for i, n := range items {
+		args = append(args, n.Recipient, string(n.Channel), n.Content, string(n.Priority), i, scheduledArg(n), templateArg(n))
 	}
-	rows, err := tx.Query(ctx, insertItemsSQL(len(cmd.Items)), args...)
+	rows, err := tx.Query(ctx, insertItemsSQL(len(items)), args...)
 	if err != nil {
 		return domain.CreateResult{}, fmt.Errorf("insert items: %w", err)
 	}

@@ -29,7 +29,7 @@ func NewStore(pool *pgxpool.Pool) *Store {
 
 const notificationColumns = `id::text, recipient, channel, content, priority::text, status::text,
 	attempts, last_error, correlation_id, batch_id::text, provider_message_id, provider_timestamp, sent_at,
-	created_at, updated_at, scheduled_at`
+	created_at, updated_at, scheduled_at, template_id::text`
 
 const (
 	reserveKeySQL = `
@@ -41,8 +41,8 @@ const (
 	// A scheduled notification is first available at its scheduled time
 	// (K26); any other at once, as the column default would make it.
 	insertNotificationSQL = `
-		INSERT INTO notifications (recipient, channel, content, priority, correlation_id, scheduled_at, available_at)
-		VALUES ($1, $2, $3, $4::text::notification_priority, $5, $6::timestamptz, coalesce($6::timestamptz, now()))
+		INSERT INTO notifications (recipient, channel, content, priority, correlation_id, scheduled_at, available_at, template_id)
+		VALUES ($1, $2, $3, $4::text::notification_priority, $5, $6::timestamptz, coalesce($6::timestamptz, now()), $7::text::uuid)
 		RETURNING ` + notificationColumns
 
 	// pastScheduledSQL returns the zero-based positions of the times ($1, in
@@ -76,7 +76,8 @@ const (
 //     until that transaction ends.
 //  2. If no row comes back, the key was completed by a committed request:
 //     roll back and read the stored response with a separate SELECT.
-//  3. Otherwise (or without a key) check the configurable limits, insert the
+//  3. Otherwise (or without a key) load the template the request names, let
+//     Prepare render it and check the content limits (K33), insert the
 //     notification, store the response bytes with the key and commit.
 func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand) (domain.CreateResult, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -98,18 +99,21 @@ func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand
 		}
 	}
 
-	if cmd.CheckLimits != nil {
-		if err := cmd.CheckLimits(); err != nil {
+	n := cmd.Notification
+	if cmd.Prepare != nil {
+		templates, err := loadTemplates(ctx, tx, []domain.NewNotification{n})
+		if err != nil {
+			return domain.CreateResult{}, err
+		}
+		if n, err = cmd.Prepare(templates); err != nil {
 			return domain.CreateResult{}, err
 		}
 	}
-
-	n := cmd.Notification
 	if err := checkScheduled(ctx, tx, []domain.NewNotification{n}, func(int) string { return "scheduled_at" }); err != nil {
 		return domain.CreateResult{}, err
 	}
 	created, err := scanNotification(tx.QueryRow(ctx, insertNotificationSQL,
-		n.Recipient, string(n.Channel), n.Content, string(n.Priority), cmd.CorrelationID, scheduledArg(n)))
+		n.Recipient, string(n.Channel), n.Content, string(n.Priority), cmd.CorrelationID, scheduledArg(n), templateArg(n)))
 	if err != nil {
 		return domain.CreateResult{}, fmt.Errorf("insert notification: %w", err)
 	}
@@ -234,7 +238,7 @@ func scanNotification(row pgx.Row) (domain.Notification, error) {
 	)
 	err := row.Scan(&n.ID, &n.Recipient, &channel, &n.Content, &priority, &status,
 		&n.Attempts, &n.LastError, &n.CorrelationID, &n.BatchID, &n.ProviderMessageID, &n.ProviderTimestamp, &n.SentAt,
-		&n.CreatedAt, &n.UpdatedAt, &n.ScheduledAt)
+		&n.CreatedAt, &n.UpdatedAt, &n.ScheduledAt, &n.TemplateID)
 	if err != nil {
 		return domain.Notification{}, err
 	}

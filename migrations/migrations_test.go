@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 10 {
-		t.Fatalf("first up applied %d migrations, want 10", len(first))
+	if len(first) != 11 {
+		t.Fatalf("first up applied %d migrations, want 11", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -116,6 +116,27 @@ func TestMigrations(t *testing.T) {
 		_, err = db.ExecContext(ctx,
 			`UPDATE provider_breaker SET probe_token = gen_random_uuid(), probe_expires_at = now()`)
 		assertConstraint(t, "probe while closed", err, "provider_breaker_probe_only_open")
+	})
+
+	t.Run("templates", func(t *testing.T) {
+		var def string
+		if err := db.QueryRowContext(ctx,
+			`SELECT pg_get_indexdef('templates_list_idx'::regclass)`).Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		if want := "CREATE INDEX templates_list_idx ON public.templates USING btree (created_at DESC, id DESC)"; def != want {
+			t.Errorf("index = %s, want %s", def, want)
+		}
+		_, err := db.ExecContext(ctx, `INSERT INTO templates (name, channel, body) VALUES ('', 'sms', 'x')`)
+		assertConstraint(t, "empty name", err, "templates_name_length")
+		_, err = db.ExecContext(ctx, `INSERT INTO templates (name, channel, body) VALUES ('n', 'fax', 'x')`)
+		assertConstraint(t, "unknown channel", err, "templates_channel_check")
+		_, err = db.ExecContext(ctx, `INSERT INTO templates (name, channel, body) VALUES ('n', 'sms', repeat('x', 10001))`)
+		assertConstraint(t, "long body", err, "templates_body_length")
+		_, err = db.ExecContext(ctx,
+			`INSERT INTO notifications (recipient, channel, content, priority, correlation_id, template_id)
+			 VALUES ('+905551234567', 'sms', 'x', 'normal', 'test', '01900000-0000-7000-8000-000000000000')`)
+		assertSQLState(t, "unknown template", err, "23503")
 	})
 
 	t.Run("status triggers exist", func(t *testing.T) {

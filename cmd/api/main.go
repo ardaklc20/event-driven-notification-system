@@ -86,6 +86,7 @@ func runServer() int {
 		}},
 		Notifications:     service.NewNotifications(store, cfg.Limits()),
 		Metrics:           service.NewMetrics(store),
+		Templates:         service.NewTemplates(store),
 		BatchMaxBodyBytes: cfg.BatchMaxBodyBytes,
 		WebSocket: httpapi.WebSocketDeps{
 			Hub:          hub,

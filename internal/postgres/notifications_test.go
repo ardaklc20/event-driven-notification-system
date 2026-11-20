@@ -24,17 +24,27 @@ var errLimit = errors.New("over the content limit")
 
 func command(key string, checkLimits func() error) domain.CreateCommand {
 	n := domain.NewNotification{Recipient: "+905551234567", Channel: domain.ChannelSMS, Content: "hello", Priority: domain.PriorityNormal}
-	return domain.CreateCommand{
+	cmd := domain.CreateCommand{
 		Operation:     domain.OperationCreate,
 		Notification:  n,
 		CorrelationID: "test",
 		Key:           key,
 		RequestHash:   domain.RequestHash(domain.OperationCreate, []domain.NewNotification{n}),
-		CheckLimits:   checkLimits,
 		Respond: func(created domain.Notification) ([]byte, error) {
 			return json.Marshal(map[string]string{"id": created.ID, "status": string(created.Status)})
 		},
 	}
+	// Without checkLimits, Prepare stays nil and the store saves the
+	// notification as the caller last set it.
+	if checkLimits != nil {
+		cmd.Prepare = func(domain.Templates) (domain.NewNotification, error) {
+			if err := checkLimits(); err != nil {
+				return domain.NewNotification{}, err
+			}
+			return n, nil
+		}
+	}
+	return cmd
 }
 
 type outcome struct {

@@ -183,7 +183,8 @@ func sizedBody(t *testing.T, size, n int) []byte {
 	t.Helper()
 	items := make([]httpapi.NotificationRequest, n)
 	for i := range items {
-		items[i] = httpapi.NotificationRequest{Recipient: "user@example.com", Channel: "email"}
+		// One character each, so the content key is in the measured body.
+		items[i] = httpapi.NotificationRequest{Recipient: "user@example.com", Channel: "email", Content: "x"}
 	}
 	free := size - len(batchJSON(t, items))
 	for i := range items {
@@ -191,7 +192,7 @@ func sizedBody(t *testing.T, size, n int) []byte {
 		if i == n-1 {
 			share += free % n
 		}
-		items[i].Content = strings.Repeat("x", share)
+		items[i].Content = strings.Repeat("x", 1+share)
 	}
 	body := batchJSON(t, items)
 	if len(body) != size {
