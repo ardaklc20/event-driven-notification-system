@@ -73,6 +73,7 @@ client ──POST /notifications──► api ──INSERT──► notification
 ID=$(curl -s -X POST http://localhost:8080/notifications \
   -H 'Content-Type: application/json' -H 'X-Correlation-ID: demo-1' \
   -d '{"recipient":"+905551234567","channel":"sms","content":"hello"}' | jq -r .id)
+sleep 2   # the worker sends it within a second or two
 curl -s "http://localhost:8080/notifications/$ID" | jq '{status, attempts, provider_message_id, sent_at}'
 docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 ```
@@ -568,6 +569,7 @@ istemci ──POST /notifications──► api ──INSERT──► notificatio
 ID=$(curl -s -X POST http://localhost:8080/notifications \
   -H 'Content-Type: application/json' -H 'X-Correlation-ID: demo-1' \
   -d '{"recipient":"+905551234567","channel":"sms","content":"hello"}' | jq -r .id)
+sleep 2   # worker onu bir iki saniye içinde gönderir
 curl -s "http://localhost:8080/notifications/$ID" | jq '{status, attempts, provider_message_id, sent_at}'
 docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 ```
