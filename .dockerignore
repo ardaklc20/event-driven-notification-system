@@ -1,0 +1,14 @@
+# Only go.mod, go.sum and the Go sources are needed to build the image.
+.git
+.github
+.claude
+docs
+api
+scripts
+**/*_test.go
+**/.DS_Store
+*.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+.golangci.yml

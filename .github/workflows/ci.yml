@@ -1,0 +1,71 @@
+# CI (B6, K29): lint, tests with the race detector, the OpenAPI check and the
+# image build, on every pull request and every push to main.
+#
+# Every job checks out the pull request's head commit instead of GitHub's
+# default merge commit, so CI tests the same commit the release check clones,
+# and logs it as tested-sha.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: echo "tested-sha=$(git rev-parse HEAD)"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: echo "tested-sha=$(git rev-parse HEAD)"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Testcontainers uses the runner's Docker (K22).
+      - run: go test -count=1 -race ./...
+
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: echo "tested-sha=$(git rev-parse HEAD)"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Generated document matches api/openapi.yaml
+        run: |
+          go run ./cmd/api openapi > "$RUNNER_TEMP/openapi.yaml"
+          diff -u api/openapi.yaml "$RUNNER_TEMP/openapi.yaml"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: echo "tested-sha=$(git rev-parse HEAD)"
+      - run: docker build .
