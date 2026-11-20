@@ -86,9 +86,9 @@ PR=${1:-}
 step candidate
 cd "$ORIG"
 if [ -z "$PR" ]; then
-  PR=$(gh pr view --json number -q .number) || fail "candidate no pull request for the current branch"
+  PR=$(gh pr view --json number -q .number 2>/dev/null) || fail "candidate no pull request for the current branch"
 fi
-SHA=$(gh pr view "$PR" --json headRefOid -q .headRefOid) || fail "candidate pull request $PR"
+SHA=$(gh pr view "$PR" --json headRefOid -q .headRefOid 2>/dev/null) || fail "candidate pull request $PR"
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || fail "candidate head SHA $SHA"
 echo "pr=$PR sha=$SHA"
 
@@ -209,7 +209,10 @@ run=$(gh run list --commit "$SHA" --workflow ci.yml --event pull_request --limit
   --json databaseId,status,conclusion -q '.[0] | "\(.databaseId) \(.status) \(.conclusion)"') || fail "ci run list"
 read -r run_id run_status run_conclusion <<<"$run"
 [ "$run_status" = completed ] && [ "$run_conclusion" = success ] || fail "ci run $run_id is $run_status/$run_conclusion"
-gh run view "$run_id" --log | grep -q "tested-sha=$SHA" || fail "ci run $run_id has no tested-sha=$SHA"
+# The log goes to a file first: grep -q would stop reading early, and with
+# pipefail the writer's broken pipe would fail the step.
+gh run view "$run_id" --log >"$WORK/ci.log" 2>/dev/null || fail "ci run $run_id log"
+grep -q "tested-sha=$SHA" "$WORK/ci.log" || fail "ci run $run_id has no tested-sha=$SHA"
 echo "run=$run_id conclusion=success tested-sha=$SHA"
 
 # --- 10. result ----------------------------------------------------------------
