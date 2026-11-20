@@ -375,3 +375,83 @@ func (p problem) has(location string) bool {
 	}
 	return false
 }
+
+// cancel posts to /notifications/{id}/cancel.
+func cancel(t *testing.T, baseURL, id string) (reply, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+"/notifications/"+id+"/cancel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST cancel: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reply{StatusCode: resp.StatusCode, Header: resp.Header}, b
+}
+
+// TestCancelResponses: queued → 200 cancelled; cancelled → 200 again;
+// processing, sent and failed → 409 with the current status; unknown → 404;
+// malformed → 422 (R5, K9).
+func TestCancelResponses(t *testing.T) {
+	pool := testdb.New(t)
+	base := notificationServer(t, pool, domain.DefaultLimits())
+	create := func(status string) string {
+		t.Helper()
+		_, body := post(t, base, smsBody, nil)
+		id := decodeAccepted(t, body).ID
+		if status == "queued" {
+			return id
+		}
+		lease := "NULL"
+		if status == "processing" {
+			lease = "gen_random_uuid()"
+		}
+		if _, err := pool.Exec(t.Context(),
+			`UPDATE notifications SET status = $2::notification_status, lease_token = `+lease+`,
+			        lease_expires_at = CASE WHEN $2 = 'processing' THEN now() + interval '30 seconds' END
+			 WHERE id = $1::uuid`, id, status); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	queued := create("queued")
+	resp, body := cancel(t, base, queued)
+	var n httpapi.NotificationBody
+	if err := json.Unmarshal(body, &n); err != nil || resp.StatusCode != http.StatusOK || n.Status != "cancelled" || n.ID != queued {
+		t.Fatalf("cancel queued: status %d, body %s; want 200 with status cancelled", resp.StatusCode, body)
+	}
+	resp, body = cancel(t, base, queued)
+	if err := json.Unmarshal(body, &n); err != nil || resp.StatusCode != http.StatusOK || n.Status != "cancelled" {
+		t.Fatalf("cancel again: status %d, body %s; want 200 with status cancelled", resp.StatusCode, body)
+	}
+
+	for _, status := range []string{"processing", "sent", "failed"} {
+		id := create(status)
+		resp, body := cancel(t, base, id)
+		var c httpapi.CancelConflictBody
+		if err := json.Unmarshal(body, &c); err != nil || resp.StatusCode != http.StatusConflict ||
+			c.CurrentStatus != status || c.Status != http.StatusConflict ||
+			resp.Header.Get("Content-Type") != "application/problem+json" {
+			t.Errorf("cancel %s: status %d, Content-Type %q, body %s; want 409 problem with current_status %s",
+				status, resp.StatusCode, resp.Header.Get("Content-Type"), body, status)
+		}
+		var still string
+		if err := pool.QueryRow(t.Context(), `SELECT status::text FROM notifications WHERE id = $1::uuid`, id).Scan(&still); err != nil || still != status {
+			t.Errorf("after a refused cancel the row is %s, want %s unchanged", still, status)
+		}
+	}
+
+	if resp, body := cancel(t, base, "0190f5a0-0000-7000-8000-000000000000"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown ID: status %d, body %s; want 404", resp.StatusCode, body)
+	}
+	if resp, body := cancel(t, base, "not-a-uuid"); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("malformed ID: status %d, body %s; want 422", resp.StatusCode, body)
+	}
+}

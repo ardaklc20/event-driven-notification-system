@@ -16,6 +16,55 @@ components:
         - id
         - status
       type: object
+    CancelConflictBody:
+      additionalProperties: false
+      properties:
+        current_status:
+          description: The notification's status, read under its row lock
+          enum:
+            - processing
+            - sent
+            - failed
+          type: string
+        detail:
+          description: A human-readable explanation specific to this occurrence of the problem.
+          examples:
+            - Property foo is required but is missing.
+          type: string
+        errors:
+          description: Optional list of individual error details
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+          type:
+            - array
+            - "null"
+        instance:
+          description: A URI reference that identifies the specific occurrence of the problem.
+          examples:
+            - https://example.com/error-log/abc123
+          format: uri
+          type: string
+        status:
+          description: HTTP status code
+          examples:
+            - 400
+          format: int64
+          type: integer
+        title:
+          description: A short, human-readable summary of the problem type. This value should not change between occurrences of the error.
+          examples:
+            - Bad Request
+          type: string
+        type:
+          default: about:blank
+          description: A URI reference to human-readable documentation for the error.
+          examples:
+            - https://example.com/errors/example
+          format: uri
+          type: string
+      required:
+        - current_status
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -323,6 +372,53 @@ paths:
                 $ref: "#/components/schemas/ErrorModel"
           description: Internal Server Error
       summary: Get a notification
+      tags:
+        - Notifications
+  /notifications/{id}/cancel:
+    post:
+      description: "Cancels the notification while it is queued: waiting for its first attempt, for its channel's rate limit or for its retry time. A notification that is already cancelled answers 200 again. One that a worker holds (processing) or that has ended (sent, failed) answers 409 with its current status: its POST may already be on its way. After a 200, no new POST goes out for it. An unknown ID gets 404, a malformed one 422."
+      operationId: cancel-notification
+      parameters:
+        - description: Notification ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Notification ID
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationBody"
+          description: OK
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Not Found
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/CancelConflictBody"
+          description: The notification is processing, sent or failed and can no longer be cancelled
+        "422":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+      summary: Cancel a queued notification
       tags:
         - Notifications
   /readyz:

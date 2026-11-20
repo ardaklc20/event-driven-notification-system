@@ -13,9 +13,10 @@ import (
 type Store interface {
 	CreateNotification(ctx context.Context, cmd domain.CreateCommand) (domain.CreateResult, error)
 	GetNotification(ctx context.Context, id string) (domain.Notification, error)
+	CancelNotification(ctx context.Context, id string) (domain.Notification, error)
 }
 
-// Notifications creates and reads notifications.
+// Notifications creates, reads and cancels notifications.
 type Notifications struct {
 	store  Store
 	limits domain.Limits
@@ -61,4 +62,12 @@ func (s *Notifications) Create(ctx context.Context, in CreateInput, respond func
 // Get reads one notification; domain.ErrNotFound when it does not exist.
 func (s *Notifications) Get(ctx context.Context, id string) (domain.Notification, error) {
 	return s.store.GetNotification(ctx, id)
+}
+
+// Cancel cancels a queued notification (K9). It returns the notification as
+// the decision left it: cancelled now, or already cancelled. A notification a
+// worker holds or that has ended gives a *domain.CancelConflictError with its
+// status; an unknown ID gives domain.ErrNotFound.
+func (s *Notifications) Cancel(ctx context.Context, id string) (domain.Notification, error) {
+	return s.store.CancelNotification(ctx, id)
 }
