@@ -1,13 +1,17 @@
 package worker_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
+	"github.com/ardaklc20/event-driven-notification-system/internal/postgres"
 	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
+	"github.com/ardaklc20/event-driven-notification-system/internal/service"
 	"github.com/ardaklc20/event-driven-notification-system/internal/testdb"
 )
 
@@ -216,5 +220,49 @@ func TestRetryKeepsScheduledAt(t *testing.T) {
 	}
 	if r.attempts != 2 || len(rec.all()) != 2 {
 		t.Errorf("attempts %d and %d POSTs, want 2 and 2", r.attempts, len(rec.all()))
+	}
+}
+
+// TestTemplateRetrySameContent: a notification made from a template is sent
+// with the content rendered at the API; a retry sends the same content (K33).
+func TestTemplateRetrySameContent(t *testing.T) {
+	pool := testdb.New(t)
+	store := postgres.NewStore(pool)
+	tpl, err := store.CreateTemplate(t.Context(), domain.NewTemplate{
+		Name: "welcome", Channel: domain.ChannelSMS, Body: "Hello {{first_name}}, your code is {{code}}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := service.NewNotifications(store, domain.DefaultLimits()).Create(t.Context(), service.CreateInput{
+		Notification: domain.NewNotification{
+			Recipient: "+905551234567", Channel: domain.ChannelSMS, TemplateID: tpl.ID,
+			Variables: map[string]string{"first_name": "Deniz", "code": "{{code}}"},
+		},
+		CorrelationID: "corr-template",
+	}, func(n domain.Notification) ([]byte, error) { return []byte(`{}`), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, srv := newProvider(t, sequence(http.StatusServiceUnavailable, http.StatusAccepted))
+	w := startWorker(t, pool, srv.URL+"/", defaults())
+	waitStatus(t, pool, res.NotificationID, "sent", 10*time.Second)
+	if err := w.stop(t); err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+
+	const want = "Hello Deniz, your code is {{code}}"
+	arrivals := rec.all()
+	if len(arrivals) != 2 {
+		t.Fatalf("%d POSTs, want 2", len(arrivals))
+	}
+	for i, a := range arrivals {
+		var body struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(a.body, &body); err != nil || body.Content != want {
+			t.Fatalf("POST %d content %q (err %v), want %q", i+1, body.Content, err, want)
+		}
 	}
 }

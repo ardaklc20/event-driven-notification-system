@@ -25,6 +25,7 @@ type Deps struct {
 	Checks        []Check
 	Notifications *service.Notifications
 	Metrics       *service.Metrics
+	Templates     *service.Templates
 	// BatchMaxBodyBytes is the largest batch body; 0 means
 	// DefaultBatchMaxBodyBytes (K12).
 	BatchMaxBodyBytes int64
@@ -64,6 +65,7 @@ func newAPI(deps Deps) (*http.ServeMux, huma.API) {
 	registerNotifications(api, deps)
 	registerBatches(api, deps)
 	registerMetrics(api, deps)
+	registerTemplates(api, deps)
 	// Plain handlers on the same mux: OpenAPI does not describe WebSockets (K25).
 	registerWebSockets(mux, deps)
 	return mux, api

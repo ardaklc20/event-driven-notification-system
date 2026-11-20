@@ -20,10 +20,13 @@ import (
 type NotificationRequest struct {
 	Recipient string `json:"recipient" minLength:"1" example:"+905551234567" doc:"sms: an E.164 number (+ and up to 15 digits). email: a plain address without a display name. push: a device token, no whitespace, at most 512 characters."`
 	Channel   string `json:"channel" enum:"sms,email,push" example:"sms"`
-	Content   string `json:"content" minLength:"1" example:"Your code is 123456" doc:"At most 160 (sms), 10000 (email) or 1000 (push) Unicode code points by default; the limits are configurable and apply to new notifications only."`
+	Content   string `json:"content,omitempty" minLength:"1" example:"Your code is 123456" doc:"The message, or leave it out and send template_id. At most 160 (sms), 10000 (email) or 1000 (push) Unicode code points by default; the limits are configurable and apply to new notifications only."`
 	Priority  string `json:"priority,omitempty" enum:"high,normal,low" default:"normal"`
 	// K26: an optional absolute time.
 	ScheduledAt string `json:"scheduled_at,omitempty" format:"date-time" example:"2026-11-22T09:00:00Z" doc:"Optional. The earliest time the notification may be sent, RFC 3339 with an offset (Z or ±hh:mm); a time without an offset gets 422. A new request whose time is at or before the server's clock gets 422; there is no upper limit. Without it the notification is sent as soon as possible."`
+	// K33: a stored template instead of content.
+	TemplateID string            `json:"template_id,omitempty" format:"uuid" doc:"A stored template to render instead of content; send exactly one of content and template_id. Its channel must equal channel. An unknown ID gets 422 on this field."`
+	Variables  map[string]string `json:"variables,omitempty" doc:"With template_id only: one string value per placeholder, no more and no fewer. Values are inserted as they are; a {{name}} inside a value is not rendered again. The rendered content follows the same limits as content."`
 }
 
 func (r NotificationRequest) toDomain() domain.NewNotification {
@@ -34,6 +37,8 @@ func (r NotificationRequest) toDomain() domain.NewNotification {
 		Priority:  domain.Priority(r.Priority),
 		// Normalize rewrites it in UTC.
 		ScheduledAt: r.ScheduledAt,
+		TemplateID:  r.TemplateID,
+		Variables:   r.Variables,
 	}
 }
 
@@ -45,10 +50,11 @@ func (r *NotificationRequest) Resolve(_ huma.Context, prefix *huma.PathBuffer) [
 	_, fieldErrs := domain.Normalize(r.toDomain())
 	var errs []error
 	for _, fe := range fieldErrs {
-		// The schema's date-time format already reports a scheduled_at that
-		// does not parse, with the same RFC 3339 rule.
+		// The schema's date-time and uuid formats already report a
+		// scheduled_at or a template_id that does not parse.
 		if fe.Code == domain.CodeRequired || fe.Code == domain.CodeUnknownValue ||
-			(fe.Field == "scheduled_at" && fe.Code == domain.CodeFormat) {
+			(fe.Field == "scheduled_at" && fe.Code == domain.CodeFormat) ||
+			(fe.Field == "template_id" && fe.Code == domain.CodeFormat) {
 			continue
 		}
 		errs = append(errs, &huma.ErrorDetail{Location: prefix.With(fe.Field), Message: fe.Message})
@@ -149,6 +155,7 @@ type NotificationBody struct {
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
 	ScheduledAt       *time.Time `json:"scheduled_at" nullable:"true" doc:"The earliest send time the request asked for, in UTC, or null when the notification was not scheduled. Retries never change it"`
+	TemplateID        *string    `json:"template_id" nullable:"true" format:"uuid" doc:"The template content was rendered from, or null; content is the rendered text"`
 }
 
 type notificationOutput struct {
@@ -208,6 +215,7 @@ func toBody(n domain.Notification) NotificationBody {
 		CreatedAt:         n.CreatedAt,
 		UpdatedAt:         n.UpdatedAt,
 		ScheduledAt:       n.ScheduledAt,
+		TemplateID:        n.TemplateID,
 	}
 }
 
@@ -354,6 +362,8 @@ func problemFor(ctx context.Context, logger *slog.Logger, err error) error {
 		return huma.Error404NotFound("notification not found")
 	case errors.Is(err, domain.ErrBatchNotFound):
 		return huma.Error404NotFound("batch not found")
+	case errors.Is(err, domain.ErrTemplateNotFound):
+		return huma.Error404NotFound("template not found")
 	case errors.Is(err, domain.ErrInvalidCursor):
 		return huma.Error400BadRequest("cursor is not valid",
 			&huma.ErrorDetail{Location: "query.cursor", Message: "is not the next_cursor of a previous page"})

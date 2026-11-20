@@ -6,7 +6,7 @@ A notification service in Go that queues SMS, email and push notifications in Po
 
 One image holds four programs, each a Compose service: `api` (the HTTP API), `worker` (claims and delivers notifications; several can run), `migrate` (applies the database migrations and exits) and `mockprovider` (a local stand-in for the external provider). There is no message broker: the `notifications` table in PostgreSQL is the queue.
 
-**Current state (core complete; circuit breaker, scheduling and real-time status, slice 13):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it. A WebSocket client can follow one notification or one batch: it gets the current state, then each status change.
+**Current state (core complete; circuit breaker, scheduling, real-time status and templates, slice 14):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it. A WebSocket client can follow one notification or one batch: it gets the current state, then each status change. Stored templates with `{{name}}` placeholders are rendered once at the API, and the worker sends the rendered content.
 
 ## Requirements
 
@@ -276,6 +276,31 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at}' 
 - **Everything else as usual.** A scheduled notification can be cancelled while it is `queued`; once due it follows priority and the rate limit like any other notification, and retries move only `available_at`, never `scheduled_at`. Within a batch, items of the same channel and priority go out in `scheduled_at` order; other channels and priorities follow the rate limit and priority first.
 - **Latency.** `GET /metrics` measures scheduled notifications from `scheduled_at` (`scheduled_latency`), not from `created_at`, so a planned wait never shows as delivery latency.
 
+### Templates
+
+```bash
+TPL=$(curl -s -X POST http://localhost:8080/templates -H 'Content-Type: application/json' \
+  -d '{"name":"welcome","channel":"sms","body":"Hello {{first_name}}, your code is {{code}}"}' | jq -r .id)
+curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d "{\"recipient\":\"+905551234567\",\"channel\":\"sms\",\"template_id\":\"$TPL\",\"variables\":{\"first_name\":\"Deniz\",\"code\":\"4821\"}}"
+curl -s "http://localhost:8080/templates?limit=10" | jq '.items[] | {id, name, created_at}'
+```
+
+A template is stored once and used by any number of notifications ([K33](docs/DECISIONS.md#k33--templates-b3-immutable-stored-templates-with-name-placeholders-rendered-at-the-api), [K47](docs/DECISIONS.md#k47--template-details-a-paged-list-422-for-an-unknown-template-in-a-body)).
+
+| Endpoint | Answer |
+|---|---|
+| `POST /templates` | `201` with `{id, name, channel, body, created_at}`; `422` for any rule below |
+| `GET /templates/{id}` | `200`; `404` for an unknown ID, `422` for a malformed one |
+| `GET /templates` | Newest first, paged with `limit` (default 50, 1 to 200) and `next_cursor`, as `GET /notifications` |
+
+- **Rules.** `name`: 1 to 100 code points, not unique (`created_at` tells templates with the same name apart). `body`: 1 to 10,000 code points. Neither may contain NUL. `channel`: `sms`, `email` or `push`.
+- **Syntax.** `{{name}}` is a placeholder; a name matches `[A-Za-z_][A-Za-z0-9_]*`, with no spaces inside the braces. Single braces are plain text. An unclosed `{{`, an empty `{{}}`, `{{1st}}` or `{{ name }}` gets `422` when the template is created.
+- **Templates never change.** There is no update or delete (`PUT`, `PATCH` and `DELETE` get `405`); a changed message is a new template.
+- **Using one.** A create request, single or batch item, carries either `content` or `template_id` with `variables`: both or neither get `422`. The template's channel must equal the request's, `variables` must hold exactly one string per placeholder, and an unknown `template_id` gets `422` on that field.
+- **Rendering.** The API renders the content once, when it saves a new notification: each placeholder is replaced by its value as given, so a `{{x}}` inside a value stays as it is. The result follows the same rules as `content`: it may not be empty or contain NUL, and rendering stops with `422` as soon as it passes the channel's limit. The notification stores the rendered `content` and the `template_id`, not the variables; the worker sends that content on every attempt.
+- **Idempotency.** The request hash covers `template_id` and the variables, so the same key with other variables gets `422`, and a repeat returns the first `202` without rendering again. In a batch, one item that fails rejects the whole batch with that item's index.
+
 ### Real-time status
 
 ```bash
@@ -353,7 +378,7 @@ Every rule violation gets `422` with one entry per field (`location` and `messag
 |---|---|
 | `recipient` | `sms`: E.164 (`+` and up to 15 digits). `email`: a plain address, no display name. `push`: no whitespace, at most 512 characters |
 | `channel` | `sms`, `email` or `push` |
-| `content` | Not empty. At most 160 (`sms`), 10,000 (`email`) or 1,000 (`push`) Unicode code points |
+| `content` | Not empty. At most 160 (`sms`), 10,000 (`email`) or 1,000 (`push`) Unicode code points. Leave it out when the request sends `template_id` ([Templates](#templates)) |
 | all text | No NUL character (U+0000), which PostgreSQL cannot store |
 
 The content limits are this application's limits, not carrier or platform guarantees: 160 code points fit one SMS segment only when every character is in the GSM-7 set (with other characters a segment holds 70), and 1,000 code points do not guarantee a push payload under the 4 KB that APNs and FCM allow. They are configurable and apply to new notifications only: after a limit is lowered, a replay of an accepted request still returns its first response.
@@ -521,6 +546,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 - **What the rate-limit measurement proves** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). The limit is on send starts at the worker. A remote provider sees arrivals, which network delays can bunch together, so it may observe more than 100 in some second. A full channel uses about 82 to 89 starts per second, not 100. The measurements are single runs on one machine.
 - **An outage on one channel pauses all three** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). The circuit breaker is per provider, because the three channels share one URL: a failure that only one channel meets at the provider still stops every claim until a probe succeeds. The probe uses one attempt of the notification it carries, and `failed` notifications are never resent.
 - **Real-time updates are best effort** ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify)). Events held in the API's memory are lost if it stops, a slow client is disconnected, and PostgreSQL does not replay notifications sent while the listener was reconnecting; a client reconnects for a fresh snapshot. Each connection follows one notification or one batch.
+- **Templates accumulate** ([K33](docs/DECISIONS.md#k33--templates-b3-immutable-stored-templates-with-name-placeholders-rendered-at-the-api)). A template cannot be changed or deleted, so a changed message is a new template. Placeholders are plain substitution: there are no conditions, loops or escaping.
 - **No delivery step in CI** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lints, tests, checks the OpenAPI document and builds the image; nothing is published or deployed.
 
 ## Bonuses
@@ -531,7 +557,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 | B1 — Failure handling: a circuit breaker | Done ([Provider outage](#provider-outage)) |
 | B2 — Scheduled notifications | Done ([Scheduled notifications](#scheduled-notifications)) |
 | B4 — Real-time status updates over WebSocket | Done ([Real-time status](#real-time-status)) |
-| B3 — Message templates | Planned ([slice 14](docs/slices/14-templates.md)) |
+| B3 — Message templates | Done ([Templates](#templates)) |
 | B5 — Distributed tracing | Planned ([slice 15](docs/slices/15-distributed-tracing.md)) |
 
 ## Project layout
@@ -545,8 +571,8 @@ cmd/loadgen/            sends the rate-limit load through the API
 cmd/ratecount/          counts send starts per one-second window from worker logs
 cmd/wswatch/            follows one WebSocket and prints each message as one line
 internal/config/        typed environment configuration
-internal/domain/        notification types, validation, request hash
-internal/service/       create, read, cancel, list, batch and metrics rules; the listing cursor; WebSocket snapshot reads
+internal/domain/        notification types, validation, request hash, template parsing and rendering
+internal/service/       create, read, cancel, list, batch, template and metrics rules; the listing cursor; WebSocket snapshot reads
 internal/httpapi/       router, Huma operations, middleware, the WebSocket endpoints
 internal/realtime/      WebSocket subscribers, their queues, the listener generation and the version filter
 internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit and probe slot, result writes with the circuit breaker, give-back, recovery, the status listener and snapshot reads
@@ -577,7 +603,7 @@ SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başın
 
 Tek bir imaj, her biri bir Compose servisi olan dört program taşır: `api` (HTTP API), `worker` (bildirimleri claim edip teslim eder; birden fazla çalışabilir), `migrate` (veritabanı migration'larını uygulayıp çıkar) ve `mockprovider` (harici provider'ın yerel yerine geçeni). Mesaj kuyruğu sunucusu yoktur: kuyruk, PostgreSQL'deki `notifications` tablosudur.
 
-**Şu anki durum (çekirdek tamam; devre kesici, zamanlama ve gerçek zamanlı durum, dilim 13):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez. Bir WebSocket istemcisi tek bir bildirimi ya da tek bir toplu isteği izleyebilir: önce güncel durumu, sonra her durum değişikliğini alır.
+**Şu anki durum (çekirdek tamam; devre kesici, zamanlama, gerçek zamanlı durum ve şablonlar, dilim 14):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez. Bir WebSocket istemcisi tek bir bildirimi ya da tek bir toplu isteği izleyebilir: önce güncel durumu, sonra her durum değişikliğini alır. `{{name}}` yer tutuculu kayıtlı şablonlar API'de bir kez render edilir ve worker render edilmiş içeriği gönderir.
 
 ## Gereksinimler
 
@@ -847,6 +873,31 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at}' 
 - **Geri kalan her şey aynı.** Zamanlanmış bir bildirim `queued` iken iptal edilebilir; zamanı gelince diğer bildirimler gibi önceliğe ve hız sınırına uyar; tekrar denemeler yalnızca `available_at`'i taşır, `scheduled_at`'i asla. Bir toplu istekte aynı kanal ve öncelikteki öğeler `scheduled_at` sırasıyla gider; farklı kanal ve öncelikler önce hız sınırına ve önceliğe uyar.
 - **Gecikme.** `GET /metrics` zamanlanmış bildirimleri `created_at`'ten değil `scheduled_at`'ten ölçer (`scheduled_latency`); böylece planlı bekleme asla teslim gecikmesi olarak görünmez.
 
+### Şablonlar
+
+```bash
+TPL=$(curl -s -X POST http://localhost:8080/templates -H 'Content-Type: application/json' \
+  -d '{"name":"welcome","channel":"sms","body":"Hello {{first_name}}, your code is {{code}}"}' | jq -r .id)
+curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d "{\"recipient\":\"+905551234567\",\"channel\":\"sms\",\"template_id\":\"$TPL\",\"variables\":{\"first_name\":\"Deniz\",\"code\":\"4821\"}}"
+curl -s "http://localhost:8080/templates?limit=10" | jq '.items[] | {id, name, created_at}'
+```
+
+Bir şablon bir kez kaydedilir ve istenen sayıda bildirimde kullanılır ([K33](docs/DECISIONS.md#k33--templates-b3-immutable-stored-templates-with-name-placeholders-rendered-at-the-api), [K47](docs/DECISIONS.md#k47--template-details-a-paged-list-422-for-an-unknown-template-in-a-body)).
+
+| Endpoint | Cevap |
+|---|---|
+| `POST /templates` | `{id, name, channel, body, created_at}` ile `201`; aşağıdaki kurallardan biri bozulursa `422` |
+| `GET /templates/{id}` | `200`; bilinmeyen ID için `404`, bozuk ID için `422` |
+| `GET /templates` | En yeni önce; `GET /notifications` gibi `limit` (varsayılan 50, 1 ile 200 arası) ve `next_cursor` ile sayfalanır |
+
+- **Kurallar.** `name`: 1 ile 100 kod noktası, benzersiz olmak zorunda değil (aynı adlı şablonları `created_at` ayırır). `body`: 1 ile 10.000 kod noktası. İkisi de NUL içeremez. `channel`: `sms`, `email` ya da `push`.
+- **Sözdizimi.** `{{name}}` bir yer tutucudur; ad `[A-Za-z_][A-Za-z0-9_]*` kalıbına uyar, süslü parantezlerin içinde boşluk olmaz. Tek süslü parantez düz metindir. Kapanmamış bir `{{`, boş bir `{{}}`, `{{1st}}` ya da `{{ name }}` şablon oluşturulurken `422` alır.
+- **Şablonlar değişmez.** Güncelleme ya da silme yoktur (`PUT`, `PATCH` ve `DELETE` `405` alır); değişen bir mesaj yeni bir şablondur.
+- **Kullanım.** Tekil ya da toplu istek öğesi olan bir oluşturma isteği ya `content` ya da `variables` ile birlikte `template_id` taşır: ikisi birden ya da hiçbiri `422` alır. Şablonun kanalı isteğinkine eşit olmalı, `variables` her yer tutucu için tam olarak bir metin değeri taşımalıdır; bilinmeyen bir `template_id` o alanda `422` alır.
+- **Render.** API içeriği yeni bir bildirimi kaydederken bir kez render eder: her yer tutucu verildiği haliyle değeriyle değiştirilir; bu yüzden bir değerin içindeki `{{x}}` olduğu gibi kalır. Sonuç `content` ile aynı kurallara uyar: boş olamaz, NUL içeremez ve kanalın sınırını geçtiği anda render `422` ile durur. Bildirim değişkenleri değil, render edilmiş `content`'i ve `template_id`'yi saklar; worker her denemede bu içeriği gönderir.
+- **Idempotency.** İstek özeti `template_id`'yi ve değişkenleri kapsar; bu yüzden aynı anahtar başka değişkenlerle `422` alır, bir tekrar ise yeniden render etmeden ilk `202`'yi döndürür. Toplu istekte başarısız olan tek bir öğe, o öğenin indeksiyle bütün toplu isteği reddeder.
+
 ### Gerçek zamanlı durum
 
 ```bash
@@ -924,7 +975,7 @@ Her kural ihlali, alan başına bir kayıtla (`location` ve `message`) `422` al�
 |---|---|
 | `recipient` | `sms`: E.164 (`+` ve en fazla 15 rakam). `email`: görünen ad olmadan düz adres. `push`: boşluk yok, en fazla 512 karakter |
 | `channel` | `sms`, `email` ya da `push` |
-| `content` | Boş olamaz. En fazla 160 (`sms`), 10.000 (`email`) ya da 1.000 (`push`) Unicode kod noktası |
+| `content` | Boş olamaz. En fazla 160 (`sms`), 10.000 (`email`) ya da 1.000 (`push`) Unicode kod noktası. İstek `template_id` gönderiyorsa verilmez ([Şablonlar](#şablonlar)) |
 | tüm metinler | PostgreSQL'in saklayamadığı NUL karakteri (U+0000) olamaz |
 
 İçerik sınırları bu uygulamanın sınırlarıdır, operatör ya da platform garantisi değildir: 160 kod noktası tek bir SMS parçasına ancak bütün karakterler GSM-7 kümesindeyse sığar (başka karakterlerle bir parça 70 karakter alır); 1.000 kod noktası da push payload'ının APNs ve FCM'nin izin verdiği 4 KB'ın altında kalacağını garanti etmez. Sınırlar ayarlanabilir ve yalnızca yeni bildirimlere uygulanır: bir sınır düşürüldükten sonra, kabul edilmiş bir isteğin tekrarı yine ilk yanıtını alır.
@@ -1092,6 +1143,7 @@ docker compose run --rm migrate
 - **Hız sınırı ölçümünün kanıtladığı** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). Sınır worker'daki gönderim başlangıçları üzerindedir. Uzak bir provider gelişleri görür; ağ gecikmeleri gelişleri bir araya toplayabilir, bu yüzden provider bir saniyede 100'den fazlasını görebilir. Dolu bir kanal saniyede 100 değil yaklaşık 82 ile 89 başlangıç kullanır. Ölçümler tek makinede tekil çalıştırmalardır.
 - **Bir kanaldaki kesinti üç kanalı da durdurur** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). Üç kanal aynı URL'yi paylaştığı için devre kesici provider başınadır: provider'da yalnızca bir kanalın karşılaştığı bir hata da bir yoklama başarılı olana kadar tüm claim'leri durdurur. Yoklama taşıdığı bildirimin bir denemesini kullanır ve `failed` bildirimler asla yeniden gönderilmez.
 - **Gerçek zamanlı güncellemeler en iyi çabadır** ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify)). API dururken bellekteki olaylar kaybolur, yavaş bir istemcinin bağlantısı kesilir ve PostgreSQL dinleyici yeniden bağlanırken gönderilen bildirimleri yeniden oynatmaz; istemci yeni bir anlık görüntü için yeniden bağlanır. Her bağlantı tek bir bildirimi ya da tek bir toplu isteği izler.
+- **Şablonlar birikir** ([K33](docs/DECISIONS.md#k33--templates-b3-immutable-stored-templates-with-name-placeholders-rendered-at-the-api)). Bir şablon değiştirilemez ya da silinemez; bu yüzden değişen bir mesaj yeni bir şablondur. Yer tutucular düz yerine koymadır: koşul, döngü ya da kaçış yoktur.
 - **CI'da teslim adımı yok** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lint, test, OpenAPI kontrolü ve imaj derlemesi yapar; hiçbir şey yayımlanmaz ya da dağıtılmaz.
 
 ## Bonuslar
@@ -1102,7 +1154,7 @@ docker compose run --rm migrate
 | B1 — Hata yönetimi: devre kesici | Tamam ([Provider kesintisi](#provider-kesintisi)) |
 | B2 — Zamanlanmış bildirimler | Tamam ([Zamanlanmış bildirimler](#zamanlanmış-bildirimler)) |
 | B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Tamam ([Gerçek zamanlı durum](#gerçek-zamanlı-durum)) |
-| B3 — Mesaj şablonları | Planlandı ([dilim 14](docs/slices/14-templates.md)) |
+| B3 — Mesaj şablonları | Tamam ([Şablonlar](#şablonlar)) |
 | B5 — Dağıtık izleme | Planlandı ([dilim 15](docs/slices/15-distributed-tracing.md)) |
 
 ## Proje yapısı
@@ -1116,8 +1168,8 @@ cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
 cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
 cmd/wswatch/            tek bir WebSocket'i izler ve her mesajı bir satır olarak yazdırır
 internal/config/        tipli ortam değişkeni yapılandırması
-internal/domain/        bildirim tipleri, doğrulama, istek özeti
-internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek ve metrik kuralları; listeleme cursor'ı; WebSocket anlık görüntü okumaları
+internal/domain/        bildirim tipleri, doğrulama, istek özeti, şablon ayrıştırma ve render
+internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek, şablon ve metrik kuralları; listeleme cursor'ı; WebSocket anlık görüntü okumaları
 internal/httpapi/       router, Huma operasyonları, middleware, WebSocket endpoint'leri
 internal/realtime/      WebSocket aboneleri, kuyrukları, dinleyici nesli ve sürüm filtresi
 internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli ve yoklama yerli claim, devre kesiciyle sonuç yazma, geri verme, kurtarma, durum dinleyicisi ve anlık görüntü okumaları

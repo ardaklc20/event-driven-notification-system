@@ -39,9 +39,9 @@ type CreateInput struct {
 }
 
 // Create follows the K10 order: structure rules and defaults, the request hash,
-// then the store's transaction, which checks the content limits only when it
-// is about to save a new notification. respond builds the 202 body; the store
-// keeps its bytes with the key.
+// then the store's transaction, which renders a template request and checks
+// the content limits only when it is about to save a new notification (K33).
+// respond builds the 202 body; the store keeps its bytes with the key.
 func (s *Notifications) Create(ctx context.Context, in CreateInput, respond func(domain.Notification) ([]byte, error)) (domain.CreateResult, error) {
 	n, errs := domain.Normalize(in.Notification)
 	if len(errs) > 0 {
@@ -53,11 +53,12 @@ func (s *Notifications) Create(ctx context.Context, in CreateInput, respond func
 		CorrelationID: in.CorrelationID,
 		Key:           in.Key,
 		RequestHash:   domain.RequestHash(domain.OperationCreate, []domain.NewNotification{n}),
-		CheckLimits: func() error {
-			if errs := s.limits.Check(n); len(errs) > 0 {
-				return &domain.ValidationError{Errors: errs}
+		Prepare: func(templates domain.Templates) (domain.NewNotification, error) {
+			out, errs := s.limits.Prepare(n, templates)
+			if len(errs) > 0 {
+				return domain.NewNotification{}, &domain.ValidationError{Errors: errs}
 			}
-			return nil
+			return out, nil
 		},
 		Respond: respond,
 	})
@@ -144,8 +145,8 @@ type BatchInput struct {
 
 // CreateBatch follows the order of Create for every item: structure rules and
 // defaults for all items with every error collected, the request hash over
-// all normalized items, then the store's transaction, which checks the
-// content limits of every item only when it is about to save them. respond
+// all normalized items, then the store's transaction, which renders and
+// checks every item only when it is about to save them. respond
 // builds the 202 body from the batch ID and the IDs in request order.
 func (s *Notifications) CreateBatch(ctx context.Context, in BatchInput,
 	respond func(batchID string, ids []string) ([]byte, error)) (domain.CreateResult, error) {
@@ -163,15 +164,18 @@ func (s *Notifications) CreateBatch(ctx context.Context, in BatchInput,
 		CorrelationID: in.CorrelationID,
 		Key:           in.Key,
 		RequestHash:   domain.RequestHash(domain.OperationBatch, items),
-		CheckLimits: func() error {
+		Prepare: func(templates domain.Templates) ([]domain.NewNotification, error) {
+			out := make([]domain.NewNotification, len(items))
 			var errs []domain.FieldError
 			for i, n := range items {
-				errs = append(errs, domain.ItemErrors(i, s.limits.Check(n))...)
+				prepared, itemErrs := s.limits.Prepare(n, templates)
+				out[i] = prepared
+				errs = append(errs, domain.ItemErrors(i, itemErrs)...)
 			}
 			if len(errs) > 0 {
-				return &domain.ValidationError{Errors: errs}
+				return nil, &domain.ValidationError{Errors: errs}
 			}
-			return nil
+			return out, nil
 		},
 		Respond: respond,
 	})

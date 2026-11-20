@@ -63,6 +63,11 @@ type NewNotification struct {
 	// 3339 with an offset; "" when it is not scheduled (K26). Normalize
 	// rewrites it in UTC.
 	ScheduledAt string
+	// TemplateID names a stored template to render instead of Content (K33);
+	// Variables holds the value of each of its placeholders. Normalize
+	// lowercases the ID.
+	TemplateID string
+	Variables  map[string]string
 }
 
 // Notification is a saved notification.
@@ -88,6 +93,9 @@ type Notification struct {
 	UpdatedAt time.Time
 	// ScheduledAt is the planned first send time, or nil (K26).
 	ScheduledAt *time.Time
+	// TemplateID is the template the content was rendered from, or nil
+	// (K33).
+	TemplateID *string
 }
 
 // Claim is a notification a worker holds under a lease (K3). The worker needs
@@ -229,10 +237,14 @@ type CreateCommand struct {
 	// Key is the Idempotency-Key; empty means the request has none.
 	Key         string
 	RequestHash []byte
-	// CheckLimits runs only when this command is about to write a new
-	// notification: when it reserved the key, or has no key. An error rolls
-	// the transaction back, so the key stays free.
-	CheckLimits func() error
+	// Prepare runs only when this command is about to write a new
+	// notification: when it reserved the key, or has no key. It gets the
+	// stored template the request names, if any, loaded in the same
+	// transaction, and returns the notification to save: rendered from its
+	// template, checked against the content limits (K10, K33). An error rolls
+	// the transaction back, so the key stays free. Nil saves Notification as
+	// it is.
+	Prepare func(Templates) (NewNotification, error)
 	// Respond builds the response body. Its bytes are stored with the key and
 	// sent unchanged on every replay.
 	Respond func(Notification) ([]byte, error)
@@ -261,9 +273,10 @@ type BatchCommand struct {
 	// Key is the Idempotency-Key; empty means the request has none.
 	Key         string
 	RequestHash []byte
-	// CheckLimits runs only when this command is about to write new
-	// notifications, as for a single create.
-	CheckLimits func() error
+	// Prepare runs only when this command is about to write new
+	// notifications, as for a single create; the templates of every item are
+	// loaded with one query. It returns the items to save, in request order.
+	Prepare func(Templates) ([]NewNotification, error)
 	// Respond builds the 202 body from the batch ID and the notification IDs
 	// in request order. Its bytes are stored with the key.
 	Respond func(batchID string, notificationIDs []string) ([]byte, error)

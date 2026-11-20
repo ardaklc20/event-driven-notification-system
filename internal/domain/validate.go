@@ -29,6 +29,8 @@ const (
 	CodeTooLong ErrorCode = "too_long"
 	// CodePast: scheduled_at is at or before the database clock (K26).
 	CodePast ErrorCode = "in_the_past"
+	// CodeOneOf: content and template_id are both given, or neither (K33).
+	CodeOneOf ErrorCode = "one_of"
 )
 
 // FieldError is one rule violation.
@@ -52,6 +54,9 @@ func (e *ValidationError) Error() string {
 }
 
 const maxPushTokenLength = 512
+
+// uuidText is a UUID in its text form, any case.
+var uuidText = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // e164 is "+" followed by 2 to 15 digits, the first not 0.
 var e164 = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
@@ -96,10 +101,24 @@ func Normalize(n NewNotification) (NewNotification, []FieldError) {
 	}
 
 	switch {
-	case n.Content == "":
-		add("content", CodeRequired, "is required")
+	case n.Content != "" && n.TemplateID != "":
+		add("content", CodeOneOf, "give either content or template_id, not both")
+	case n.Content == "" && n.TemplateID == "":
+		add("content", CodeRequired, "is required, unless template_id is given")
+	case n.TemplateID != "":
+		if !uuidText.MatchString(n.TemplateID) {
+			add("template_id", CodeFormat, "must be a UUID")
+		} else {
+			n.TemplateID = strings.ToLower(n.TemplateID)
+		}
+		if n.Variables == nil {
+			n.Variables = map[string]string{}
+		}
 	case strings.ContainsRune(n.Content, 0):
 		add("content", CodeNUL, "must not contain the NUL character (U+0000)")
+	}
+	if n.TemplateID == "" && n.Variables != nil {
+		add("variables", CodeOneOf, "is allowed only with template_id")
 	}
 
 	if n.ScheduledAt != "" {
@@ -195,15 +214,7 @@ func DefaultLimits() Limits {
 // Check returns a field error when the content is over its channel's limit.
 // It expects a notification that passed Normalize.
 func (l Limits) Check(n NewNotification) []FieldError {
-	limit := 0
-	switch n.Channel {
-	case ChannelSMS:
-		limit = l.SMS
-	case ChannelEmail:
-		limit = l.Email
-	case ChannelPush:
-		limit = l.Push
-	}
+	limit := l.For(n.Channel)
 	if count := utf8.RuneCountInString(n.Content); limit > 0 && count > limit {
 		return []FieldError{{
 			Field:   "content",
@@ -228,6 +239,10 @@ type hashedItem struct {
 	// Left out when empty, so a request without scheduled_at hashes as it
 	// did before the field existed and its stored key still replays.
 	ScheduledAt string `json:"scheduled_at,omitempty"`
+	// Left out for plain content, for the same reason (K33). JSON encodes a
+	// map with its keys sorted.
+	TemplateID string            `json:"template_id,omitempty"`
+	Variables  map[string]string `json:"variables,omitempty"`
 }
 
 // RequestHash returns the SHA-256 of the operation and its normalized items
