@@ -610,3 +610,13 @@ I chose to build every slice on its own branch and merge it through a pull reque
 - **Also considered:** Squash merge (one commit per slice on `main`, but the small steps disappear from `main`) and committing straight to `main` (no pull request evidence, and CI would catch problems only after they land).
 - **What it costs:** About 3–5 extra minutes per slice. Without squashing, every commit inside a pull request stays in `main`'s history, so each one has to be clean and pass the tests.
 - **How to read the history:** `git log --first-parent main` shows one line per slice; `git log` shows every step.
+
+### K35 — Planning with one delivery plan and a note per slice
+
+I chose one delivery plan with a note per slice because reviewers need one place to see the delivery order and dependencies, and each slice can keep its own tasks and acceptance tests close together.
+
+- **Main plan.** `docs/PLAN.md` lists slices in delivery order, with dependencies, scope, the relevant R/B and K IDs, and an acceptance check. [REQUIREMENTS.md](REQUIREMENTS.md) defines the expected behaviour, and this decision log records the design and its trade-offs. The plan refers to those IDs.
+- **Slice notes.** Every slice has its own note under `docs/slices/` with its preconditions, files, schema changes, steps, tests, acceptance checks, failure scenarios and the evidence its PR records. `docs/PLAN.md` keeps what spans slices: the order, the dependencies, the gate, the coverage and the open questions.
+- **How the plan is written.** I wrote a small Claude Code skill, `slice-planner`, that I invoke by hand. It reads the requirement and decision records and writes only `docs/PLAN.md` and `docs/slices/`. It runs no shell commands and no Git operations, so code and commits stay separate steps. It contains no project names or IDs, so I can reuse it in other repositories.
+- **Verification.** The plan or slice note states the command and expected result before implementation. The slice PR records what was run and the observed result. A change in scope or order is updated in the same PR.
+- **What it costs.** The plan and its links need manual maintenance. The existing requirement and decision IDs give the plan a consistent structure without a separate specification workflow.

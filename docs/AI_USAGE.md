@@ -14,7 +14,7 @@ I built this project with AI assistants on purpose: the role is AI-assisted engi
 |---|---|---|
 | 1. Requirements | The AI turns the case PDF into numbered, testable requirements. I review them, ask for re-checks, and approve. | [`REQUIREMENTS.md`](REQUIREMENTS.md) |
 | 2. Decisions | For each design question the AI lays out options with consequences (code, testing, failure modes, reversibility). I pick one and write the reason in my own words. | [`DECISIONS.md`](DECISIONS.md) |
-| 3. Plan | Spec → plan → tasks, as vertical slices: core first, bonus features after. | *(planning tool not chosen yet)* |
+| 3. Plan | A second Claude Code skill I wrote, `slice-planner`, which I invoke by hand, turns the requirements and decisions into vertical slices in delivery order: core first, bonus features after. Each slice lists its dependencies and an acceptance check, with the command to run and the expected result. The skill writes only the plan documents; code and Git stay separate steps. I review the plan with OpenAI Codex ([K35](DECISIONS.md)). | [`PLAN.md`](PLAN.md), [`slices/`](slices/) |
 | 4. Build | The AI writes code one small piece at a time and explains each piece. Before a slice is committed, I explain why it is built the way it is, and I make every commit myself. Each slice lives on its own branch and is merged through a pull request with a merge commit. | Commits and pull requests |
 | 5. Verify | Behaviour is measured with tests and scripts, not by reading code (see section 4). | Test and script output |
 
@@ -88,7 +88,7 @@ Bu projeyi bilerek yapay zekâ asistanlarıyla geliştirdim: rol, yapay zekâ de
 |---|---|---|
 | 1. Gereksinimler | Yapay zekâ case PDF'ini numaralı, test edilebilir gereksinimlere çevirir. Ben okurum, yeniden kontrol isterim ve onaylarım. | [`REQUIREMENTS.md`](REQUIREMENTS.md) |
 | 2. Kararlar | Yapay zekâ her tasarım sorusu için seçenekleri sonuçlarıyla birlikte sunar: koda etkisi, test, olası arızalar, geri dönüş maliyeti. Birini seçerim ve gerekçemi kendi cümlemle yazarım. | [`DECISIONS.md`](DECISIONS.md) |
-| 3. Plan | Spec → plan → görevler, dikey dilimler halinde: önce çekirdek, sonra bonuslar. | *(planlama aracı henüz seçilmedi)* |
+| 3. Plan | Yazdığım ve elle çağırdığım ikinci bir Claude Code skill'i, `slice-planner`, gereksinimleri ve kararları teslim sırasına dizilmiş dikey dilimlere çevirir: önce çekirdek, sonra bonuslar. Her dilim bağımlılıklarını ve bir kabul kontrolünü, yani çalıştırılacak komutu ve beklenen sonucu listeler. Skill yalnızca plan belgelerini yazar; kod ve Git ayrı adımlardır. Planı OpenAI Codex ile incelerim ([K35](DECISIONS.md)). | [`PLAN.md`](PLAN.md), [`slices/`](slices/) |
 | 4. Yapım | Yapay zekâ kodu küçük parçalar halinde yazar ve her parçayı açıklar. Bir dilim commit'lenmeden önce neden o şekilde kurulduğunu ben açıklarım; her commit'i kendim atarım. Her dilim kendi branch'inde yapılır ve bir pull request üzerinden merge commit ile birleştirilir. | Commit'ler ve pull request'ler |
 | 5. Doğrulama | Davranış kod okunarak değil, testler ve script'lerle ölçülerek doğrulanır (bkz. bölüm 4). | Test ve script çıktıları |
 
