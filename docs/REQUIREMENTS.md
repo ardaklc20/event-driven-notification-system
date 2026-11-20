@@ -70,7 +70,7 @@ Every line is written so it can be tested. `docs/AI_USAGE.md` maps each ID to th
 
 | ID | Deliverable |
 |---|---|
-| D1 | Public GitHub repository with a clean commit history |
+| D1 | A GitHub or GitLab repository with a clean commit history, shared by its link. *(The case does not say "public"; we publish a public GitHub repository so that the link works for any reviewer.)* |
 | D2 | README: setup, architecture overview, API examples |
 | D3 | One-command setup: `docker-compose up` |
 | D4 | Swagger / OpenAPI specification |
