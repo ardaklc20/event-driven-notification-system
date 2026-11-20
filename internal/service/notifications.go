@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 )
@@ -14,9 +15,10 @@ type Store interface {
 	CreateNotification(ctx context.Context, cmd domain.CreateCommand) (domain.CreateResult, error)
 	GetNotification(ctx context.Context, id string) (domain.Notification, error)
 	CancelNotification(ctx context.Context, id string) (domain.Notification, error)
+	ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error)
 }
 
-// Notifications creates, reads and cancels notifications.
+// Notifications creates, reads, cancels and lists notifications.
 type Notifications struct {
 	store  Store
 	limits domain.Limits
@@ -70,4 +72,46 @@ func (s *Notifications) Get(ctx context.Context, id string) (domain.Notification
 // status; an unknown ID gives domain.ErrNotFound.
 func (s *Notifications) Cancel(ctx context.Context, id string) (domain.Notification, error) {
 	return s.store.CancelNotification(ctx, id)
+}
+
+// ListInput is one listing request (K13). Cursor is the opaque next_cursor of
+// the previous page, or "".
+type ListInput struct {
+	Status   domain.Status
+	Channel  domain.Channel
+	From, To *time.Time
+	Cursor   string
+	Limit    int
+}
+
+// ListResult is one page.
+type ListResult struct {
+	Items []domain.Notification
+	// NextCursor reads the next page; "" on the last page.
+	NextCursor string
+}
+
+// List returns one page, newest first. It reads one row more than the page
+// holds to learn whether another page exists; the next cursor is built from
+// the last returned row. A cursor that does not decode gives
+// domain.ErrInvalidCursor.
+func (s *Notifications) List(ctx context.Context, in ListInput) (ListResult, error) {
+	f := domain.ListFilter{Status: in.Status, Channel: in.Channel, From: in.From, To: in.To, Limit: in.Limit + 1}
+	if in.Cursor != "" {
+		c, err := DecodeCursor(in.Cursor)
+		if err != nil {
+			return ListResult{}, err
+		}
+		f.After = &c
+	}
+	items, err := s.store.ListNotifications(ctx, f)
+	if err != nil {
+		return ListResult{}, err
+	}
+	if len(items) <= in.Limit {
+		return ListResult{Items: items}, nil
+	}
+	items = items[:in.Limit]
+	last := items[len(items)-1]
+	return ListResult{Items: items, NextCursor: EncodeCursor(domain.Cursor{CreatedAt: last.CreatedAt, ID: last.ID})}, nil
 }

@@ -164,6 +164,27 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency key already used with a different request")
 )
 
+// ListFilter is one listing query (K13). Empty fields do not filter.
+type ListFilter struct {
+	Status  Status
+	Channel Channel
+	// From is included and To excluded: the range is half-open.
+	From, To *time.Time
+	// After, when set, returns only rows below it in the listing order.
+	After *Cursor
+	// Limit is the most rows returned.
+	Limit int
+}
+
+// Cursor is a position in the listing order: created_at DESC, id DESC.
+type Cursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// ErrInvalidCursor means a cursor was not produced by a previous page.
+var ErrInvalidCursor = errors.New("cursor is not valid")
+
 // CancelConflictError means the notification can no longer be cancelled: a
 // worker holds it (processing) or it has ended (sent, failed). Status is the
 // status read under the row lock (K9).

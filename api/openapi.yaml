@@ -117,6 +117,22 @@ components:
           format: uri
           type: string
       type: object
+    ListBody:
+      additionalProperties: false
+      properties:
+        items:
+          description: "Newest first: created_at descending, then ID descending"
+          items:
+            $ref: "#/components/schemas/NotificationBody"
+          type:
+            - array
+            - "null"
+        next_cursor:
+          description: Pass as cursor to read the next page; absent on the last page
+          type: string
+      required:
+        - items
+      type: object
     LivenessBody:
       additionalProperties: false
       properties:
@@ -285,6 +301,96 @@ paths:
       tags:
         - Health
   /notifications:
+    get:
+      description: Lists notifications newest first. status, channel, from and to filter with AND; the created_at range is half-open, from included and to excluded. Follow next_cursor to read further pages; notifications created meanwhile do not shift them. Each page is a separate query, so a notification whose status changes between pages can move into or out of a filtered list. A cursor that was not produced by a previous page gets 400.
+      operationId: list-notifications
+      parameters:
+        - description: Only notifications with this status
+          explode: false
+          in: query
+          name: status
+          schema:
+            description: Only notifications with this status
+            enum:
+              - queued
+              - processing
+              - sent
+              - failed
+              - cancelled
+            type: string
+        - description: Only notifications on this channel
+          explode: false
+          in: query
+          name: channel
+          schema:
+            description: Only notifications on this channel
+            enum:
+              - sms
+              - email
+              - push
+            type: string
+        - description: Only notifications created at or after this time (RFC 3339, included)
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: Only notifications created at or after this time (RFC 3339, included)
+            format: date-time
+            type: string
+        - description: Only notifications created before this time (RFC 3339, excluded)
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: Only notifications created before this time (RFC 3339, excluded)
+            format: date-time
+            type: string
+        - description: Page size; outside 1 to 200 gets 422
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Page size; outside 1 to 200 gets 422
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: The next_cursor of the previous page, unchanged
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: The next_cursor of the previous page, unchanged
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListBody"
+          description: OK
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Bad Request
+        "422":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+      summary: List notifications
+      tags:
+        - Notifications
     post:
       description: Validates the notification, saves it as queued and answers 202 at once, without waiting for delivery. With an Idempotency-Key, a repeat of the same request returns the first response byte for byte.
       operationId: create-notification
