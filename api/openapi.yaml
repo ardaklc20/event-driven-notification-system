@@ -162,6 +162,81 @@ components:
       required:
         - current_status
       type: object
+    ChannelMetricsBody:
+      additionalProperties: false
+      properties:
+        completed:
+          $ref: "#/components/schemas/CompletedBody"
+        latency:
+          $ref: "#/components/schemas/LatencyBody"
+        processing:
+          description: Notifications a worker holds at as_of; high while nothing completes means a stalled worker
+          format: int64
+          minimum: 0
+          type: integer
+        queue:
+          $ref: "#/components/schemas/QueueBody"
+      required:
+        - queue
+        - processing
+        - completed
+        - latency
+      type: object
+    ChannelsMetricsBody:
+      additionalProperties: false
+      properties:
+        email:
+          $ref: "#/components/schemas/ChannelMetricsBody"
+        push:
+          $ref: "#/components/schemas/ChannelMetricsBody"
+        sms:
+          $ref: "#/components/schemas/ChannelMetricsBody"
+      required:
+        - sms
+        - email
+        - push
+      type: object
+    CompletedBody:
+      additionalProperties: false
+      properties:
+        failed:
+          format: int64
+          minimum: 0
+          type: integer
+        failed_per_second:
+          description: failed / 60
+          format: double
+          minimum: 0
+          type: number
+        sent:
+          format: int64
+          minimum: 0
+          type: integer
+        sent_per_second:
+          description: sent / 60
+          format: double
+          minimum: 0
+          type: number
+        success_ratio:
+          description: sent / (sent + failed); null when nothing completed. Cancellations are not completions
+          format: double
+          maximum: 1
+          minimum: 0
+          type:
+            - number
+            - "null"
+        window_seconds:
+          description: "Always 60: completed_at after as_of − 60 s and at or before as_of"
+          format: int64
+          type: integer
+      required:
+        - window_seconds
+        - sent
+        - failed
+        - sent_per_second
+        - failed_per_second
+        - success_ratio
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -214,6 +289,38 @@ components:
           format: uri
           type: string
       type: object
+    LatencyBody:
+      additionalProperties: false
+      properties:
+        p50_ms:
+          description: null when samples is 0
+          format: double
+          type:
+            - number
+            - "null"
+        p95_ms:
+          description: null when samples is 0
+          format: double
+          type:
+            - number
+            - "null"
+        p99_ms:
+          description: null when samples is 0
+          format: double
+          type:
+            - number
+            - "null"
+        samples:
+          description: Notifications sent in the window
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+        - samples
+        - p50_ms
+        - p95_ms
+        - p99_ms
+      type: object
     ListBody:
       additionalProperties: false
       properties:
@@ -240,6 +347,19 @@ components:
           type: string
       required:
         - status
+      type: object
+    MetricsBody:
+      additionalProperties: false
+      properties:
+        as_of:
+          description: The database time every value refers to; RFC 3339 with microseconds
+          format: date-time
+          type: string
+        channels:
+          $ref: "#/components/schemas/ChannelsMetricsBody"
+      required:
+        - as_of
+        - channels
       type: object
     NotificationBody:
       additionalProperties: false
@@ -361,6 +481,44 @@ components:
         - channel
         - content
       type: object
+    PriorityQueueBody:
+      additionalProperties: false
+      properties:
+        deferred:
+          description: queued with a later available_at, such as a retry waiting for its time
+          format: int64
+          minimum: 0
+          type: integer
+        oldest_ready_age_seconds:
+          description: as_of minus the earliest available_at of the ready notifications; null when none is ready
+          format: double
+          type:
+            - number
+            - "null"
+        ready:
+          description: queued with available_at at or before as_of
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+        - ready
+        - deferred
+        - oldest_ready_age_seconds
+      type: object
+    QueueBody:
+      additionalProperties: false
+      properties:
+        high:
+          $ref: "#/components/schemas/PriorityQueueBody"
+        low:
+          $ref: "#/components/schemas/PriorityQueueBody"
+        normal:
+          $ref: "#/components/schemas/PriorityQueueBody"
+      required:
+        - high
+        - normal
+        - low
+      type: object
     ReadinessBody:
       additionalProperties: false
       properties:
@@ -469,6 +627,26 @@ paths:
       summary: Liveness
       tags:
         - Health
+  /metrics:
+    get:
+      description: "Reads every value in one database snapshot taken at as_of: per channel and priority the queued notifications that are ready and deferred and the age of the oldest ready one; the processing count; the notifications sent and failed in the last 60 seconds with their rates and success ratio; and the p50, p95 and p99 of created_at → sent_at for those sent. It summarizes completed notifications; the rate limit is proven by counting send starts, not by these numbers."
+      operationId: get-metrics
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Queue depth, completions and latency per channel
+      tags:
+        - Metrics
   /notifications:
     get:
       description: Lists notifications newest first. status, channel, from and to filter with AND; the created_at range is half-open, from included and to excluded. Follow next_cursor to read further pages; notifications created meanwhile do not shift them. Each page is a separate query, so a notification whose status changes between pages can move into or out of a filtered list. A cursor that was not produced by a previous page gets 400.

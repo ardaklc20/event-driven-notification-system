@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,6 +17,9 @@ import (
 // Store runs the notification queries (K17).
 type Store struct {
 	pool *pgxpool.Pool
+	// afterAsOf, when set by a test, runs right after the metrics snapshot
+	// read its as_of.
+	afterAsOf func(time.Time)
 }
 
 // NewStore returns a Store on pool.
