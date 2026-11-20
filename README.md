@@ -4,7 +4,7 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 4):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires.
+**Current state (slice 5):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`.
 
 ## Requirements
 
@@ -50,8 +50,8 @@ client ──POST /notifications──► api ──INSERT──► notification
 ```
 
 - The API validates the request, saves the notification as `queued` and answers `202`. It never calls the provider, so its response time does not depend on the provider.
-- The `notifications` table is the queue. A worker claims the oldest due `queued` row with `FOR UPDATE SKIP LOCKED` and, in the same statement, puts it under a lease: `processing`, a new `lease_token`, `lease_expires_at` 30 seconds ahead and `attempts + 1`. Several workers can run against the same table (`docker compose up --scale worker=2`); a notification has one valid lease at a time.
-- The worker posts `{to, channel, content}` to `PROVIDER_URL` with the notification's `X-Correlation-ID`, a 5-second timeout and no redirects. The call ends at least `RESULT_BUDGET` before the lease does.
+- The `notifications` table is the queue. A worker claims on one channel at a time: in one statement it takes the channel's permit from its row in `channel_limits` and the channel's next due `queued` notification (`high → normal → low`, then the earliest `available_at`), both with `SKIP LOCKED`, and puts the notification under a lease: `processing`, a new `lease_token`, `lease_expires_at` 30 seconds ahead and `attempts + 1` ([Rate limit and priority](#rate-limit-and-priority)). Several workers can run against the same table (`docker compose up --scale worker=2`); they share each channel's permits, and a notification has one valid lease at a time.
+- The worker posts `{to, channel, content}` to `PROVIDER_URL` with the notification's `X-Correlation-ID`, a 5-second timeout and no redirects. The send starts only before the permit's start deadline, and the call ends at least `RESULT_BUDGET` before the lease does.
 - The result is written only while the row is still `processing` under the same token and the lease has not expired by the database clock. A `202` ends as `sent` with `provider_message_id`, `provider_timestamp` and `sent_at`. A `202` whose body is broken, or never finishes arriving, still ends as `sent`, with those fields empty and a warning in the log: the provider accepted the notification, and a second POST could deliver it twice.
 - A temporary failure goes back to `queued` with a later `available_at`; a permanent one ends as `failed` ([Retries and failures](#retries-and-failures)).
 - Every worker also takes back leases that expired because their worker crashed or stalled.
@@ -67,7 +67,7 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, attempts, provi
 docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 ```
 
-The worker writes two JSON lines per attempt: `provider call started` before the POST, and `provider call finished` after it with `status_code`, `duration_ms`, `class` and `outcome` (`sent`, `queued` for a retry, or `failed`). Both carry `worker_id`, `correlation_id`, `notification_id`, `channel` and `attempt`. Recipients and content are never logged.
+The worker writes two JSON lines per attempt: `provider call started` with `started_at`, the send start the start gate read right before handing the request to the HTTP transport, and `provider call finished` after the call with `status_code`, `duration_ms`, `class` and `outcome` (`sent`, `queued` for a retry, or `failed`). Both carry `worker_id`, `correlation_id`, `notification_id`, `channel` and `attempt`. A claim whose start deadline passed before the send writes one `start deadline missed …` line instead and no start line. Recipients and content are never logged.
 
 ## Retries and failures
 
@@ -87,6 +87,43 @@ Each attempt's result is classified, and the notification's next state follows f
 - **Crash recovery:** every `RECOVERY_INTERVAL` (5 s) each worker takes back at most `RECOVERY_BATCH` (100) notifications whose lease has expired by the database clock: back to `queued`, or `failed` if that was the fifth attempt, with `last_error` `temporary: lease expired before a result was written`. Workers recovering at the same time never take the same row. With a 30-second lease, a crashed worker's notification is expected back within about 35 seconds while any worker runs; nothing is recovered while no worker runs. A worker whose lease has ended can never change the row, and it does not start a POST it could not finish within its lease.
 - **What `failed` means:** the attempts ran out or the error was permanent. It does not prove the notification was never delivered: an earlier attempt may have timed out after the provider had already accepted it.
 - **Duplicates are possible:** this is not exactly-once delivery. When the outcome of an attempt is unclear, a retry can become a second send: for example, the provider accepts the request but its answer is lost or arrives after the timeout, or the worker receives `202` and crashes before writing it. webhook.site documents no deduplication. Repeated **API requests** never create a second notification when they carry the same `Idempotency-Key`.
+
+## Rate limit and priority
+
+**The limit.** Each channel gets at most 100 **send starts** in any one-second window `[t, t + 1 s)`, however many workers run. A send start is the moment the worker hands the request to the HTTP transport, recorded as `started_at` in its start line; the mock provider's arrival times are reported separately and are not the measure.
+
+- **One permit row per channel.** `channel_limits` holds `next_permit_at` for `sms`, `email` and `push`, shared by every worker. A claim locks its channel's row with `SKIP LOCKED` (another worker holding it: the claim returns at once), reads the database clock once, and takes the permit only when `next_permit_at` has come; it then claims one notification and moves `next_permit_at` to `PERMIT_INTERVAL` (11 ms) after the permit, all in one statement. A channel with no due notification keeps its permit, and a notification waiting for a permit stays `queued`.
+- **A start deadline.** A permit is valid for `PERMIT_GRACE` (100 ms). The provider client's start gate reads the clock, compares it with that deadline and, before it, records that reading as the send start, in one step at the last point before the transport. A request past its deadline is not sent: the notification goes back to `queued` with its attempt returned, once and only under its own lease, and the permit is not given back.
+- **Why it holds:** 101 starts need 101 permits, the first and the last at least 100 × 11 ms = 1,100 ms apart. A start comes at most 100 ms after its permit, so the first and the last start are at least 1,000 ms apart and cannot share a window. This holds when a worker pauses, for example after its claim. `Validate()` refuses settings for which 100 × `PERMIT_INTERVAL` − `PERMIT_GRACE` is below one second.
+- **What it costs:** permits are used up to about 91 per second per channel. Measured, a full channel reached 82 to 89 starts in its busiest second: each claim's round trip to PostgreSQL comes on top of the 11 ms.
+- **Claim loop:** each worker keeps a next try per channel: at once after a claim, after the remaining wait (at most `PERMIT_INTERVAL`) when the permit is not due yet, after `PERMIT_INTERVAL` when another worker holds the row, and after `IDLE_WAIT` when the channel has nothing due. It always tries the channel whose turn comes first, so an empty or busy channel never slows the others. Retries take permits like first attempts.
+
+**Priority.** Within a channel, a worker takes `high` before `normal` before `low`, then the earliest `available_at`, then the lowest ID. The order comes from the PostgreSQL enum's declared order and is served by a partial index on queued rows. Channels do not compete: each has its own limit. The order is the order of claims; calls run in parallel, so they can reach the provider in another order. **Cost:** `low` waits as long as higher-priority work fills the channel, without limit.
+
+**Calls in flight.** To use the full limit, the calls in flight across all workers must cover the provider's latency: about 3 channels × 91 per second × latency. With a provider answering in 200 ms and two workers, the load test below sent everything within 30 seconds at 10 calls per worker only partly, reached 69 to 70 starts per channel in the busiest second at 20, 89 at 30 and 85 at 40. `IN_FLIGHT` defaults to 30 per worker; a single worker against a 200 ms provider would need about 60. Against the mock, which answers at once, a few calls are enough.
+
+**Measuring it.** The tests count starts with the same code as `cmd/ratecount`:
+
+```bash
+go test -count=1 -v -run '^(TestSendStartsWithPausedWorker|TestRateLimitTwoWorkers)$' ./internal/worker/
+R8_IN_FLIGHT=30 R8_PROVIDER_DELAY=200ms go test -count=1 -v -run '^TestRateLimitTwoWorkers$' ./internal/worker/
+```
+
+On the stack, in its own Compose project with two workers (free the host ports first with `docker compose stop`):
+
+```bash
+P="nsys-r8-$(date +%s)"
+PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard MOCK_DELAY=0s \
+  docker compose -p "$P" up -d --build --scale worker=2
+scripts/wait-health.sh -p "$P" api healthy 60
+go run ./cmd/loadgen -url http://127.0.0.1:8080 -per-channel 1000; echo "loadgen exit=$?"
+# wait until nothing is queued or processing, then:
+docker compose -p "$P" logs --no-log-prefix worker | go run ./cmd/ratecount; echo "ratecount exit=$?"
+curl -s http://localhost:8081/stats | jq .
+docker compose -p "$P" down -v
+```
+
+A run on 2026-11-20: 3,000 creates accepted in 630 ms; all `sent` 16 seconds after the first create; `ratecount` printed `max_window` 83 (`email`), 83 (`push`) and 84 (`sms`) with `starts=1000` each and `workers=2`; no start deadline was missed; the mock's arrival maxima were the same. One passing run is a measurement, not a guarantee: the bound comes from the permit spacing and the start deadline.
 
 ## API
 
@@ -215,14 +252,16 @@ Each program reads typed environment variables and refuses to start with an inva
 | `HTTP_TIMEOUT` | `5s` | Limit of one provider call |
 | `RESULT_BUDGET` | `5s` | Part of the lease kept for writing the result; the call ends at least this long before the lease |
 | `LEASE_DURATION` | `30s` | How long a claim holds its notification; at least `HTTP_TIMEOUT + RESULT_BUDGET` |
-| `IN_FLIGHT` | `20` | Provider calls one worker runs at once |
-| `IDLE_WAIT` | `200ms` | Pause after a claim that found no due notification |
+| `IN_FLIGHT` | `30` | Provider calls one worker runs at once ([Calls in flight](#rate-limit-and-priority)) |
+| `IDLE_WAIT` | `200ms` | Pause on a channel after its permit was due but no notification was |
 | `SHUTDOWN_BUDGET` | `10s` | Wait for calls in flight after `SIGTERM` |
 | `MAX_ATTEMPTS` | `5` | Attempts in total, the first one included |
 | `BACKOFF_BASE` | `2s` | Backoff of the first retry; it doubles with each retry |
 | `BACKOFF_CAP` | `60s` | Longest backoff; a longer `Retry-After` still wins |
 | `RECOVERY_INTERVAL` | `5s` | How often the worker takes back expired leases |
 | `RECOVERY_BATCH` | `100` | Most expired leases taken back in one round |
+| `PERMIT_INTERVAL` | `11ms` | Least time between two permits of a channel |
+| `PERMIT_GRACE` | `100ms` | How long after its time a permit may start a send; 100 × `PERMIT_INTERVAL` − `PERMIT_GRACE` must be at least `1s` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 ### Mock provider settings
@@ -280,13 +319,16 @@ cmd/api/                API entry point; subcommands healthcheck and openapi
 cmd/worker/             worker entry point
 cmd/migrate/            migrate up
 cmd/mockprovider/       mock provider entry point
+cmd/loadgen/            sends the rate-limit load through the API
+cmd/ratecount/          counts send starts per one-second window from worker logs
 internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
 internal/service/       create and read rules
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, read, claim, result writes, recovery
-internal/worker/        claim loop, lease deadline, retries and backoff, lease recovery
-internal/provider/      provider HTTP client, response classification, Retry-After
+internal/postgres/      connection pool and all SQL: create, read, claim with permit, result writes, give-back, recovery
+internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery
+internal/provider/      provider HTTP client, start gate, response classification, Retry-After
+internal/ratecheck/     largest count in a half-open one-second window
 internal/mockprovider/  mock provider handlers and /stats
 internal/e2e/           end-to-end tests: API, worker and a test provider on one database
 internal/testdb/        test helper: PostgreSQL container and one database per test
@@ -309,7 +351,7 @@ docs/                   requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 4):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır.
+**Şu anki durum (dilim 5):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir.
 
 ## Gereksinimler
 
@@ -355,8 +397,8 @@ istemci ──POST /notifications──► api ──INSERT──► notificatio
 ```
 
 - API isteği doğrular, bildirimi `queued` olarak kaydeder ve `202` döner. Provider'ı hiç çağırmaz; bu yüzden yanıt süresi provider'a bağlı değildir.
-- Kuyruk `notifications` tablosunun kendisidir. Worker, zamanı gelmiş en eski `queued` satırı `FOR UPDATE SKIP LOCKED` ile alır ve aynı ifadede onu bir lease altına koyar: `processing`, yeni bir `lease_token`, 30 saniye sonrası için `lease_expires_at` ve `attempts + 1`. Aynı tabloya karşı birden fazla worker çalışabilir (`docker compose up --scale worker=2`); bir bildirimin aynı anda tek bir geçerli lease'i olur.
-- Worker `{to, channel, content}` gövdesini, bildirimin `X-Correlation-ID`'siyle, 5 saniyelik zaman aşımıyla ve yönlendirmeleri izlemeden `PROVIDER_URL`'e POST eder. Çağrı, lease bitmeden en az `RESULT_BUDGET` önce sona erer.
+- Kuyruk `notifications` tablosunun kendisidir. Worker her seferinde tek bir kanalda claim yapar: tek bir ifadede kanalın `channel_limits`'teki satırından iznini ve kanalın zamanı gelmiş sıradaki `queued` bildirimini (`high → normal → low`, sonra en erken `available_at`) ikisi de `SKIP LOCKED` ile alır ve bildirimi bir lease altına koyar: `processing`, yeni bir `lease_token`, 30 saniye sonrası için `lease_expires_at` ve `attempts + 1` ([Hız sınırı ve öncelik](#hız-sınırı-ve-öncelik)). Aynı tabloya karşı birden fazla worker çalışabilir (`docker compose up --scale worker=2`); her kanalın izinlerini paylaşırlar ve bir bildirimin aynı anda tek bir geçerli lease'i olur.
+- Worker `{to, channel, content}` gövdesini, bildirimin `X-Correlation-ID`'siyle, 5 saniyelik zaman aşımıyla ve yönlendirmeleri izlemeden `PROVIDER_URL`'e POST eder. Gönderim yalnızca iznin başlama son anından önce başlar ve çağrı, lease bitmeden en az `RESULT_BUDGET` önce sona erer.
 - Sonuç yalnızca satır hâlâ aynı token altında `processing` iken ve lease veritabanı saatine göre dolmamışken yazılır. `202`, `provider_message_id`, `provider_timestamp` ve `sent_at` ile `sent` olarak biter. Gövdesi bozuk olan ya da gelmesi hiç bitmeyen bir `202` de `sent` olarak biter; bu alanlar boş kalır ve log'a bir uyarı yazılır: provider bildirimi kabul etmiştir ve ikinci bir POST onu iki kez teslim edebilir.
 - Geçici bir hata bildirimi daha sonraki bir `available_at` ile `queued`'a döndürür; kalıcı bir hata `failed` ile bitirir ([Tekrar denemeler ve hatalar](#tekrar-denemeler-ve-hatalar)).
 - Her worker, worker'ı çöktüğü ya da takıldığı için süresi dolan lease'leri de geri alır.
@@ -372,7 +414,7 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, attempts, provi
 docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 ```
 
-Worker her deneme için iki JSON satırı yazar: POST'tan önce `provider call started`, sonra da `status_code`, `duration_ms`, `class` ve `outcome` (`sent`, tekrar deneme için `queued` ya da `failed`) ile `provider call finished`. İkisi de `worker_id`, `correlation_id`, `notification_id`, `channel` ve `attempt` taşır. Alıcılar ve içerik asla loglanmaz.
+Worker her deneme için iki JSON satırı yazar: `started_at` ile `provider call started` (başlatma kapısının isteği HTTP transport'a vermeden hemen önce okuduğu gönderim başlangıcı) ve çağrıdan sonra `status_code`, `duration_ms`, `class` ve `outcome` (`sent`, tekrar deneme için `queued` ya da `failed`) ile `provider call finished`. İkisi de `worker_id`, `correlation_id`, `notification_id`, `channel` ve `attempt` taşır. Başlama son anı gönderimden önce geçmiş bir claim, başlangıç satırı yerine tek bir `start deadline missed …` satırı yazar. Alıcılar ve içerik asla loglanmaz.
 
 ## Tekrar denemeler ve hatalar
 
@@ -392,6 +434,43 @@ Her denemenin sonucu sınıflandırılır ve bildirimin sonraki durumu sınıfta
 - **Çökme sonrası kurtarma:** her `RECOVERY_INTERVAL`'de (5 s) her worker, lease'i veritabanı saatine göre dolmuş en fazla `RECOVERY_BATCH` (100) bildirimi geri alır: `queued`'a, beşinci denemeyse `failed`'a, `last_error` `temporary: lease expired before a result was written` ile. Aynı anda kurtarma yapan worker'lar asla aynı satırı almaz. 30 saniyelik lease ile, herhangi bir worker çalıştığı sürece çöken bir worker'ın bildiriminin yaklaşık 35 saniye içinde geri gelmesi beklenir; hiçbir worker çalışmıyorsa hiçbir şey geri alınmaz. Lease'i bitmiş bir worker satırı asla değiştiremez ve lease'i içinde bitiremeyeceği bir POST'a başlamaz.
 - **`failed` ne demek:** denemeler bitti ya da hata kalıcıydı. Bildirimin hiç teslim edilmediğini kanıtlamaz: daha önceki bir deneme, provider isteği kabul ettikten sonra zaman aşımına uğramış olabilir.
 - **Tekrar gönderim mümkün:** bu tam olarak bir kez (exactly-once) teslim değildir. Bir denemenin sonucu belirsiz olduğunda tekrar deneme ikinci bir gönderim olabilir: örneğin provider isteği kabul eder ama cevabı kaybolur ya da zaman aşımından sonra gelir, veya worker `202` alır ve onu yazmadan çöker. webhook.site herhangi bir tekilleştirme belgelemiyor. Aynı `Idempotency-Key`'i taşıyan tekrarlanan **API istekleri** ise asla ikinci bir bildirim oluşturmaz.
+
+## Hız sınırı ve öncelik
+
+**Sınır.** Kaç worker çalışırsa çalışsın, her kanal herhangi bir bir saniyelik `[t, t + 1 s)` penceresinde en fazla 100 **gönderim başlangıcı** alır. Gönderim başlangıcı, worker'ın isteği HTTP transport'a verdiği andır ve başlangıç satırında `started_at` olarak kaydedilir; mock provider'ın geliş zamanları ayrıca raporlanır, ölçü onlar değildir.
+
+- **Kanal başına bir izin satırı.** `channel_limits`, `sms`, `email` ve `push` için bütün worker'ların paylaştığı `next_permit_at`'i tutar. Bir claim kanalının satırını `SKIP LOCKED` ile kilitler (satırı başka bir worker tutuyorsa claim hemen döner), veritabanı saatini bir kez okur ve izni yalnızca `next_permit_at` geldiyse alır; ardından tek bir bildirimi claim eder ve `next_permit_at`'i iznin `PERMIT_INTERVAL` (11 ms) sonrasına taşır; hepsi tek ifadede. Zamanı gelmiş bildirimi olmayan bir kanal iznini korur ve izin bekleyen bir bildirim `queued` kalır.
+- **Başlama son anı.** Bir izin `PERMIT_GRACE` (100 ms) boyunca geçerlidir. Provider istemcisinin başlatma kapısı saati okur, son anla karşılaştırır ve son andan önceyse bu okumayı gönderim başlangıcı olarak kaydeder; ikisi transport'tan önceki son noktada tek adımdır. Son anı geçmiş bir istek gönderilmez: bildirim `queued`'a döner ve denemesi geri verilir (bir kez ve yalnızca kendi lease'i altında), izin geri verilmez.
+- **Neden tutar:** 101 başlangıç 101 izin ister; ilki ile sonuncusu arasında en az 100 × 11 ms = 1.100 ms vardır. Bir başlangıç izninden en fazla 100 ms sonra gelir; bu yüzden ilk ve son başlangıç arasında en az 1.000 ms olur ve aynı pencereye düşemezler. Bir worker duraklasa da (örneğin claim'inden sonra) bu geçerlidir. `Validate()`, 100 × `PERMIT_INTERVAL` − `PERMIT_GRACE` değeri bir saniyenin altında kalan ayarları reddeder.
+- **Bedeli:** izinler kanal başına saniyede en fazla yaklaşık 91 kullanılır. Ölçümde dolu bir kanal en yoğun saniyesinde 82 ile 89 arası başlangıca ulaştı: her claim'in PostgreSQL'e gidiş-dönüşü 11 ms'nin üzerine eklenir.
+- **Claim döngüsü:** her worker kanal başına bir sonraki deneme zamanı tutar: bir claim'den sonra hemen, izin henüz gelmemişse kalan beklemeden sonra (en fazla `PERMIT_INTERVAL`), satırı başka bir worker tutuyorsa `PERMIT_INTERVAL` sonra, kanalda zamanı gelmiş iş yoksa `IDLE_WAIT` sonra. Her zaman sırası ilk gelen kanalı dener; böylece boş ya da meşgul bir kanal diğerlerini yavaşlatmaz. Tekrar denemeler de ilk denemeler gibi izin alır.
+
+**Öncelik.** Bir kanal içinde worker `high`'ı `normal`'dan, `normal`'ı `low`'dan önce alır; sonra en erken `available_at`, sonra en küçük ID gelir. Sıra PostgreSQL enum'unun tanımlanma sırasından gelir ve kuyruktaki satırlar üzerindeki kısmi bir index ile karşılanır. Kanallar birbiriyle yarışmaz: her birinin kendi sınırı vardır. Bu sıra claim sırasıdır; çağrılar paralel yürüdüğü için provider'a başka bir sırayla ulaşabilirler. **Bedeli:** daha yüksek öncelikli iş kanalı doldurduğu sürece `low` sınırsız bekler.
+
+**Aynı anda süren çağrılar.** Sınırın tamamını kullanmak için bütün worker'lardaki süren çağrılar provider'ın gecikmesini karşılamalıdır: yaklaşık 3 kanal × saniyede 91 × gecikme. 200 ms'de cevap veren bir provider ve iki worker ile aşağıdaki yük testi, worker başına 10 çağrıda her şeyi 30 saniye içinde gönderemedi; 20'de en yoğun saniyede kanal başına 69–70, 30'da 89, 40'ta 85 başlangıca ulaştı. `IN_FLIGHT` worker başına varsayılan olarak 30'dur; 200 ms'lik bir provider'a karşı tek bir worker yaklaşık 60'a ihtiyaç duyar. Hemen cevap veren mock'a karşı birkaç çağrı yeterlidir.
+
+**Ölçmek.** Testler başlangıçları `cmd/ratecount` ile aynı kodla sayar:
+
+```bash
+go test -count=1 -v -run '^(TestSendStartsWithPausedWorker|TestRateLimitTwoWorkers)$' ./internal/worker/
+R8_IN_FLIGHT=30 R8_PROVIDER_DELAY=200ms go test -count=1 -v -run '^TestRateLimitTwoWorkers$' ./internal/worker/
+```
+
+Stack üzerinde, iki worker'lı kendi Compose projesinde (önce `docker compose stop` ile host portları boşaltılır):
+
+```bash
+P="nsys-r8-$(date +%s)"
+PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard MOCK_DELAY=0s \
+  docker compose -p "$P" up -d --build --scale worker=2
+scripts/wait-health.sh -p "$P" api healthy 60
+go run ./cmd/loadgen -url http://127.0.0.1:8080 -per-channel 1000; echo "loadgen exit=$?"
+# queued ya da processing hiçbir şey kalmayınca:
+docker compose -p "$P" logs --no-log-prefix worker | go run ./cmd/ratecount; echo "ratecount exit=$?"
+curl -s http://localhost:8081/stats | jq .
+docker compose -p "$P" down -v
+```
+
+2026-11-20 tarihli bir çalıştırma: 3.000 oluşturma 630 ms'de kabul edildi; hepsi ilk oluşturmadan 16 saniye sonra `sent` oldu; `ratecount` her biri `starts=1000` ve `workers=2` ile `max_window` 83 (`email`), 83 (`push`) ve 84 (`sms`) yazdı; hiçbir başlama son anı kaçırılmadı; mock'un geliş maksimumları aynıydı. Geçen tek bir çalıştırma bir ölçümdür, garanti değildir: sınırı izin aralığı ve başlama son anı sağlar.
 
 ## API
 
@@ -520,14 +599,16 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 | `HTTP_TIMEOUT` | `5s` | Tek bir provider çağrısının sınırı |
 | `RESULT_BUDGET` | `5s` | Lease'in sonucu yazmak için ayrılan kısmı; çağrı lease'ten en az bu kadar önce biter |
 | `LEASE_DURATION` | `30s` | Bir claim'in bildirimi ne kadar tuttuğu; en az `HTTP_TIMEOUT + RESULT_BUDGET` |
-| `IN_FLIGHT` | `20` | Bir worker'ın aynı anda yürüttüğü provider çağrısı sayısı |
-| `IDLE_WAIT` | `200ms` | Zamanı gelmiş bildirim bulamayan bir claim'den sonraki bekleme |
+| `IN_FLIGHT` | `30` | Bir worker'ın aynı anda yürüttüğü provider çağrısı sayısı ([Aynı anda süren çağrılar](#hız-sınırı-ve-öncelik)) |
+| `IDLE_WAIT` | `200ms` | İzni gelmiş ama zamanı gelmiş bildirimi olmayan bir kanalda bekleme |
 | `SHUTDOWN_BUDGET` | `10s` | `SIGTERM` sonrasında süren çağrılar için bekleme |
 | `MAX_ATTEMPTS` | `5` | İlki dahil toplam deneme sayısı |
 | `BACKOFF_BASE` | `2s` | İlk tekrar denemenin backoff'u; her tekrar denemede iki katına çıkar |
 | `BACKOFF_CAP` | `60s` | En uzun backoff; daha uzun bir `Retry-After` yine kazanır |
 | `RECOVERY_INTERVAL` | `5s` | Worker'ın süresi dolan lease'leri ne sıklıkla geri aldığı |
 | `RECOVERY_BATCH` | `100` | Bir turda geri alınan en fazla lease sayısı |
+| `PERMIT_INTERVAL` | `11ms` | Bir kanalın iki izni arasındaki en kısa süre |
+| `PERMIT_GRACE` | `100ms` | Bir iznin, zamanından ne kadar sonrasına kadar gönderim başlatabileceği; 100 × `PERMIT_INTERVAL` − `PERMIT_GRACE` en az `1s` olmalı |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ya da `error` |
 
 ### Mock provider ayarları
@@ -585,13 +666,16 @@ cmd/api/                API giriş noktası; healthcheck ve openapi alt komutlar
 cmd/worker/             worker giriş noktası
 cmd/migrate/            migrate up
 cmd/mockprovider/       mock provider giriş noktası
+cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
+cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
 internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
 internal/service/       oluşturma ve okuma kuralları
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, claim, sonuç yazma, kurtarma
-internal/worker/        claim döngüsü, lease bitiş anı, tekrar denemeler ve backoff, lease kurtarma
-internal/provider/      provider HTTP istemcisi, cevap sınıflandırması, Retry-After
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, izinli claim, sonuç yazma, geri verme, kurtarma
+internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma
+internal/provider/      provider HTTP istemcisi, başlatma kapısı, cevap sınıflandırması, Retry-After
+internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı
 internal/mockprovider/  mock provider handler'ları ve /stats
 internal/e2e/           uçtan uca testler: API, worker ve bir test provider'ı tek veritabanında
 internal/testdb/        test yardımcısı: PostgreSQL container'ı ve test başına bir veritabanı

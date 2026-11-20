@@ -126,6 +126,8 @@ func newStack(t *testing.T, answer http.HandlerFunc) *stack {
 		BackoffCap:       0,
 		RecoveryInterval: time.Second,
 		RecoveryBatch:    100,
+		PermitInterval:   11 * time.Millisecond,
+		PermitGrace:      100 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -341,4 +343,84 @@ func TestReplayAfterSent(t *testing.T) {
 	if err := s.pool.QueryRow(t.Context(), `SELECT count(*) FROM notifications`).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("%d notifications (err %v), want 1", rows, err)
 	}
+}
+
+// TestBurstAccepted: 3,000 creates, as fast as the test can send them, across
+// the three channels. Every create is accepted at once and buffered in the
+// queue; the worker then sends every one within its rate limit (N1).
+func TestBurstAccepted(t *testing.T) {
+	s := newStack(t, func(w http.ResponseWriter, _ *http.Request) { accept(w) })
+	const perChannel = 1000
+	bodies := map[string]string{
+		"sms":   `{"recipient":"+905551234567","channel":"sms","content":"burst"}`,
+		"email": `{"recipient":"user@example.com","channel":"email","content":"burst"}`,
+		"push":  `{"recipient":"device-token-1","channel":"push","content":"burst"}`,
+	}
+	jobs := make(chan string)
+	statuses := make(chan int, 3*perChannel)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for range 50 {
+		wg.Go(func() {
+			for body := range jobs {
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, s.apiURL+"/notifications",
+					strings.NewReader(body))
+				if err != nil {
+					statuses <- 0
+					continue
+				}
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					statuses <- 0
+					continue
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				statuses <- resp.StatusCode
+			}
+		})
+	}
+	for range perChannel {
+		for _, ch := range []string{"sms", "email", "push"} {
+			jobs <- bodies[ch]
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	close(statuses)
+	accepted := time.Since(start)
+
+	counts := map[int]int{}
+	for code := range statuses {
+		counts[code]++
+	}
+	if counts[http.StatusAccepted] != 3*perChannel {
+		t.Fatalf("create statuses %v, want %d × 202", counts, 3*perChannel)
+	}
+	var rows int
+	if err := s.pool.QueryRow(t.Context(), `SELECT count(*) FROM notifications`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 3*perChannel {
+		t.Fatalf("%d rows, want %d", rows, 3*perChannel)
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var sent int
+		if err := s.pool.QueryRow(t.Context(),
+			`SELECT count(*) FROM notifications WHERE status = 'sent'`).Scan(&sent); err != nil {
+			t.Fatal(err)
+		}
+		if sent == 3*perChannel {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d sent after 60 s", sent, 3*perChannel)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("3,000 creates accepted in %s; all sent %s after the first create",
+		accepted.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
 }

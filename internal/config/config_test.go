@@ -133,7 +133,7 @@ func TestWorkerConfig(t *testing.T) {
 			HTTPTimeout:      5 * time.Second,
 			ResultBudget:     5 * time.Second,
 			LeaseDuration:    30 * time.Second,
-			InFlight:         20,
+			InFlight:         30,
 			IdleWait:         200 * time.Millisecond,
 			ShutdownBudget:   10 * time.Second,
 			LogLevel:         slog.LevelInfo,
@@ -142,6 +142,8 @@ func TestWorkerConfig(t *testing.T) {
 			BackoffCap:       60 * time.Second,
 			RecoveryInterval: 5 * time.Second,
 			RecoveryBatch:    100,
+			PermitInterval:   11 * time.Millisecond,
+			PermitGrace:      100 * time.Millisecond,
 		}
 		if cfg != want {
 			t.Errorf("got %+v\nwant %+v", cfg, want)
@@ -231,5 +233,30 @@ func TestMockProviderConfig(t *testing.T) {
 	}
 	if _, err := config.LoadMockProvider(env.Options{Environment: map[string]string{"MOCK_DELAY": "-1s"}}); err == nil {
 		t.Fatal("negative MOCK_DELAY accepted")
+	}
+}
+
+// TestPermitConfig: Validate accepts a permit interval and grace only when
+// 100 × PERMIT_INTERVAL − PERMIT_GRACE is at least one second, and a grace
+// only when it is positive (K42).
+func TestPermitConfig(t *testing.T) {
+	for _, tt := range []struct {
+		interval, grace string
+		ok              bool
+	}{
+		{"11ms", "100ms", true},  // 1100 − 100 = 1000 ms
+		{"10ms", "100ms", false}, // 1000 − 100 = 900 ms
+		{"11ms", "0s", false},    // grace not positive
+		{"11ms", "-1ms", false},  // grace not positive
+		{"12ms", "200ms", true},  // 1200 − 200 = 1000 ms
+		{"0s", "100ms", false},
+	} {
+		_, err := config.LoadWorker(env.Options{Environment: map[string]string{
+			"DATABASE_URL": testURL, "PROVIDER_URL": testProviderURL,
+			"PERMIT_INTERVAL": tt.interval, "PERMIT_GRACE": tt.grace,
+		}})
+		if (err == nil) != tt.ok {
+			t.Errorf("PERMIT_INTERVAL=%s PERMIT_GRACE=%s: err %v, want accepted=%v", tt.interval, tt.grace, err, tt.ok)
+		}
 	}
 }

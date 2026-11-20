@@ -12,6 +12,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/ardaklc20/event-driven-notification-system/internal/ratecheck"
 )
 
 // Channels are the channels /stats reports, in this order.
@@ -113,24 +115,10 @@ func (s *Server) Snapshot() Stats {
 	defer s.mu.Unlock()
 	out := Stats{Channels: make(map[string]ChannelStats, len(Channels))}
 	for _, ch := range Channels {
-		times := slices.Clone(s.arrivals[ch])
-		slices.SortFunc(times, func(a, b time.Time) int { return a.Compare(b) })
-		out.Channels[ch] = ChannelStats{Arrivals: len(times), MaxArrivalsPerSecond: maxInWindow(times, time.Second)}
+		times := s.arrivals[ch]
+		out.Channels[ch] = ChannelStats{Arrivals: len(times), MaxArrivalsPerSecond: ratecheck.MaxInWindow(times, ratecheck.Window)}
 	}
 	return out
-}
-
-// maxInWindow returns the most sorted times that fit in any half-open window
-// [t, t + width). A window holding the most times can start at one of them.
-func maxInWindow(sorted []time.Time, width time.Duration) int {
-	best, end := 0, 0
-	for start := range sorted {
-		for end < len(sorted) && sorted[end].Sub(sorted[start]) < width {
-			end++
-		}
-		best = max(best, end-start)
-	}
-	return best
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

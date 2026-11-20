@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 3 {
-		t.Fatalf("first up applied %d migrations, want 3", len(first))
+	if len(first) != 4 {
+		t.Fatalf("first up applied %d migrations, want 4", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -163,6 +163,36 @@ func TestMigrations(t *testing.T) {
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO idempotency_keys (key, operation, request_hash) VALUES (repeat('k', 128), 'batch', '\x00')`); err != nil {
 			t.Errorf("128-byte key rejected: %v", err)
+		}
+	})
+
+	t.Run("one permit row per channel", func(t *testing.T) {
+		var channels string
+		var due bool
+		err := db.QueryRowContext(ctx,
+			`SELECT string_agg(channel, ',' ORDER BY channel), bool_and(next_permit_at <= clock_timestamp())
+			 FROM channel_limits`).Scan(&channels, &due)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if channels != "email,push,sms" || !due {
+			t.Errorf("channel_limits = %s, all due %v; want email,push,sms, all due", channels, due)
+		}
+		_, err = db.ExecContext(ctx, `INSERT INTO channel_limits (channel, next_permit_at) VALUES ('fax', now())`)
+		assertSQLState(t, "channel fax", err, "23514")
+	})
+
+	t.Run("claim index is partial on queued rows", func(t *testing.T) {
+		var def string
+		err := db.QueryRowContext(ctx,
+			`SELECT pg_get_indexdef('notifications_claim_idx'::regclass)`).Scan(&def)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const want = "CREATE INDEX notifications_claim_idx ON public.notifications USING btree " +
+			"(channel, priority, available_at, id) WHERE (status = 'queued'::notification_status)"
+		if def != want {
+			t.Errorf("index = %s, want %s", def, want)
 		}
 	})
 

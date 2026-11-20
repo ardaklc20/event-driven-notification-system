@@ -35,6 +35,8 @@ type settings struct {
 	hooks worker.Hooks
 	// wrap, when set, wraps the store the worker uses.
 	wrap func(worker.Store) worker.Store
+	// id is the worker_id in the logs; "test-worker" when empty.
+	id string
 }
 
 // defaults retry at once (zero backoff), so attempt sequences run fast.
@@ -53,6 +55,8 @@ func defaults() settings {
 			BackoffCap:       0,
 			RecoveryInterval: 100 * time.Millisecond,
 			RecoveryBatch:    100,
+			PermitInterval:   11 * time.Millisecond,
+			PermitGrace:      100 * time.Millisecond,
 		},
 	}
 }
@@ -95,8 +99,12 @@ type running struct {
 func startWorker(t *testing.T, pool *pgxpool.Pool, providerURL string, s settings) *running {
 	t.Helper()
 	logs := &logBuffer{}
+	id := s.id
+	if id == "" {
+		id = "test-worker"
+	}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})).
-		With(slog.String("worker_id", "test-worker"))
+		With(slog.String("worker_id", id))
 	client := provider.NewClient(providerURL, s.httpTimeout, s.cfg.InFlight)
 	var store worker.Store = postgres.NewStore(pool)
 	if s.wrap != nil {
