@@ -42,7 +42,7 @@ No variables are stored: templates cannot change, so the template ID and the ren
 
 | Field or endpoint | Rule |
 |---|---|
-| `name` | Required; 1 to 100 code points; not unique, so the list shows `created_at` to tell templates apart |
+| `name` | Required; 1 to 100 code points; no NUL, which [K11] rejects in any text field because PostgreSQL's text types cannot hold it; not unique, so the list shows `created_at` to tell templates apart |
 | `body` | Required; 1 to 10,000 code points; no NUL; valid placeholder syntax (below) |
 | `channel` | `sms`, `email` or `push` |
 | `POST /templates` | `201` with the stored template; `422` for any rule above, and no row |
@@ -93,7 +93,7 @@ Code points are counted as in [K11].
 | `TestParseTemplate` | `internal/domain` | Unit, table | Every row of the syntax table | The listed result for each row |
 | `TestRenderTemplate` | `internal/domain` | Unit, table | Values with plain text, `{{x}}` inside a value, a missing and an extra variable, a template that renders empty, a result one code point over the `sms` limit, a value with NUL, and a body that repeats one placeholder 1,000 times with a 100-code-point value | Plain values replaced; `{{x}}` in a value kept as it is; the other rows return the matching error. For the repeated placeholder: the over-limit error, and the renderer's output buffer never holds more than the limit plus one value ([K47]) |
 | `TestCreateTemplate` | `internal/httpapi` | HTTP + database | Valid template; malformed syntax | `201` and `GET /templates/{id}` returns the same fields; `422` for the malformed one and no row |
-| `TestTemplateFieldRules` | `internal/httpapi` | HTTP + database | `name` empty and of 101 code points; `body` empty, of 10,001 code points and with NUL; then two valid templates with the same name | `422` for each invalid one and no row; both same-name templates get `201` with different IDs ([K47]) |
+| `TestTemplateFieldRules` | `internal/httpapi` | HTTP + database | `name` empty, of 101 code points and with NUL (`"a\u0000b"`); `body` empty, of 10,001 code points and with NUL; then two valid templates with the same name | `422` with a field error for each invalid one, never a database error, and no row; both same-name templates get `201` with different IDs ([K47]) |
 | `TestTemplatesImmutable` | `internal/httpapi` | HTTP + database | `PUT`, `PATCH` and `DELETE` on `/templates/{id}` | `405`; the row is unchanged |
 | `TestTemplateRequestRules` | `internal/httpapi` | HTTP + database | Both `content` and `template_id`; neither; channel mismatch; a missing variable; an extra variable | `422` for each; no notification; no key |
 | `TestTemplateRenderedContentRules` | `internal/httpapi` | HTTP + database | Renders over the limit; renders empty; then the same key with valid variables | `422` twice with nothing stored; the third request gets `202`, because the key stayed free |

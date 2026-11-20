@@ -38,7 +38,7 @@ A window is half-open: `[t, t + 1 s)`. The count for a channel is the largest nu
 | `migrations/00004_rate_limit_and_priority.sql` | Limiter rows and the claim index |
 | `internal/postgres/` | Claim transaction rebuilt around the permit, its deadline and the priority order; the give-back write ([K42]) |
 | `internal/provider/` | The start gate: a wrapper around the client's `http.RoundTripper` that checks the deadline and records the send start in one step ([K42]) |
-| `internal/worker/` | Passes the deadline to the adapter; gives the attempt back after a refused start; test hooks before the gate and after the claim |
+| `internal/worker/` | The claim loop with a next-try time per channel; passes the deadline to the adapter; gives the attempt back after a refused start; test hooks before the gate and after the claim |
 | `internal/config/` | `PERMIT_INTERVAL`, `PERMIT_GRACE` and their validation ([K32], [K42]) |
 | `internal/ratecheck/` | Largest count of starts in a half-open one-second window, per channel; used by the tests and by `cmd/ratecount` |
 | `cmd/loadgen/` | Sends the R8 load through the API; exits with 1 if any create does not return `202` with an ID ([K43]) |
@@ -55,12 +55,25 @@ A window is half-open: `[t, t + 1 s)`. The count for a channel is the largest nu
 
 One short transaction:
 
-1. Lock the channel's `channel_limits` row with `FOR UPDATE SKIP LOCKED`. If another worker holds it, return at once and try again after a short wait.
-2. Read `clock_timestamp()` **once**, together with the row lock; this reading is the permit time. If `next_permit_at` is still after it, return without a notification.
+1. Lock the channel's `channel_limits` row with `FOR UPDATE SKIP LOCKED`. If another worker holds it, return `busy` at once.
+2. Read `clock_timestamp()` **once**, together with the row lock; this reading is the permit time. If `next_permit_at` is still after it, return `throttled` with the wait `next_permit_at − permit time`, computed by the database, and no notification.
 3. Select one due notification on that channel: `status = 'queued'`, `available_at <= clock_timestamp()`, `attempts < MAX_ATTEMPTS`, ordered by the explicit priority order, then `available_at`, then `id`, `FOR UPDATE SKIP LOCKED`.
-4. If none: return; the permit time is not moved.
+4. If none: return `empty`; the permit time is not moved.
 5. Otherwise: write the lease and the attempt (slice 3). The permit's start, its deadline and the next permit are all derived from the one reading of step 2, passed back as a parameter: `next_permit_at = permit time + PERMIT_INTERVAL` ([K5]) and deadline `= permit time + PERMIT_GRACE` ([K42]). Only the time left until that deadline is read later, from `clock_timestamp()` at the end of the statement; a later reading can only shorten it. Commit.
 6. The worker adds the time left to the monotonic time it read just before the claim, as for the lease ([K3]), and passes that deadline to the provider adapter with the request.
+
+## Claim outcomes and the worker loop
+
+Slice 3's loop knew two outcomes, a claimed row and an empty queue, and waited `IDLE_WAIT` (200 ms) after an empty one. With permits 11 ms apart, most claims on a busy channel now come back without a row only because the next permit is not due yet. Waiting 200 ms after each of those would hold a full channel far below its limit, so the loop tells the outcomes apart and keeps a next-try time per channel:
+
+| Outcome | Meaning | Next try on that channel |
+|---|---|---|
+| `claimed` | A notification and a permit | At once, while a call slot is free |
+| `throttled` | The permit is not due yet | After the wait the claim returned, at most `PERMIT_INTERVAL` |
+| `busy` | Another worker holds the limiter row | After `PERMIT_INTERVAL`: the holder is taking or checking the same permit |
+| `empty` | The permit is due, but no notification is | After `IDLE_WAIT` |
+
+The loop always tries the channel whose next try comes first, so one channel's wait never delays another channel's claims. Only `empty` waits `IDLE_WAIT`.
 
 ## The start gate ([K42])
 
@@ -77,7 +90,7 @@ Lease recovery (slice 4) never touches `channel_limits`.
 ## Steps
 
 1. **Migration** `00004`; extend `TestMigrations`.
-2. **Claim transaction** as above: `TestPermitKeptWithoutWork`, `TestChannelsIndependent`, `TestRecoveryWithoutPermit`.
+2. **Claim transaction** as above, returning its outcome: `TestPermitKeptWithoutWork`, `TestClaimOutcomes`, `TestChannelsIndependent`, `TestRecoveryWithoutPermit`. **Worker loop** with a next-try time per channel: `TestClaimLoopWaits`.
 3. **Priority:** `TestPriorityOrder`, `TestPriorityTieBreak`, `TestClaimQueryPlan`.
 4. **Configuration:** `PERMIT_INTERVAL` (default `11ms`) and `PERMIT_GRACE` (default `100ms`). `Validate()` rejects a grace that is not positive and any pair for which `100 × PERMIT_INTERVAL − PERMIT_GRACE` is below 1 second, the condition [K42]'s bound needs ([K32]). Test: `TestPermitConfig`.
 5. **Start gate and give-back**, as above: `TestExpiredPermitNoPost`, `TestMissedStartGivesBack`.
@@ -93,7 +106,9 @@ Lease recovery (slice 4) never touches `channel_limits`.
 
 | Test | Package | Kind | Setup | Asserts |
 |---|---|---|---|---|
-| `TestPermitKeptWithoutWork` | `internal/postgres` | Database | Empty channel, permit due | Claim returns nothing; `next_permit_at` unchanged |
+| `TestPermitKeptWithoutWork` | `internal/postgres` | Database | Empty channel, permit due | Claim returns `empty`; `next_permit_at` unchanged |
+| `TestClaimOutcomes` | `internal/postgres` | Database | Subtest *throttled*: the claim runs with `PERMIT_INTERVAL` set to 1 minute; two due notifications on one channel; both claims share one 5-second context. The first claim takes the permit, so `next_permit_at` is its permit time plus 1 minute, as in normal operation; the second claim follows within the same context. A timeout fails the test explicitly; a successful second claim must run before that permit is due. Subtest *busy*: the channel's limiter row locked by a held transaction | Throttled: both calls succeed within their shared budget; the second returns `throttled` with a wait above 0 and at most `PERMIT_INTERVAL` (1 minute); `next_permit_at` is unchanged by it; the second notification is still `queued` with `attempts` 0. Busy: `busy`, returned at once |
+| `TestClaimLoopWaits` | `internal/worker` | Unit, fake claimer and fake clock | The fake claimer returns each outcome in turn; one subtest keeps `sms` `empty` while `email` has work | Next try after `claimed`: at once; after `throttled` with 7 ms: 7 ms; after `busy`: `PERMIT_INTERVAL`; after `empty`: `IDLE_WAIT`. The empty `sms` channel does not delay any `email` claim |
 | `TestChannelsIndependent` | `internal/postgres` | Database | A held transaction locks the `sms` limiter row | `email` and `push` claims still succeed |
 | `TestRecoveryWithoutPermit` | `internal/postgres` | Database | `sms` limiter row locked by a held transaction; an expired `sms` lease | Recovery still returns the row to `queued` |
 | `TestPriorityOrder` | `internal/postgres` | Database | One channel: 50 `low`, then 50 `high`; one claimer, one at a time | All 50 `high` claimed before the first `low`; within a level, by `available_at` |
@@ -104,14 +119,15 @@ Lease recovery (slice 4) never touches `channel_limits`.
 | `TestExpiredPermitNoPost` | `internal/worker` | Worker + database + `httptest` | A hook stops the worker inside the start gate, before its check; the test releases it 200 ms later, after the deadline | The provider receives no request; no start line and one `start deadline missed` line; the row is `queued` with its lease cleared and `attempts` back to its value before the claim; `next_permit_at` was not moved back; a later claim sends it, and the provider receives it once |
 | `TestMissedStartGivesBack` | `internal/postgres` | Database | A claimed row; subtests: the give-back with the valid token; the same give-back run a second time; a lease that has expired; a row recovered and claimed again under a new token | Valid token: one row changed, `attempts` reduced by one. Second run, expired lease, other token: 0 rows changed and `attempts` unchanged |
 | `TestSendStartsWithPausedWorker` | `internal/worker` | Two workers + database + `httptest` | One channel full; worker A's hook pauses for 300 ms right after its claim commits; worker B runs normally | Both workers record starts; A's paused claim misses its deadline and sends nothing; that notification is sent later, once; no half-open one-second window holds more than 100 starts |
-| `TestRateLimitTwoWorkers` | `internal/worker` | Two workers + database + `httptest` | 1,000 queued per channel; the provider answers `503` only to the **first attempt** of every tenth notification, `202` otherwise | Every notification ends `sent`; retries appear among the starts; both workers started sends, since any worker may take any channel's permit ([K5], [K42]); per channel, no window holds more than 100; in the busiest second, the three channels together exceed 100 (they do not share one permit) |
+| `TestRateLimitTwoWorkers` | `internal/worker` | Two workers + database + `httptest` | 1,000 queued per channel; the provider answers `503` only to the **first attempt** of every tenth notification, `202` otherwise | Every notification ends `sent` within 30 seconds (about 11 at the permit spacing; waiting `IDLE_WAIT` after every permit that is not yet due would take minutes); retries appear among the starts; both workers started sends, since any worker may take any channel's permit ([K5], [K42]); per channel, no window holds more than 100; in the busiest second, the three channels together exceed 100 (they do not share one permit) |
 | `TestBurstAccepted` | `internal/e2e` | API + worker + `httptest` | 3,000 creates as fast as the test can send, across the three channels | Every create returns `202`; 3,000 rows; every notification ends `sent` within a bounded wait |
 
 ## Acceptance checks
 
 | Check | Command | Expected observation |
 |---|---|---|
-| Claim and priority ([R9]) | `go test -count=1 -v -run '^(TestPermitKeptWithoutWork\|TestChannelsIndependent\|TestRecoveryWithoutPermit\|TestPriorityOrder\|TestPriorityTieBreak\|TestClaimQueryPlan)$' ./internal/postgres/` | Six `--- PASS` lines |
+| Claim and priority ([R9]) | `go test -count=1 -v -run '^(TestPermitKeptWithoutWork\|TestClaimOutcomes\|TestChannelsIndependent\|TestRecoveryWithoutPermit\|TestPriorityOrder\|TestPriorityTieBreak\|TestClaimQueryPlan)$' ./internal/postgres/` | Seven `--- PASS` lines |
+| Claim loop | `go test -count=1 -v -run '^TestClaimLoopWaits$' ./internal/worker/` | `--- PASS: TestClaimLoopWaits` |
 | Window counting | `go test -count=1 -v -run '^TestWindowCount$' ./internal/ratecheck/` | `--- PASS: TestWindowCount` |
 | Permit settings ([K42]) | `go test -count=1 -v -run '^TestPermitConfig$' ./internal/config/` | `--- PASS: TestPermitConfig` |
 | Give-back ([K42]) | `go test -count=1 -v -run '^TestMissedStartGivesBack$' ./internal/postgres/` | `--- PASS: TestMissedStartGivesBack` |
@@ -127,12 +143,12 @@ The measurement runs in its own Compose project, so its database, its worker log
 
    ```bash
    P="nsys-r8-$(date +%s)"
-   PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard \
+   PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard MOCK_DELAY=0s \
      docker compose -p "$P" up -d --build --scale worker=2
    scripts/wait-health.sh -p "$P" api healthy 60
    ```
 
-   The provider is set on the command itself: a separate project does not isolate the shell's environment, and Compose would otherwise take `PROVIDER_URL` from it and could send this load to a real URL.
+   The provider and the mock's delay are set on the command itself: a separate project does not isolate the shell's environment, and Compose would otherwise take `PROVIDER_URL` from it and could send this load to a real URL, or take a `MOCK_DELAY` that stretches the run and adds timeouts and retries.
 
 2. Queue 1,000 notifications per channel through the API:
 
@@ -162,7 +178,7 @@ The measurement runs in its own Compose project, so its database, its worker log
 5. Collect the arrivals: `curl -s --max-time 5 http://localhost:8081/stats | jq .`.
 6. Clean-up: `docker compose -p "$P" down -v`, then `docker compose start` for the main stack.
 
-**Expected observation:** `loadgen exit=0` with 3,000 creates answered `202`; `left=0`, and the count query prints exactly three lines, `email|sent|1000`, `push|sent|1000` and `sms|sent|1000`: `left=0` alone would also hold if notifications had failed. `ratecount exit=0` with `starts=1000` and `max_window` at most 100 on every channel line, and `workers=2`; the arrivals at the mock add up to 3,000. The number of missed deadlines is reported; a missed deadline produces no start, so it does not change these counts. The mock answers every request with `202`, so this run has no retries; retry traffic is covered by `TestRateLimitTwoWorkers`. The arrival maximum per channel is reported next to it, separately. Both numbers go into the pull request; neither is presented as a guarantee on its own ([K5]). The bound itself comes from [K42]'s spacing and deadline; this run shows it holding under load and does not replace that argument.
+**Expected observation:** `loadgen exit=0` with 3,000 creates answered `202`; `left=0` within 30 seconds of the loop's start (at about 91 starts per second per channel, 1,000 per channel take about 11 seconds from the first create; the number of seconds the loop took goes into the pull request), and the count query prints exactly three lines, `email|sent|1000`, `push|sent|1000` and `sms|sent|1000`: `left=0` alone would also hold if notifications had failed. `ratecount exit=0` with `starts=1000` and `max_window` at most 100 on every channel line, and `workers=2`; the arrivals at the mock add up to 3,000. The number of missed deadlines is reported; a missed deadline produces no start, so it does not change these counts. The mock answers every request with `202`, so this run has no retries; retry traffic is covered by `TestRateLimitTwoWorkers`. The arrival maximum per channel is reported next to it, separately. Both numbers go into the pull request; neither is presented as a guarantee on its own ([K5]). The bound itself comes from [K42]'s spacing and deadline; this run shows it holding under load and does not replace that argument.
 
 ## Failure scenarios
 
@@ -171,7 +187,8 @@ The measurement runs in its own Compose project, so its database, its worker log
 | A worker pauses after taking its permit | `TestSendStartsWithPausedWorker` |
 | A worker reaches the send point after its deadline | `TestExpiredPermitNoPost` |
 | A give-back after recovery, after the lease expired, or a second time | `TestMissedStartGivesBack` |
-| Another worker holds a channel's limiter row | `TestChannelsIndependent` |
+| Another worker holds a channel's limiter row | `TestChannelsIndependent`, `TestClaimOutcomes` |
+| A permit not yet due, or an empty channel, slowing the others | `TestClaimLoopWaits`, the 30-second bound in `TestRateLimitTwoWorkers` |
 | Retries compete with first attempts | `TestRateLimitTwoWorkers` |
 | Recovery while the channel row is locked | `TestRecoveryWithoutPermit` |
 | A burst far above the send rate | `TestBurstAccepted` |

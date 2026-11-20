@@ -54,6 +54,14 @@ Every path that changes a status passes through the triggers: the claim, a resul
 
 For a batch, the filter keeps one version per notification of the batch. Versions of different notifications are never compared with each other.
 
+## Message size
+
+A batch snapshot is one message holding every item of the batch: up to 1,000 items of about 200 bytes each (six fields, two of them UUIDs), so about 200 KB. `coder/websocket` limits each message a connection reads to 32,768 bytes by default; above that, the read fails with `ErrMessageTooBig` and the connection is closed with `StatusMessageTooBig` ([library documentation](https://pkg.go.dev/github.com/coder/websocket#Conn.SetReadLimit)). A batch of about 160 items would already pass it. The server only writes, and writes have no such limit, so the limit is the client's:
+
+- `cmd/wswatch` and the test client call `SetReadLimit(1 << 20)` (1 MiB) before their first read, about five times the largest snapshot.
+- `TestBatchSnapshotMaxSize` checks the real size of a 1,000-item snapshot against half that limit, so a later field cannot quietly grow it past the client's.
+- The README states the largest snapshot size, so another client can set its own limit.
+
 ## The listener
 
 - One connection taken out of the pool with `Hijack`; it runs `LISTEN notification_status` and then waits in `WaitForNotification`.
@@ -77,14 +85,14 @@ For a batch, the filter keeps one version per notification of the batch. Version
 3. **Listener** in `internal/postgres`.
 4. **Hub and version filter** in `internal/realtime`, tested without a network.
 5. **Handlers** and the writer; `404` before the upgrade; `CloseRead`.
-6. **Shutdown:** `RegisterOnShutdown` sends close status 1001 ("going away") to every connection and waits at most `WS_CLOSE_TIMEOUT` ([K25]).
+6. **Shutdown:** the function registered with `RegisterOnShutdown` only starts closing: it tells every connection's writer to send close status 1001 ("going away") and returns at once, because `net/http` runs it in its own goroutine and its documentation says it should not wait for shutdown to complete. The bounded wait, at most `WS_CLOSE_TIMEOUT`, runs in `cmd/api`'s shutdown sequence after `http.Server.Shutdown`; a connection still open when it ends is cut ([K25]).
 7. **Leak check** with `goleak` v1.3.0 ([K45]): each WebSocket test takes `goleak.IgnoreCurrent()` before it opens any of its resources and calls `goleak.VerifyNone` with it after the listener, the sockets and the server are closed. These tests do not call `t.Parallel()`, so another test's goroutines cannot appear.
-8. **`cmd/wswatch`** ([K43]): flags `-url` and `-for`; prints each text message as one line; exits with 0 after `-for`, and with 1 if the connection fails or the server closes it with an error status.
-9. **README:** endpoints, messages with an example, the best-effort contract, reconnecting for a fresh snapshot.
+8. **`cmd/wswatch`** ([K43]): flags `-url` and `-for`; sets the read limit to 1 MiB ([message size](#message-size)); prints each text message as one line; exits with 0 after `-for`, and with 1 if the connection fails or the server closes it with an error status.
+9. **README:** endpoints, messages with an example, the largest snapshot size and the client read limit it needs, the best-effort contract, reconnecting for a fresh snapshot.
 
 ## Tests
 
-Database tests use the Compose PostgreSQL image ([K22]); WebSocket tests use `httptest.Server` and the library's client.
+Database tests use the Compose PostgreSQL image ([K22]); WebSocket tests use `httptest.Server` and the library's client, with the read limit `cmd/wswatch` sets.
 
 | Test | Package | Kind | Setup | Asserts |
 |---|---|---|---|---|
@@ -98,13 +106,14 @@ Database tests use the Compose PostgreSQL image ([K22]); WebSocket tests use `ht
 | `TestSnapshotNoGap` | `internal/httpapi` | WebSocket + database | A test hook commits a status change after registration and before the snapshot read ends | The client ends with the newest status, in the snapshot or as the next message |
 | `TestOlderEventsDropped` | `internal/httpapi` | WebSocket + database | Buffered events with versions at or below the snapshot's | None of them is sent |
 | `TestBatchWebSocket` | `internal/httpapi` | WebSocket + database | A batch of 3; one item changes | The snapshot lists all 3; the change arrives as one update |
+| `TestBatchSnapshotMaxSize` | `internal/httpapi` | WebSocket + database | A batch of 1,000, the largest allowed ([K12]); a client with the 1 MiB read limit | The snapshot arrives as one message with 1,000 items; its size, printed by the test, is below 512 KiB |
 | `TestBatchVersionPerNotification` | `internal/httpapi` | WebSocket + database | Batch with A at version 5 and B at version 1 in the snapshot; then events B v2 and A v4 | B v2 is sent although 2 < 5; A v4 is dropped |
 | `TestListenerDropClosesSockets` | `internal/httpapi` | WebSocket + database | Two clients; the test ends the listener's backend with `pg_terminate_backend` | Both connections receive a close frame; after the listener is back, a reconnecting client gets a fresh snapshot |
 | `TestWebSocketWhileListenerDown` | `internal/httpapi` | WebSocket + database | Listener stopped; a client connects to each endpoint | `503` with `Retry-After: 1`; no `101`, so no upgrade ([K46]) |
 | `TestListenerDropDuringUpgrade` | `internal/httpapi` | WebSocket + database | A hook stops the handler after the upgrade and before registration; the test ends the listener's backend, waits until the drop is handled, then releases the hook | The registration is refused; the client receives a close frame and no snapshot; the hub holds no subscription of the ended generation; after the listener is back, a new client receives a snapshot ([K46]) |
-| `TestSlowClientDisconnected` | `internal/httpapi` | WebSocket + database | Two clients on one batch; one stops reading; 100 status changes | The slow one is closed when its queue fills; the other receives every update, each within 1 second of its commit |
-| `TestControlFrames` | `internal/httpapi` | WebSocket | Client pings | The ping returns without error within 1 second |
-| `TestWebSocketShutdown` | `internal/httpapi` | WebSocket | Three open connections; the server shuts down | Each receives close status 1001 before shutdown returns; shutdown returns within `WS_CLOSE_TIMEOUT` plus 1 second |
+| `TestSlowClientDisconnected` | `internal/httpapi` | WebSocket + database | Two clients on one batch; `WS_SEND_QUEUE` 16. A test hook blocks the slow connection's writer before its first write, so its queue really fills; small messages alone could sit in TCP buffers without ever filling it. Then 20 status changes | The slow one is closed when its queue fills; the other receives every update, each within 1 second of its commit |
+| `TestControlFrames` | `internal/httpapi` | WebSocket | The client runs a reader (`CloseRead`), because the library's `Ping` gets its pong only while the connection is being read; then it pings | The ping returns without error within 1 second |
+| `TestWebSocketShutdown` | `internal/httpapi` | WebSocket | Three open connections; the API's shutdown sequence runs: `http.Server.Shutdown`, then the WebSocket wait. Subtest: one client never answers the close | The registered function returns before any close handshake ends; each client receives close status 1001; the sequence returns within `WS_CLOSE_TIMEOUT` plus 1 second, the silent client's connection cut when the wait ends |
 | `TestWebSocketNoLeak` | `internal/httpapi` | WebSocket | `goleak.IgnoreCurrent()` first; then open and close 50 connections, and close the listener and the server | `goleak.VerifyNone` reports no goroutine ([K45]) |
 
 ## Acceptance checks
@@ -113,7 +122,7 @@ Database tests use the Compose PostgreSQL image ([K22]); WebSocket tests use `ht
 |---|---|---|
 | Events at the source ([K24]) | `go test -count=1 -v -run '^(TestStatusVersionIncrements\|TestNotifyOnCommitOnly\|TestNotifyPayload\|TestListenerOutsideTransaction)$' ./internal/postgres/` | Four `--- PASS` lines |
 | Version filter | `go test -count=1 -v -run '^TestVersionFilter$' ./internal/realtime/` | `--- PASS: TestVersionFilter` |
-| Contract ([B4]) | `go test -count=1 -v -run '^(TestWebSocketUnknownID\|TestWebSocketSnapshotThenUpdate\|TestSnapshotNoGap\|TestOlderEventsDropped\|TestBatchWebSocket\|TestBatchVersionPerNotification)$' ./internal/httpapi/` | Six `--- PASS` lines |
+| Contract ([B4]) | `go test -count=1 -v -run '^(TestWebSocketUnknownID\|TestWebSocketSnapshotThenUpdate\|TestSnapshotNoGap\|TestOlderEventsDropped\|TestBatchWebSocket\|TestBatchSnapshotMaxSize\|TestBatchVersionPerNotification)$' ./internal/httpapi/` | Seven `--- PASS` lines; the snapshot size is printed |
 | Failure scenarios ([K25], [K45], [K46]) | `go test -count=1 -v -run '^(TestListenerDropClosesSockets\|TestWebSocketWhileListenerDown\|TestListenerDropDuringUpgrade\|TestSlowClientDisconnected\|TestControlFrames\|TestWebSocketShutdown\|TestWebSocketNoLeak)$' ./internal/httpapi/` | Seven `--- PASS` lines |
 | Through the stack | [Stack check](#stack-check) | As described there |
 
@@ -130,25 +139,18 @@ jq -r '[.status, .version] | @tsv' ws.out
 
 **Expected observation:** the first line is the snapshot with `queued`; later lines show `processing`, then `sent`, with `version` growing on every line.
 
-## Review items to apply before this slice starts
-
-Found in the plan review; this note is updated with them in the slice's own pull request.
-
-1. **Slow client:** 100 small frames can sit in TCP buffers without filling the application queue. `TestSlowClientDisconnected` blocks the slow connection's writer with a test hook, so the queue really fills.
-2. **Ping:** `TestControlFrames` runs a reader on the client side (for example `CloseRead`); the library's `Ping` receives the pong only while the connection is being read.
-3. **Shutdown:** the function registered with `RegisterOnShutdown` only starts closing (it sends status 1001); it must not wait. The bounded wait of `WS_CLOSE_TIMEOUT` runs in `cmd/api`'s shutdown sequence, as [K25] already states. Step 6 and `TestWebSocketShutdown` are rewritten to match.
-
 ## Evidence for the pull request
 
 - Output of every acceptance check and of the stack check.
 
 ## Documentation
 
-- `README.md`: the two endpoints, the message format with an example, the best-effort contract, what a client does after a disconnect; the bonus listed as done only after this pull request merges.
+- `README.md`: the two endpoints, the message format with an example, the largest snapshot size, the best-effort contract, what a client does after a disconnect; the bonus listed as done only after this pull request merges.
 - `AI_USAGE.md`: slice log row; evidence row for [B4].
 
 [B4]: ../REQUIREMENTS.md#bonus-features-in-scope-built-after-the-core
 [K6]: ../DECISIONS.md#k6--process-layout-the-api-and-the-worker-run-as-separate-processes-from-one-go-module
+[K12]: ../DECISIONS.md#k12--batches-all-or-nothing-with-mixed-channels-and-priorities
 [K16]: ../DECISIONS.md#k16--http-router-the-standard-librarys-nethttp
 [K22]: ../DECISIONS.md#k22--test-database-testcontainers-with-the-same-postgresql-image-as-compose
 [K23]: ../DECISIONS.md#k23--project-layout-small-packages-by-layer-with-multi-table-transactions-inside-postgres

@@ -78,7 +78,7 @@ When the HTTP call's context has ended, the result is written with a **new** dat
 | `RESULT_BUDGET` | `5s` | Time kept for writing a result |
 | `LEASE_DURATION` | `30s` | `Validate()`: at least `HTTP_TIMEOUT + RESULT_BUDGET` |
 | `IN_FLIGHT` | `20` | Calls in flight per worker; measured in slice 5 ([K5]) |
-| `IDLE_WAIT` | `200ms` | Wait when the queue is empty ([K2]) |
+| `IDLE_WAIT` | `200ms` | Wait when the queue is empty ([K2]); from slice 5 on, only after an `empty` claim, never after a permit that is not yet due |
 | `SHUTDOWN_BUDGET` | `10s` | ([K6]) |
 | `LOG_LEVEL` | `info` | ([K21]) |
 
@@ -94,7 +94,7 @@ When the HTTP call's context has ended, the result is written with a **new** dat
 8. **End-to-end tests** in `internal/e2e`: `TestCreateWhileProviderBlocked`, `TestCorrelationIDEndToEnd`, `TestReplayAfterSent`.
 9. **Image and Compose.** The Dockerfile now builds `api`, `worker`, `migrate` and `mockprovider`. New services:
    - `worker`: `command: ["/app/worker"]`; `PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}`; `PROVIDER_PROFILE: ${PROVIDER_PROFILE:-standard}`; after `postgres` is healthy and `migrate` completed; `stop_grace_period: 15s` ([K6]).
-   - `mockprovider`: `command: ["/app/mockprovider"]`; port `${BIND_ADDRESS:-127.0.0.1}:${MOCK_PORT:-8081}:8081` ([K39]).
+   - `mockprovider`: `command: ["/app/mockprovider"]`; `MOCK_DELAY: ${MOCK_DELAY:-0s}`, so a value set on a `docker compose up` command reaches the container; port `${BIND_ADDRESS:-127.0.0.1}:${MOCK_PORT:-8081}:8081` ([K39]).
 10. **README:** architecture overview (API → `notifications` table → worker → provider), how to follow a notification to `sent`, the worker settings.
 
 ## Tests
@@ -130,8 +130,14 @@ When the HTTP call's context has ended, the result is written with a **new** dat
 
 ## Stack check
 
+The check counts the mock's arrivals, so it runs in its own Compose project with an empty database and a fresh mock: notifications or counters from earlier runs cannot change the result. The provider and the mock's delay are set on the `up` command, so the shell's environment can neither send this notification to a real URL nor slow the mock into timeouts and retries that would add arrivals.
+
 ```bash
-docker compose up -d --build && scripts/wait-health.sh api healthy 60
+docker compose stop          # the main stack, if it runs; frees the host ports
+P="nsys-delivery-$(date +%s)"
+PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard MOCK_DELAY=0s \
+  docker compose -p "$P" up -d --build
+scripts/wait-health.sh -p "$P" api healthy 60
 ID=$(curl -s -X POST http://localhost:8080/notifications \
   -H 'Content-Type: application/json' -H 'X-Correlation-ID: demo-1' \
   -d '{"recipient":"+905551234567","channel":"sms","content":"hello"}' | jq -r .id)
@@ -141,11 +147,13 @@ for i in $(seq 1 30); do
   sleep 1
 done
 curl -s "http://localhost:8080/notifications/$ID" | jq '{status, provider_message_id, sent_at}'
-docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
+docker compose -p "$P" logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 curl -s http://localhost:8081/stats | jq .
+docker compose -p "$P" down -v
+docker compose start         # the main stack, if it ran before
 ```
 
-**Expected observation:** within 30 seconds `status` is `sent` with a non-empty `provider_message_id` (a UUID from the mock); the worker log shows one start line and one result line with `"correlation_id":"demo-1"`; `/stats` shows one `sms` arrival. If the loop ends with any other status, the check fails.
+**Expected observation:** within 30 seconds `status` is `sent` with a non-empty `provider_message_id` (a UUID from the mock); the worker log shows one start line and one result line with `"correlation_id":"demo-1"`; `/stats` shows exactly one arrival, on `sms`. If the loop ends with any other status, the check fails.
 
 ## Failure scenarios
 
@@ -160,7 +168,33 @@ curl -s http://localhost:8081/stats | jq .
 | Slow claim answer | `TestLeaseDeadlineFromClaimStart` |
 | Stop signal with a call in flight | `TestWorkerShutdown`; stack variant below |
 
-**Stack variant of the shutdown scenario:** set `MOCK_DELAY=3s` for `mockprovider`, create one notification, run `docker compose stop worker` within a second, then `docker compose logs --no-log-prefix worker | tail -5` and `docker compose ps -a --format 'table {{.Service}}\t{{.State}}\t{{.ExitCode}}'`. Expected: the attempt's result line appears before the worker's last line, the worker shows `exited 0`, and the notification is `sent`.
+**Stack variant of the shutdown scenario:** a project as in the stack check, but with a mock that holds each request for 3 seconds. The worker is stopped only after it has started the call: the loop waits at most 5 seconds for the first worker log line of this notification, which is its start line, written before the POST. Stopping right after the create could stop a worker that has not claimed anything yet.
+
+```bash
+docker compose stop          # the main stack, if it runs; frees the host ports
+P="nsys-shutdown-$(date +%s)"
+PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard MOCK_DELAY=3s \
+  docker compose -p "$P" up -d --build
+scripts/wait-health.sh -p "$P" api healthy 60
+ID=$(curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"in flight"}' | jq -r .id)
+STARTED=no
+for i in $(seq 1 25); do       # at most 5 s, every 0.2 s
+  docker compose -p "$P" logs --no-log-prefix worker \
+    | jq -eR --arg id "$ID" 'fromjson? | select(.notification_id == $id)' >/dev/null \
+    && STARTED=yes && break
+  sleep 0.2
+done
+echo "started=$STARTED"
+docker compose -p "$P" stop worker
+docker compose -p "$P" logs --no-log-prefix worker | tail -5
+docker compose -p "$P" ps -a --format 'table {{.Service}}\t{{.State}}\t{{.ExitCode}}'
+curl -s "http://localhost:8080/notifications/$ID" | jq -r .status
+docker compose -p "$P" down -v
+docker compose start         # the main stack, if it ran before
+```
+
+Expected: `started=yes`; the attempt's result line appears before the worker's last line; the worker shows `exited 0`; the notification is `sent`. With `started=no` the check fails, because the stop did not test a call in flight.
 
 ## Evidence for the pull request
 
