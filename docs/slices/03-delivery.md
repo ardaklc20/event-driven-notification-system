@@ -93,7 +93,7 @@ When the HTTP call's context has ended, the result is written with a **new** dat
 7. **Mock provider.** `POST /` → after `MOCK_DELAY` (default `0s`), `202` with `{messageId: <new UUID>, status: "accepted", timestamp: <RFC 3339>}`; a body that is not the expected JSON → `400`. It records each arrival's time per channel. `GET /stats` returns per channel the arrival count and the highest number of arrivals in any sliding one-second window. Test: `TestMockProvider`.
 8. **End-to-end tests** in `internal/e2e`: `TestCreateWhileProviderBlocked`, `TestCorrelationIDEndToEnd`, `TestReplayAfterSent`.
 9. **Image and Compose.** The Dockerfile now builds `api`, `worker`, `migrate` and `mockprovider`. New services:
-   - `worker`: `command: ["/app/worker"]`; `PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}`; `PROVIDER_PROFILE: ${PROVIDER_PROFILE:-standard}`; after `postgres` is healthy and `migrate` completed; `stop_grace_period: 15s` ([K6]).
+   - `worker`: `command: ["/app/worker"]`; `PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}`; `PROVIDER_PROFILE: ${PROVIDER_PROFILE:-standard}`; after `postgres` is healthy, `migrate` completed and `mockprovider` started (under the interim rule, a first claim that met a closed port would fail its notification for good); `stop_grace_period: 15s` ([K6]).
    - `mockprovider`: `command: ["/app/mockprovider"]`; `MOCK_DELAY: ${MOCK_DELAY:-0s}`, so a value set on a `docker compose up` command reaches the container; port `${BIND_ADDRESS:-127.0.0.1}:${MOCK_PORT:-8081}:8081` ([K39]).
 10. **README:** architecture overview (API → `notifications` table → worker → provider), how to follow a notification to `sent`, the worker settings.
 

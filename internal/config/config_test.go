@@ -3,6 +3,7 @@ package config_test
 import (
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/config"
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
+	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
 )
 
 const testURL = "postgres://u:p@localhost:5432/db"
@@ -110,5 +112,114 @@ func TestListenConfig(t *testing.T) {
 	}
 	if port, _ := cfg.Port(); port != "9000" {
 		t.Errorf("port = %q, want 9000", port)
+	}
+}
+
+const testProviderURL = "http://mockprovider:8081/"
+
+func TestWorkerConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := config.LoadWorker(env.Options{Environment: map[string]string{
+			"DATABASE_URL": testURL,
+			"PROVIDER_URL": testProviderURL,
+		}})
+		if err != nil {
+			t.Fatalf("LoadWorker: %v", err)
+		}
+		want := config.Worker{
+			DatabaseURL:     testURL,
+			ProviderURL:     testProviderURL,
+			ProviderProfile: provider.ProfileStandard,
+			HTTPTimeout:     5 * time.Second,
+			ResultBudget:    5 * time.Second,
+			LeaseDuration:   30 * time.Second,
+			InFlight:        20,
+			IdleWait:        200 * time.Millisecond,
+			ShutdownBudget:  10 * time.Second,
+			LogLevel:        slog.LevelInfo,
+		}
+		if cfg != want {
+			t.Errorf("got %+v\nwant %+v", cfg, want)
+		}
+	})
+
+	t.Run("webhook.site profile", func(t *testing.T) {
+		cfg, err := config.LoadWorker(env.Options{Environment: map[string]string{
+			"DATABASE_URL":     testURL,
+			"PROVIDER_URL":     "https://webhook.site/0b6b1a3c-0000-4000-8000-000000000000",
+			"PROVIDER_PROFILE": "webhook_site_free",
+		}})
+		if err != nil || cfg.ProviderProfile != provider.ProfileWebhookSiteFree {
+			t.Fatalf("profile = %q, err = %v", cfg.ProviderProfile, err)
+		}
+	})
+
+	t.Run("missing PROVIDER_URL", func(t *testing.T) {
+		_, err := config.LoadWorker(env.Options{Environment: map[string]string{"DATABASE_URL": testURL}})
+		var notSet env.VarIsNotSetError
+		if !errors.As(err, &notSet) || notSet.Key != "PROVIDER_URL" {
+			t.Fatalf("err = %v, want VarIsNotSetError for PROVIDER_URL", err)
+		}
+	})
+
+	t.Run("empty PROVIDER_URL", func(t *testing.T) {
+		_, err := config.LoadWorker(env.Options{Environment: map[string]string{"DATABASE_URL": testURL, "PROVIDER_URL": ""}})
+		var empty env.EmptyVarError
+		if !errors.As(err, &empty) || empty.Key != "PROVIDER_URL" {
+			t.Fatalf("err = %v, want EmptyVarError for PROVIDER_URL", err)
+		}
+	})
+
+	t.Run("rejected values", func(t *testing.T) {
+		for name, extra := range map[string]map[string]string{
+			"unknown profile":                     {"PROVIDER_PROFILE": "webhook_site"},
+			"lease shorter than timeout + budget": {"LEASE_DURATION": "9s", "HTTP_TIMEOUT": "5s", "RESULT_BUDGET": "5s"},
+			"relative provider URL":               {"PROVIDER_URL": "mockprovider:8081"},
+			"provider URL with another scheme":    {"PROVIDER_URL": "ftp://mockprovider/"},
+			"zero in-flight calls":                {"IN_FLIGHT": "0"},
+			"zero idle wait":                      {"IDLE_WAIT": "0s"},
+			"zero shutdown budget":                {"SHUTDOWN_BUDGET": "0s"},
+			"negative HTTP timeout":               {"HTTP_TIMEOUT": "-1s"},
+		} {
+			vars := map[string]string{"DATABASE_URL": testURL, "PROVIDER_URL": testProviderURL}
+			for k, v := range extra {
+				vars[k] = v
+			}
+			if _, err := config.LoadWorker(env.Options{Environment: vars}); err == nil {
+				t.Errorf("%s: LoadWorker accepted %v", name, extra)
+			}
+		}
+	})
+
+	t.Run("lease equal to timeout + budget", func(t *testing.T) {
+		if _, err := config.LoadWorker(env.Options{Environment: map[string]string{
+			"DATABASE_URL": testURL, "PROVIDER_URL": testProviderURL,
+			"LEASE_DURATION": "10s", "HTTP_TIMEOUT": "5s", "RESULT_BUDGET": "5s",
+		}}); err != nil {
+			t.Fatalf("LoadWorker: %v", err)
+		}
+	})
+
+	t.Run("provider URL not repeated in the error", func(t *testing.T) {
+		_, err := config.LoadWorker(env.Options{Environment: map[string]string{
+			"DATABASE_URL": testURL, "PROVIDER_URL": "secret-token-path",
+		}})
+		if err == nil || strings.Contains(err.Error(), "secret-token-path") {
+			t.Fatalf("err = %v, want an error that does not repeat the URL", err)
+		}
+	})
+}
+
+func TestMockProviderConfig(t *testing.T) {
+	cfg, err := config.LoadMockProvider(env.Options{Environment: map[string]string{}})
+	if err != nil || cfg.HTTPAddr != ":8081" || cfg.Delay != 0 {
+		t.Fatalf("defaults: %+v, err %v", cfg, err)
+	}
+	cfg, err = config.LoadMockProvider(env.Options{Environment: map[string]string{"MOCK_DELAY": "3s"}})
+	if err != nil || cfg.Delay != 3*time.Second {
+		t.Fatalf("MOCK_DELAY=3s: %+v, err %v", cfg, err)
+	}
+	if _, err := config.LoadMockProvider(env.Options{Environment: map[string]string{"MOCK_DELAY": "-1s"}}); err == nil {
+		t.Fatal("negative MOCK_DELAY accepted")
 	}
 }

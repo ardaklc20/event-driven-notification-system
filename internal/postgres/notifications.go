@@ -24,7 +24,8 @@ func NewStore(pool *pgxpool.Pool) *Store {
 }
 
 const notificationColumns = `id::text, recipient, channel, content, priority::text, status::text,
-	attempts, last_error, correlation_id, created_at, updated_at`
+	attempts, last_error, correlation_id, provider_message_id, provider_timestamp, sent_at,
+	created_at, updated_at`
 
 const (
 	reserveKeySQL = `
@@ -162,7 +163,8 @@ func scanNotification(row pgx.Row) (domain.Notification, error) {
 		status   string
 	)
 	err := row.Scan(&n.ID, &n.Recipient, &channel, &n.Content, &priority, &status,
-		&n.Attempts, &n.LastError, &n.CorrelationID, &n.CreatedAt, &n.UpdatedAt)
+		&n.Attempts, &n.LastError, &n.CorrelationID, &n.ProviderMessageID, &n.ProviderTimestamp, &n.SentAt,
+		&n.CreatedAt, &n.UpdatedAt)
 	if err != nil {
 		return domain.Notification{}, err
 	}

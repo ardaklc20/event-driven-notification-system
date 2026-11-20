@@ -69,8 +69,38 @@ type Notification struct {
 	Attempts      int
 	LastError     *string
 	CorrelationID string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// What the provider answered with its 202, when it was readable (K15).
+	ProviderMessageID *string
+	ProviderTimestamp *time.Time
+	// SentAt is when the acceptance was recorded.
+	SentAt    *time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Claim is a notification a worker holds under a lease (K3). The worker needs
+// only these fields to send it.
+type Claim struct {
+	ID            string
+	Recipient     string
+	Channel       Channel
+	Content       string
+	CorrelationID string
+	// Attempt is the attempt this claim started; the claim counted it (K9).
+	Attempt int
+	// LeaseToken must match for any result write (K3).
+	LeaseToken string
+	// LeaseRemaining is the lease time left, computed by the database when it
+	// returned the claim. The worker adds it to the time it took before sending
+	// the claim, never to the time the answer arrived.
+	LeaseRemaining time.Duration
+}
+
+// Acceptance is the provider's 202 body. A field the provider sent broken is
+// left empty: MessageID "" or a zero Timestamp (K15).
+type Acceptance struct {
+	MessageID string
+	Timestamp time.Time
 }
 
 // Errors the store and the service return.
