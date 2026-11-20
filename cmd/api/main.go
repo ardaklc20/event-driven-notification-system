@@ -22,6 +22,7 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/config"
 	"github.com/ardaklc20/event-driven-notification-system/internal/httpapi"
 	"github.com/ardaklc20/event-driven-notification-system/internal/postgres"
+	"github.com/ardaklc20/event-driven-notification-system/internal/service"
 )
 
 func main() {
@@ -65,6 +66,7 @@ func runServer() int {
 			Name: "database",
 			Run:  func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
 		}},
+		Notifications: service.NewNotifications(postgres.NewStore(pool), cfg.Limits()),
 	})
 	srv := &http.Server{
 		Handler:           handler,

@@ -1,5 +1,21 @@
 components:
   schemas:
+    AcceptedBody:
+      additionalProperties: false
+      properties:
+        id:
+          description: Notification ID (UUIDv7)
+          format: uuid
+          type: string
+        status:
+          description: "Always queued: the notification is saved and waits for a worker"
+          enum:
+            - queued
+          type: string
+      required:
+        - id
+        - status
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -63,6 +79,99 @@ components:
       required:
         - status
       type: object
+    NotificationBody:
+      additionalProperties: false
+      properties:
+        attempts:
+          description: Attempts started so far; an attempt counts when a worker claims the notification
+          format: int64
+          minimum: 0
+          type: integer
+        channel:
+          enum:
+            - sms
+            - email
+            - push
+          type: string
+        content:
+          type: string
+        created_at:
+          format: date-time
+          type: string
+        id:
+          format: uuid
+          type: string
+        last_error:
+          description: The last delivery error, or null
+          type:
+            - string
+            - "null"
+        priority:
+          enum:
+            - high
+            - normal
+            - low
+          type: string
+        recipient:
+          type: string
+        status:
+          enum:
+            - queued
+            - processing
+            - sent
+            - failed
+            - cancelled
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      required:
+        - id
+        - recipient
+        - channel
+        - content
+        - priority
+        - status
+        - attempts
+        - last_error
+        - created_at
+        - updated_at
+      type: object
+    NotificationRequest:
+      additionalProperties: false
+      properties:
+        channel:
+          enum:
+            - sms
+            - email
+            - push
+          examples:
+            - sms
+          type: string
+        content:
+          description: At most 160 (sms), 10000 (email) or 1000 (push) Unicode code points by default; the limits are configurable and apply to new notifications only.
+          examples:
+            - Your code is 123456
+          minLength: 1
+          type: string
+        priority:
+          default: normal
+          enum:
+            - high
+            - normal
+            - low
+          type: string
+        recipient:
+          description: "sms: an E.164 number (+ and up to 15 digits). email: a plain address without a display name. push: a device token, no whitespace, at most 512 characters."
+          examples:
+            - "+905551234567"
+          minLength: 1
+          type: string
+      required:
+        - recipient
+        - channel
+        - content
+      type: object
     ReadinessBody:
       additionalProperties: false
       properties:
@@ -106,6 +215,96 @@ paths:
       summary: Liveness
       tags:
         - Health
+  /notifications:
+    post:
+      description: Validates the notification, saves it as queued and answers 202 at once, without waiting for delivery. With an Idempotency-Key, a repeat of the same request returns the first response byte for byte.
+      operationId: create-notification
+      parameters:
+        - description: Optional. Sent once, 1 to 128 characters from A–Z, a–z, 0–9, '.', '_' and '-'. A repeat with the same key and the same request returns the first 202 response unchanged; the same key with a different request gets 422.
+          in: header
+          name: Idempotency-Key
+          schema:
+            description: Optional. Sent once, 1 to 128 characters from A–Z, a–z, 0–9, '.', '_' and '-'. A repeat with the same key and the same request returns the first 202 response unchanged; the same key with a different request gets 422.
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationRequest"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedBody"
+          description: Accepted and queued
+          headers:
+            Content-Type:
+              schema:
+                type: string
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Bad Request
+        "422":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+      summary: Create a notification
+      tags:
+        - Notifications
+  /notifications/{id}:
+    get:
+      description: Returns the notification's current state. A malformed ID gets 422, an unknown one 404.
+      operationId: get-notification
+      parameters:
+        - description: Notification ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Notification ID
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationBody"
+          description: OK
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Not Found
+        "422":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+      summary: Get a notification
+      tags:
+        - Notifications
   /readyz:
     get:
       description: Pings PostgreSQL with a short time limit. Answers 200 with each check's result, or 503 naming the failing check. Answers 503 once shutdown has started.

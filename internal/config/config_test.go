@@ -9,6 +9,7 @@ import (
 	"github.com/caarlos0/env/v11"
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/config"
+	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 )
 
 const testURL = "postgres://u:p@localhost:5432/db"
@@ -30,6 +31,9 @@ func TestAPIConfig(t *testing.T) {
 		}
 		if cfg.ShutdownTimeout != 10*time.Second {
 			t.Errorf("ShutdownTimeout = %s, want 10s", cfg.ShutdownTimeout)
+		}
+		if cfg.Limits() != domain.DefaultLimits() {
+			t.Errorf("Limits = %+v, want %+v", cfg.Limits(), domain.DefaultLimits())
 		}
 	})
 
@@ -82,6 +86,8 @@ func TestAPIConfig(t *testing.T) {
 		for name, vars := range map[string]map[string]string{
 			"address without port": {"DATABASE_URL": testURL, "HTTP_ADDR": "localhost"},
 			"zero shutdown":        {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "0s"},
+			"zero sms limit":       {"DATABASE_URL": testURL, "SMS_CONTENT_LIMIT": "0"},
+			"negative push limit":  {"DATABASE_URL": testURL, "PUSH_CONTENT_LIMIT": "-1"},
 		} {
 			if _, err := config.LoadAPI(env.Options{Environment: vars}); err == nil {
 				t.Errorf("%s: LoadAPI accepted %v", name, vars)

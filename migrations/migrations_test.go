@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 1 || first[0].Source.Version != 1 {
-		t.Fatalf("first up applied %d migrations, want version 1 only", len(first))
+	if len(first) != 2 || first[0].Source.Version != 1 || first[1].Source.Version != 2 {
+		t.Fatalf("first up applied %d migrations, want versions 1 and 2", len(first))
 	}
 
 	second, err := provider.Up(ctx)
@@ -71,11 +71,16 @@ func TestMigrations(t *testing.T) {
 			"notifications_channel_check",
 			"notifications_attempts_check",
 			"notifications_lease_matches_status",
+			"idempotency_keys_pkey",
+			"idempotency_keys_key_length",
+			"idempotency_keys_operation_check",
+			"idempotency_keys_response_complete",
+			"idempotency_keys_notification_id_fkey",
 		} {
 			var n int
 			err := db.QueryRowContext(ctx,
 				`SELECT count(*) FROM pg_constraint
-				 WHERE conrelid = 'notifications'::regclass AND conname = $1`, name).Scan(&n)
+				 WHERE conrelid IN ('notifications'::regclass, 'idempotency_keys'::regclass) AND conname = $1`, name).Scan(&n)
 			if err != nil || n != 1 {
 				t.Errorf("constraint %s: count=%d err=%v", name, n, err)
 			}
@@ -87,8 +92,8 @@ func TestMigrations(t *testing.T) {
 		var status string
 		var attempts int
 		err := db.QueryRowContext(ctx,
-			`INSERT INTO notifications (recipient, channel, content, priority)
-			 VALUES ('+905551234567', 'sms', 'hello', 'normal')
+			`INSERT INTO notifications (recipient, channel, content, priority, correlation_id)
+			 VALUES ('+905551234567', 'sms', 'hello', 'normal', 'test')
 			 RETURNING uuid_extract_version(id), status::text, attempts`).Scan(&version, &status, &attempts)
 		if err != nil {
 			t.Fatalf("insert: %v", err)
@@ -103,22 +108,38 @@ func TestMigrations(t *testing.T) {
 
 	t.Run("unknown enum values are rejected", func(t *testing.T) {
 		for name, query := range map[string]string{
-			"priority urgent": `INSERT INTO notifications (recipient, channel, content, priority)
-				VALUES ('+905551234567', 'sms', 'x', 'urgent')`,
-			"status pending": `INSERT INTO notifications (recipient, channel, content, priority, status)
-				VALUES ('+905551234567', 'sms', 'x', 'normal', 'pending')`,
+			"priority urgent": `INSERT INTO notifications (recipient, channel, content, priority, correlation_id)
+				VALUES ('+905551234567', 'sms', 'x', 'urgent', 'test')`,
+			"status pending": `INSERT INTO notifications (recipient, channel, content, priority, status, correlation_id)
+				VALUES ('+905551234567', 'sms', 'x', 'normal', 'pending', 'test')`,
 		} {
 			_, err := db.ExecContext(ctx, query)
 			assertSQLState(t, name, err, "22P02") // invalid_text_representation
 		}
 	})
 
+	t.Run("idempotency key rules", func(t *testing.T) {
+		for name, query := range map[string]string{
+			"empty key":       `INSERT INTO idempotency_keys (key, operation, request_hash) VALUES ('', 'create', '\x00')`,
+			"129-byte key":    `INSERT INTO idempotency_keys (key, operation, request_hash) VALUES (repeat('k', 129), 'create', '\x00')`,
+			"unknown op":      `INSERT INTO idempotency_keys (key, operation, request_hash) VALUES ('k1', 'delete', '\x00')`,
+			"status, no body": `INSERT INTO idempotency_keys (key, operation, request_hash, response_status) VALUES ('k2', 'create', '\x00', 202)`,
+		} {
+			_, err := db.ExecContext(ctx, query)
+			assertSQLState(t, name, err, "23514")
+		}
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO idempotency_keys (key, operation, request_hash) VALUES (repeat('k', 128), 'batch', '\x00')`); err != nil {
+			t.Errorf("128-byte key rejected: %v", err)
+		}
+	})
+
 	t.Run("unknown channel and negative attempts are rejected", func(t *testing.T) {
 		for name, query := range map[string]string{
-			"channel fax": `INSERT INTO notifications (recipient, channel, content, priority)
-				VALUES ('x', 'fax', 'x', 'normal')`,
-			"attempts -1": `INSERT INTO notifications (recipient, channel, content, priority, attempts)
-				VALUES ('+905551234567', 'sms', 'x', 'normal', -1)`,
+			"channel fax": `INSERT INTO notifications (recipient, channel, content, priority, correlation_id)
+				VALUES ('x', 'fax', 'x', 'normal', 'test')`,
+			"attempts -1": `INSERT INTO notifications (recipient, channel, content, priority, attempts, correlation_id)
+				VALUES ('+905551234567', 'sms', 'x', 'normal', -1, 'test')`,
 		} {
 			_, err := db.ExecContext(ctx, query)
 			assertSQLState(t, name, err, "23514") // check_violation
@@ -149,8 +170,8 @@ func TestLeaseMatchesStatus(t *testing.T) {
 	rejected := 0
 	for _, c := range cases {
 		_, err := pool.Exec(t.Context(),
-			`INSERT INTO notifications (recipient, channel, content, priority, status, lease_token, lease_expires_at)
-			 VALUES ('+905551234567', 'sms', 'x', 'normal', $1,
+			`INSERT INTO notifications (recipient, channel, content, priority, correlation_id, status, lease_token, lease_expires_at)
+			 VALUES ('+905551234567', 'sms', 'x', 'normal', 'test', $1,
 			         CASE WHEN $2 THEN uuidv7() END,
 			         CASE WHEN $3 THEN now() + interval '30 seconds' END)`,
 			c.status, c.token, c.expires)
