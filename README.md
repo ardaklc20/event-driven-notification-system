@@ -6,7 +6,7 @@ A notification service in Go that queues SMS, email and push notifications in Po
 
 One image holds four programs, each a Compose service: `api` (the HTTP API), `worker` (claims and delivers notifications; several can run), `migrate` (applies the database migrations and exits) and `mockprovider` (a local stand-in for the external provider). There is no message broker: the `notifications` table in PostgreSQL is the queue.
 
-**Current state (core complete; circuit breaker and scheduling, slice 12):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it.
+**Current state (core complete; circuit breaker, scheduling and real-time status, slice 13):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it. A WebSocket client can follow one notification or one batch: it gets the current state, then each status change.
 
 ## Requirements
 
@@ -276,6 +276,35 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at}' 
 - **Everything else as usual.** A scheduled notification can be cancelled while it is `queued`; once due it follows priority and the rate limit like any other notification, and retries move only `available_at`, never `scheduled_at`. Within a batch, items of the same channel and priority go out in `scheduled_at` order; other channels and priorities follow the rate limit and priority first.
 - **Latency.** `GET /metrics` measures scheduled notifications from `scheduled_at` (`scheduled_latency`), not from `created_at`, so a planned wait never shows as delivery latency.
 
+### Real-time status
+
+```bash
+go run ./cmd/wswatch -url "ws://localhost:8080/ws/notifications/$ID" -for 30s   # or /ws/batches/$BATCH_ID
+```
+
+Two WebSocket endpoints follow one notification or one batch ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify), [K25](docs/DECISIONS.md#k25--websocket-endpoint-b4-coderwebsocket-one-notification-or-batch-per-connection)). They are not in the OpenAPI document, which does not describe WebSockets.
+
+| Endpoint | First message | Then |
+|---|---|---|
+| `GET /ws/notifications/{id}` | The notification's current state, `type` `snapshot` | One `update` per status change |
+| `GET /ws/batches/{id}` | Every notification of the batch, `type` `snapshot` | One `update` per status change of any item |
+
+Only the server sends. A run of `cmd/wswatch` on a notification scheduled 15 seconds ahead printed:
+
+```json
+{"type":"snapshot","notification_id":"01a1fb38-2482-7c67-9b60-8a3522747d9b","batch_id":null,"status":"queued","attempts":0,"version":0,"updated_at":"2026-11-20T23:08:43.004539Z"}
+{"type":"update","notification_id":"01a1fb38-2482-7c67-9b60-8a3522747d9b","batch_id":null,"status":"processing","attempts":1,"version":1,"updated_at":"2026-11-20T23:08:57.079818Z"}
+{"type":"update","notification_id":"01a1fb38-2482-7c67-9b60-8a3522747d9b","batch_id":null,"status":"sent","attempts":1,"version":2,"updated_at":"2026-11-20T23:08:57.094705Z"}
+```
+
+A batch snapshot is `{"type":"snapshot","batch_id":"…","notifications":[…]}`, with the same six fields per item. `version` counts one notification's status changes; compare it only within the same `notification_id`.
+
+- **How events are made.** A database trigger publishes every status change with `pg_notify` when its transaction commits: the claim, a result, a retry, a cancel and lease recovery. The API keeps one connection that runs `LISTEN` and passes each event to the subscribers of that notification or batch.
+- **No gap after the snapshot.** A subscriber is registered first and its events are queued; then the snapshot is read and sent; then only events with a higher `version` for the same notification are sent.
+- **Best effort.** A snapshot, then updates for as long as the connection lasts. Nothing is replayed: when the connection closes, reconnect for a fresh snapshot, or read the state with `GET`. The server closes a connection with `1013` (try again later) when its listener connection drops, `1008` when the client reads too slowly and its queue of `WS_SEND_QUEUE` messages fills, and `1001` when the API shuts down. While the listener is reconnecting, a new request gets `503` with `Retry-After: 1` and no upgrade.
+- **Message size.** The largest message is the snapshot of a 1,000-item batch, about 195 KB (measured by `TestBatchSnapshotMaxSize`). Many WebSocket clients read at most 32 KiB per message by default, `coder/websocket` among them; set the read limit to at least 256 KiB. `cmd/wswatch` uses 1 MiB.
+- **Unknown IDs** get `404` before the upgrade. Browsers are accepted only from the same origin.
+
 ### Metrics
 
 ```bash
@@ -399,6 +428,9 @@ Each program reads typed environment variables and refuses to start with an inva
 | `EMAIL_CONTENT_LIMIT` | `10000` | Content limit for `email` |
 | `PUSH_CONTENT_LIMIT` | `1000` | Content limit for `push` |
 | `BATCH_MAX_BODY_BYTES` | `16777216` (16 MiB) | Largest `POST /notifications/batch` body; a larger one gets `413` |
+| `WS_SEND_QUEUE` | `16` | Messages waiting for one WebSocket; when full, the connection is closed with `1008` |
+| `WS_WRITE_TIMEOUT` | `5s` | Limit for one WebSocket write |
+| `WS_CLOSE_TIMEOUT` | `5s` | Wait for open WebSockets at shutdown; must be below `SHUTDOWN_TIMEOUT` |
 
 ### Worker settings
 
@@ -457,7 +489,7 @@ The document is generated from the code with Huma and committed as [`api/openapi
 go run ./cmd/api openapi > api/openapi.yaml
 ```
 
-`TestOpenAPIUpToDate` and the CI `openapi` job fail if the committed file differs from the generated one.
+`TestOpenAPIUpToDate` and the CI `openapi` job fail if the committed file differs from the generated one. The WebSocket endpoints are not in it; [Real-time status](#real-time-status) describes their messages.
 
 ## Migrations
 
@@ -488,6 +520,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 - **`provider_message_id` is not unique** ([K15](docs/DECISIONS.md#k15--provider-response-store-messageid-and-timestamp)). A provider with a static response gives every notification the same ID.
 - **What the rate-limit measurement proves** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). The limit is on send starts at the worker. A remote provider sees arrivals, which network delays can bunch together, so it may observe more than 100 in some second. A full channel uses about 82 to 89 starts per second, not 100. The measurements are single runs on one machine.
 - **An outage on one channel pauses all three** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). The circuit breaker is per provider, because the three channels share one URL: a failure that only one channel meets at the provider still stops every claim until a probe succeeds. The probe uses one attempt of the notification it carries, and `failed` notifications are never resent.
+- **Real-time updates are best effort** ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify)). Events held in the API's memory are lost if it stops, a slow client is disconnected, and PostgreSQL does not replay notifications sent while the listener was reconnecting; a client reconnects for a fresh snapshot. Each connection follows one notification or one batch.
 - **No delivery step in CI** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lints, tests, checks the OpenAPI document and builds the image; nothing is published or deployed.
 
 ## Bonuses
@@ -497,7 +530,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 | B6 — GitHub Actions pipeline for tests and linting | Done ([CI](#ci)) |
 | B1 — Failure handling: a circuit breaker | Done ([Provider outage](#provider-outage)) |
 | B2 — Scheduled notifications | Done ([Scheduled notifications](#scheduled-notifications)) |
-| B4 — Real-time status updates over WebSocket | Planned ([slice 13](docs/slices/13-realtime-status.md)) |
+| B4 — Real-time status updates over WebSocket | Done ([Real-time status](#real-time-status)) |
 | B3 — Message templates | Planned ([slice 14](docs/slices/14-templates.md)) |
 | B5 — Distributed tracing | Planned ([slice 15](docs/slices/15-distributed-tracing.md)) |
 
@@ -510,11 +543,13 @@ cmd/migrate/            migrate up
 cmd/mockprovider/       mock provider entry point
 cmd/loadgen/            sends the rate-limit load through the API
 cmd/ratecount/          counts send starts per one-second window from worker logs
+cmd/wswatch/            follows one WebSocket and prints each message as one line
 internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
-internal/service/       create, read, cancel, list, batch and metrics rules; the listing cursor
-internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit and probe slot, result writes with the circuit breaker, give-back, recovery
+internal/service/       create, read, cancel, list, batch and metrics rules; the listing cursor; WebSocket snapshot reads
+internal/httpapi/       router, Huma operations, middleware, the WebSocket endpoints
+internal/realtime/      WebSocket subscribers, their queues, the listener generation and the version filter
+internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit and probe slot, result writes with the circuit breaker, give-back, recovery, the status listener and snapshot reads
 internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery, breaker pauses
 internal/provider/      provider HTTP client, start gate, response classification with outage flags, Retry-After
 internal/ratecheck/     largest count in a half-open one-second window
@@ -542,7 +577,7 @@ SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başın
 
 Tek bir imaj, her biri bir Compose servisi olan dört program taşır: `api` (HTTP API), `worker` (bildirimleri claim edip teslim eder; birden fazla çalışabilir), `migrate` (veritabanı migration'larını uygulayıp çıkar) ve `mockprovider` (harici provider'ın yerel yerine geçeni). Mesaj kuyruğu sunucusu yoktur: kuyruk, PostgreSQL'deki `notifications` tablosudur.
 
-**Şu anki durum (çekirdek tamam; devre kesici ve zamanlama, dilim 12):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez.
+**Şu anki durum (çekirdek tamam; devre kesici, zamanlama ve gerçek zamanlı durum, dilim 13):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez. Bir WebSocket istemcisi tek bir bildirimi ya da tek bir toplu isteği izleyebilir: önce güncel durumu, sonra her durum değişikliğini alır.
 
 ## Gereksinimler
 
@@ -812,6 +847,35 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, scheduled_at}' 
 - **Geri kalan her şey aynı.** Zamanlanmış bir bildirim `queued` iken iptal edilebilir; zamanı gelince diğer bildirimler gibi önceliğe ve hız sınırına uyar; tekrar denemeler yalnızca `available_at`'i taşır, `scheduled_at`'i asla. Bir toplu istekte aynı kanal ve öncelikteki öğeler `scheduled_at` sırasıyla gider; farklı kanal ve öncelikler önce hız sınırına ve önceliğe uyar.
 - **Gecikme.** `GET /metrics` zamanlanmış bildirimleri `created_at`'ten değil `scheduled_at`'ten ölçer (`scheduled_latency`); böylece planlı bekleme asla teslim gecikmesi olarak görünmez.
 
+### Gerçek zamanlı durum
+
+```bash
+go run ./cmd/wswatch -url "ws://localhost:8080/ws/notifications/$ID" -for 30s   # ya da /ws/batches/$BATCH_ID
+```
+
+İki WebSocket endpoint'i tek bir bildirimi ya da tek bir toplu isteği izler ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify), [K25](docs/DECISIONS.md#k25--websocket-endpoint-b4-coderwebsocket-one-notification-or-batch-per-connection)). WebSocket'leri tanımlamadığı için OpenAPI dokümanında yer almazlar.
+
+| Endpoint | İlk mesaj | Sonra |
+|---|---|---|
+| `GET /ws/notifications/{id}` | Bildirimin güncel durumu, `type` `snapshot` | Her durum değişikliğinde bir `update` |
+| `GET /ws/batches/{id}` | Toplu isteğin bütün bildirimleri, `type` `snapshot` | Herhangi bir öğenin her durum değişikliğinde bir `update` |
+
+Yalnızca sunucu gönderir. 15 saniye sonraya zamanlanmış bir bildirimde `cmd/wswatch` şunu yazdırdı:
+
+```json
+{"type":"snapshot","notification_id":"01a1fb38-2482-7c67-9b60-8a3522747d9b","batch_id":null,"status":"queued","attempts":0,"version":0,"updated_at":"2026-11-20T23:08:43.004539Z"}
+{"type":"update","notification_id":"01a1fb38-2482-7c67-9b60-8a3522747d9b","batch_id":null,"status":"processing","attempts":1,"version":1,"updated_at":"2026-11-20T23:08:57.079818Z"}
+{"type":"update","notification_id":"01a1fb38-2482-7c67-9b60-8a3522747d9b","batch_id":null,"status":"sent","attempts":1,"version":2,"updated_at":"2026-11-20T23:08:57.094705Z"}
+```
+
+Toplu istek anlık görüntüsü `{"type":"snapshot","batch_id":"…","notifications":[…]}` biçimindedir; her öğede aynı altı alan bulunur. `version` tek bir bildirimin durum değişikliklerini sayar; yalnızca aynı `notification_id` içinde karşılaştırın.
+
+- **Olaylar nasıl oluşur.** Bir veritabanı trigger'ı her durum değişikliğini, transaction'ı commit olduğunda `pg_notify` ile yayımlar: claim, sonuç, tekrar deneme, iptal ve lease kurtarma. API, `LISTEN` çalıştıran bir bağlantı tutar ve her olayı o bildirimin ya da toplu isteğin abonelerine iletir.
+- **Anlık görüntüden sonra boşluk yok.** Abone önce kaydedilir ve olayları kuyruğa alınır; sonra anlık görüntü okunup gönderilir; sonra yalnızca aynı bildirim için daha yüksek `version`'lı olaylar gönderilir.
+- **En iyi çaba.** Bir anlık görüntü, sonra bağlantı sürdükçe güncellemeler. Hiçbir şey yeniden oynatılmaz: bağlantı kapanınca yeni bir anlık görüntü için yeniden bağlanın ya da durumu `GET` ile okuyun. Sunucu bir bağlantıyı, dinleyici bağlantısı koptuğunda `1013` (sonra tekrar deneyin), istemci çok yavaş okuyup `WS_SEND_QUEUE` mesajlık kuyruğu dolduğunda `1008`, API kapanırken `1001` ile kapatır. Dinleyici yeniden bağlanırken yeni bir istek `503` ve `Retry-After: 1` alır, upgrade yapılmaz.
+- **Mesaj boyutu.** En büyük mesaj 1.000 öğeli bir toplu isteğin anlık görüntüsüdür, yaklaşık 195 KB (`TestBatchSnapshotMaxSize` ölçer). Pek çok WebSocket istemcisi varsayılan olarak mesaj başına en fazla 32 KiB okur, `coder/websocket` da bunlardan biridir; okuma sınırını en az 256 KiB yapın. `cmd/wswatch` 1 MiB kullanır.
+- **Bilinmeyen ID'ler** upgrade'den önce `404` alır. Tarayıcılar yalnızca aynı origin'den kabul edilir.
+
 ### Metrikler
 
 ```bash
@@ -935,6 +999,9 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 | `EMAIL_CONTENT_LIMIT` | `10000` | `email` için içerik sınırı |
 | `PUSH_CONTENT_LIMIT` | `1000` | `push` için içerik sınırı |
 | `BATCH_MAX_BODY_BYTES` | `16777216` (16 MiB) | En büyük `POST /notifications/batch` gövdesi; daha büyüğü `413` alır |
+| `WS_SEND_QUEUE` | `16` | Bir WebSocket için bekleyen mesajlar; dolunca bağlantı `1008` ile kapanır |
+| `WS_WRITE_TIMEOUT` | `5s` | Tek bir WebSocket yazımı için sınır |
+| `WS_CLOSE_TIMEOUT` | `5s` | Kapanışta açık WebSocket'ler için bekleme; `SHUTDOWN_TIMEOUT`'tan küçük olmalı |
 
 ### Worker ayarları
 
@@ -993,7 +1060,7 @@ Doküman koddan Huma ile üretilir ve [`api/openapi.yaml`](api/openapi.yaml) ola
 go run ./cmd/api openapi > api/openapi.yaml
 ```
 
-Commit'lenmiş dosya üretilenden farklıysa `TestOpenAPIUpToDate` ve CI'daki `openapi` job'ı başarısız olur.
+Commit'lenmiş dosya üretilenden farklıysa `TestOpenAPIUpToDate` ve CI'daki `openapi` job'ı başarısız olur. WebSocket endpoint'leri dokümanda yoktur; mesajlarını [Gerçek zamanlı durum](#gerçek-zamanlı-durum) anlatır.
 
 ## Migration'lar
 
@@ -1024,6 +1091,7 @@ docker compose run --rm migrate
 - **`provider_message_id` benzersiz değildir** ([K15](docs/DECISIONS.md#k15--provider-response-store-messageid-and-timestamp)). Sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
 - **Hız sınırı ölçümünün kanıtladığı** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). Sınır worker'daki gönderim başlangıçları üzerindedir. Uzak bir provider gelişleri görür; ağ gecikmeleri gelişleri bir araya toplayabilir, bu yüzden provider bir saniyede 100'den fazlasını görebilir. Dolu bir kanal saniyede 100 değil yaklaşık 82 ile 89 başlangıç kullanır. Ölçümler tek makinede tekil çalıştırmalardır.
 - **Bir kanaldaki kesinti üç kanalı da durdurur** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). Üç kanal aynı URL'yi paylaştığı için devre kesici provider başınadır: provider'da yalnızca bir kanalın karşılaştığı bir hata da bir yoklama başarılı olana kadar tüm claim'leri durdurur. Yoklama taşıdığı bildirimin bir denemesini kullanır ve `failed` bildirimler asla yeniden gönderilmez.
+- **Gerçek zamanlı güncellemeler en iyi çabadır** ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify)). API dururken bellekteki olaylar kaybolur, yavaş bir istemcinin bağlantısı kesilir ve PostgreSQL dinleyici yeniden bağlanırken gönderilen bildirimleri yeniden oynatmaz; istemci yeni bir anlık görüntü için yeniden bağlanır. Her bağlantı tek bir bildirimi ya da tek bir toplu isteği izler.
 - **CI'da teslim adımı yok** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lint, test, OpenAPI kontrolü ve imaj derlemesi yapar; hiçbir şey yayımlanmaz ya da dağıtılmaz.
 
 ## Bonuslar
@@ -1033,7 +1101,7 @@ docker compose run --rm migrate
 | B6 — Testler ve lint için GitHub Actions hattı | Tamam ([CI](#ci-1)) |
 | B1 — Hata yönetimi: devre kesici | Tamam ([Provider kesintisi](#provider-kesintisi)) |
 | B2 — Zamanlanmış bildirimler | Tamam ([Zamanlanmış bildirimler](#zamanlanmış-bildirimler)) |
-| B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Planlandı ([dilim 13](docs/slices/13-realtime-status.md)) |
+| B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Tamam ([Gerçek zamanlı durum](#gerçek-zamanlı-durum)) |
 | B3 — Mesaj şablonları | Planlandı ([dilim 14](docs/slices/14-templates.md)) |
 | B5 — Dağıtık izleme | Planlandı ([dilim 15](docs/slices/15-distributed-tracing.md)) |
 
@@ -1046,11 +1114,13 @@ cmd/migrate/            migrate up
 cmd/mockprovider/       mock provider giriş noktası
 cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
 cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
+cmd/wswatch/            tek bir WebSocket'i izler ve her mesajı bir satır olarak yazdırır
 internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
-internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek ve metrik kuralları; listeleme cursor'ı
-internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli ve yoklama yerli claim, devre kesiciyle sonuç yazma, geri verme, kurtarma
+internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek ve metrik kuralları; listeleme cursor'ı; WebSocket anlık görüntü okumaları
+internal/httpapi/       router, Huma operasyonları, middleware, WebSocket endpoint'leri
+internal/realtime/      WebSocket aboneleri, kuyrukları, dinleyici nesli ve sürüm filtresi
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli ve yoklama yerli claim, devre kesiciyle sonuç yazma, geri verme, kurtarma, durum dinleyicisi ve anlık görüntü okumaları
 internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma, devre kesici beklemeleri
 internal/provider/      provider HTTP istemcisi, başlatma kapısı, kesinti işaretli cevap sınıflandırması, Retry-After
 internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı
