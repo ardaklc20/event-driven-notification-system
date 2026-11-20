@@ -41,7 +41,7 @@ Each requirement gets one command that proves it by running it.
 | D4 | `go test -count=1 -v -run '^TestOpenAPIUpToDate$' ./internal/httpapi/`; `go run ./cmd/api openapi \| diff -u api/openapi.yaml -` | Passed (slice 1): `--- PASS: TestOpenAPIUpToDate`; no difference |
 | D5 | `go test -count=1 -v -run '^(TestMigrations\|TestLeaseMatchesStatus)$' ./migrations/`; `docker compose run --rm migrate`; broken-migration check in [slice 1](slices/01-walking-skeleton.md#broken-migration) | Passed (slice 1): both `--- PASS`; second run exit 0 with `no migrations to apply`; with `99999_broken.sql`, `migrate` exited 1 naming the file, `api` stayed `created`, version 1 stayed applied |
 | D6 | `go test -count=1 ./...` | Passed (slice 1): every package `ok` or `[no test files]`, run twice without `(cached)` |
-| B6 | `gh pr checks` on the slice 1 pull request | Pending: the workflow first runs when the pull request is opened |
+| B6 | `gh pr checks 8`; `gh run view <run> --log \| grep tested-sha` | Passed (slice 1, [#8](https://github.com/ardaklc20/event-driven-notification-system/pull/8)): `lint` 46 s (`0 issues.`), `test` 59 s (`go test -count=1 -race ./...`, every package `ok`), `openapi` 28 s, `docker` 39 s, all `pass`; all four jobs logged `tested-sha=d56d42da3e7a809fc3277a3b1a61959f1d09287f`, the pull request's head commit |
 | R1–R15, N1–N3 | — | Pending; filled as slices are built |
 
 ## 5. Rejected or corrected AI output
@@ -124,7 +124,7 @@ Her gereksinim için, çalıştırınca o gereksinimi kanıtlayan tek bir komut 
 | D4 | `go test -count=1 -v -run '^TestOpenAPIUpToDate$' ./internal/httpapi/`; `go run ./cmd/api openapi \| diff -u api/openapi.yaml -` | Geçti (dilim 1): `--- PASS: TestOpenAPIUpToDate`; fark yok |
 | D5 | `go test -count=1 -v -run '^(TestMigrations\|TestLeaseMatchesStatus)$' ./migrations/`; `docker compose run --rm migrate`; [dilim 1](slices/01-walking-skeleton.md#broken-migration)'deki bozuk migration kontrolü | Geçti (dilim 1): iki `--- PASS`; ikinci çalıştırma `no migrations to apply` ile 0 çıkışı; `99999_broken.sql` ile `migrate` dosyayı adlandırarak 1 ile çıktı, `api` `created` kaldı, sürüm 1 uygulanmış kaldı |
 | D6 | `go test -count=1 ./...` | Geçti (dilim 1): her paket `ok` ya da `[no test files]`, iki çalıştırmada da `(cached)` yok |
-| B6 | Dilim 1 pull request'inde `gh pr checks` | Bekliyor: workflow ilk kez pull request açılınca çalışacak |
+| B6 | `gh pr checks 8`; `gh run view <run> --log \| grep tested-sha` | Geçti (dilim 1, [#8](https://github.com/ardaklc20/event-driven-notification-system/pull/8)): `lint` 46 sn (`0 issues.`), `test` 59 sn (`go test -count=1 -race ./...`, her paket `ok`), `openapi` 28 sn, `docker` 39 sn, hepsi `pass`; dört job'ın dördü de pull request'in head commit'i olan `tested-sha=d56d42da3e7a809fc3277a3b1a61959f1d09287f` değerini logladı |
 | R1–R15, N1–N3 | — | Bekliyor; dilimler yapıldıkça doldurulacak |
 
 ## 5. Reddedilen ya da düzeltilen yapay zekâ çıktıları
