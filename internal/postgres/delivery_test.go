@@ -89,6 +89,7 @@ type leaseRow struct {
 	expires   *time.Time
 	attempts  int
 	sentAt    *time.Time
+	completed *time.Time
 	messageID *string
 	timestamp *time.Time
 	lastError *string
@@ -98,10 +99,10 @@ func readLease(t *testing.T, pool *pgxpool.Pool, id string) leaseRow {
 	t.Helper()
 	var r leaseRow
 	err := pool.QueryRow(t.Context(),
-		`SELECT status::text, lease_token::text, lease_expires_at, attempts, sent_at,
+		`SELECT status::text, lease_token::text, lease_expires_at, attempts, sent_at, completed_at,
 		        provider_message_id, provider_timestamp, last_error
 		 FROM notifications WHERE id = $1::uuid`, id).Scan(
-		&r.status, &r.token, &r.expires, &r.attempts, &r.sentAt, &r.messageID, &r.timestamp, &r.lastError)
+		&r.status, &r.token, &r.expires, &r.attempts, &r.sentAt, &r.completed, &r.messageID, &r.timestamp, &r.lastError)
 	if err != nil {
 		t.Fatalf("read row %s: %v", id, err)
 	}
@@ -271,6 +272,9 @@ func TestResultRequiresValidLease(t *testing.T) {
 		r.messageID == nil || *r.messageID != "m-1" || r.timestamp == nil || !r.timestamp.Equal(acc.Timestamp) {
 		t.Fatalf("row = %+v, want sent with its provider fields and no lease", r)
 	}
+	if r.completed == nil || !r.completed.Equal(*r.sentAt) {
+		t.Fatalf("completed_at = %v, want the same database time as sent_at %v (K20)", r.completed, r.sentAt)
+	}
 
 	// The failed write follows the same rule.
 	failedID := insertQueued(t, pool, 1)[0]
@@ -285,6 +289,9 @@ func TestResultRequiresValidLease(t *testing.T) {
 	fr := readLease(t, pool, failedID)
 	if fr.status != "failed" || fr.token != nil || fr.expires != nil || fr.lastError == nil || *fr.lastError != "unexpected status 307" {
 		t.Fatalf("row = %+v, want failed with last_error and no lease", fr)
+	}
+	if fr.completed == nil {
+		t.Fatal("failed row has no completed_at (K20)")
 	}
 }
 
@@ -342,8 +349,8 @@ func TestRetryWrite(t *testing.T) {
 	}
 	r := readLease(t, pool, id)
 	if r.status != "queued" || r.token != nil || r.expires != nil || r.attempts != 1 ||
-		r.lastError == nil || *r.lastError != "temporary: status 503" {
-		t.Fatalf("row = %+v, want queued, no lease, attempts 1, last_error kept", r)
+		r.lastError == nil || *r.lastError != "temporary: status 503" || r.completed != nil {
+		t.Fatalf("row = %+v, want queued, no lease, attempts 1, last_error kept, not completed", r)
 	}
 	var wait time.Duration
 	if err := pool.QueryRow(t.Context(),
@@ -403,7 +410,8 @@ func TestExpiredLeaseCannotOverwrite(t *testing.T) {
 		}
 	}
 	r := readLease(t, pool, id)
-	if r.status != "processing" || r.token == nil || *r.token != b.LeaseToken || r.sentAt != nil || r.messageID != nil || r.attempts != 2 {
+	if r.status != "processing" || r.token == nil || *r.token != b.LeaseToken || r.sentAt != nil || r.messageID != nil ||
+		r.attempts != 2 || r.completed != nil {
 		t.Fatalf("row = %+v, want B's processing lease untouched", r)
 	}
 }
@@ -437,8 +445,8 @@ func TestStaleWriteAfterRecovery(t *testing.T) {
 	}
 	r := readLease(t, pool, id)
 	if r.status != "failed" || r.sentAt != nil || r.messageID != nil || r.timestamp != nil ||
-		r.lastError == nil || *r.lastError != postgres.RecoveredError {
-		t.Fatalf("row = %+v, want failed by recovery with no sent_at and no provider fields", r)
+		r.lastError == nil || *r.lastError != postgres.RecoveredError || r.completed == nil {
+		t.Fatalf("row = %+v, want failed by recovery with completed_at, no sent_at and no provider fields", r)
 	}
 }
 

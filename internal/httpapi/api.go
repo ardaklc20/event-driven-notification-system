@@ -24,6 +24,7 @@ type Deps struct {
 	// Checks run on every GET /readyz (K30).
 	Checks        []Check
 	Notifications *service.Notifications
+	Metrics       *service.Metrics
 	// BatchMaxBodyBytes is the largest batch body; 0 means
 	// DefaultBatchMaxBodyBytes (K12).
 	BatchMaxBodyBytes int64
@@ -59,6 +60,7 @@ func newAPI(deps Deps) (*http.ServeMux, huma.API) {
 	registerHealth(api, deps)
 	registerNotifications(api, deps)
 	registerBatches(api, deps)
+	registerMetrics(api, deps)
 	return mux, api
 }
 

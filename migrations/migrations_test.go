@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 6 {
-		t.Fatalf("first up applied %d migrations, want 6", len(first))
+	if len(first) != 7 {
+		t.Fatalf("first up applied %d migrations, want 7", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -240,6 +240,19 @@ func TestMigrations(t *testing.T) {
 		assertSQLState(t, "1,001 items", err, "23514")
 	})
 
+	t.Run("completion index", func(t *testing.T) {
+		var def string
+		if err := db.QueryRowContext(ctx,
+			`SELECT pg_get_indexdef('notifications_completed_idx'::regclass)`).Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		const want = "CREATE INDEX notifications_completed_idx ON public.notifications USING btree " +
+			"(completed_at) WHERE (completed_at IS NOT NULL)"
+		if def != want {
+			t.Errorf("index = %s, want %s", def, want)
+		}
+	})
+
 	t.Run("unknown channel and negative attempts are rejected", func(t *testing.T) {
 		for name, query := range map[string]string{
 			"channel fax": `INSERT INTO notifications (recipient, channel, content, priority, correlation_id)
@@ -317,4 +330,55 @@ func boolText(b bool) string {
 		return "set"
 	}
 	return "null"
+}
+
+// TestCompletedAtBackfill: a sent and a failed row written before migration
+// 00007 get their completed_at from it; queued and cancelled rows stay
+// without one (K20).
+func TestCompletedAtBackfill(t *testing.T) {
+	db, err := sql.Open("pgx", testdb.Empty(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	provider, err := migrations.NewProvider(db)
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Close() })
+	ctx := t.Context()
+	if _, err := provider.UpTo(ctx, 6); err != nil {
+		t.Fatalf("up to 6: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO notifications (recipient, channel, content, priority, correlation_id, status, sent_at, updated_at)
+		 VALUES ('+905551234567', 'sms', 'sent', 'normal', 'test', 'sent',
+		         '2026-11-20T10:00:00Z', '2026-11-20T10:00:05Z'),
+		        ('+905551234567', 'sms', 'failed', 'normal', 'test', 'failed',
+		         NULL, '2026-11-20T11:00:00Z'),
+		        ('+905551234567', 'sms', 'queued', 'normal', 'test', 'queued',
+		         NULL, '2026-11-20T12:00:00Z'),
+		        ('+905551234567', 'sms', 'cancelled', 'normal', 'test', 'cancelled',
+		         NULL, '2026-11-20T13:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	want := map[string]string{
+		"sent":      "2026-11-20T10:00:00Z",
+		"failed":    "2026-11-20T11:00:00Z",
+		"queued":    "",
+		"cancelled": "",
+	}
+	for content, at := range want {
+		var got sql.NullString
+		if err := db.QueryRowContext(ctx,
+			`SELECT to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+			 FROM notifications WHERE content = $1`, content).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.String != at {
+			t.Errorf("%s: completed_at = %q, want %q", content, got.String, at)
+		}
+	}
 }

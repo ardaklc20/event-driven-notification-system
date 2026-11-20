@@ -4,7 +4,7 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 8):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, and up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged.
+**Current state (slice 9):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel.
 
 ## Requirements
 
@@ -229,6 +229,34 @@ curl -s 'http://localhost:8080/batches/01a1f9f2-5de8-77ce-bd30-03a9e9616567?limi
 
 `counts` lists all five statuses, zeros included. `items` are the batch's own notifications in the listing order, paged with `limit` (50 by default, 1 to 200) and `next_cursor` exactly as in [List notifications](#list-notifications). The counts and the page are read in one snapshot, so they agree with each other; the next page is a new read. An unknown batch gets `404`.
 
+### Metrics
+
+```bash
+curl -s http://localhost:8080/metrics | jq '{as_of, sms: .channels.sms}'
+```
+
+```json
+{"as_of":"2026-11-20T17:23:07.414075Z","sms":{"queue":{"high":{"ready":0,"deferred":0,"oldest_ready_age_seconds":null},"normal":{…},"low":{…}},
+ "processing":0,
+ "completed":{"window_seconds":60,"sent":5,"failed":0,"sent_per_second":0.0833,"failed_per_second":0,"success_ratio":1},
+ "latency":{"samples":5,"p50_ms":193.341,"p95_ms":197.05,"p99_ms":197.569}}}
+```
+
+Every value is read in one database snapshot, taken at `as_of` (the database clock, RFC 3339 with microseconds), so the numbers of one response agree with each other. `channels` always holds `sms`, `email` and `push`, and `queue` always holds `high`, `normal` and `low`.
+
+| Field | What it counts |
+|---|---|
+| `queue.<priority>.ready` | `queued` notifications whose `available_at` is at or before `as_of` |
+| `queue.<priority>.deferred` | `queued` notifications waiting for a later `available_at`, such as a retry |
+| `queue.<priority>.oldest_ready_age_seconds` | `as_of` minus the earliest `available_at` of the ready ones; `null` when none is ready. A growing age for `low` while `high` keeps arriving shows starvation |
+| `processing` | Notifications a worker holds at `as_of`; high while nothing completes means a stalled worker |
+| `completed.sent`, `completed.failed` | Notifications that became `sent` or `failed` with `completed_at` after `as_of − 60 s` and at or before `as_of` |
+| `completed.sent_per_second`, `completed.failed_per_second` | The counts divided by 60; `0` when nothing completed |
+| `completed.success_ratio` | `sent / (sent + failed)`; `null` when nothing completed |
+| `latency.samples`, `latency.p50_ms`, `p95_ms`, `p99_ms` | `created_at → sent_at` of the notifications sent in the window, with `percentile_cont`; `null` without samples |
+
+Cancellations and retries that are still waiting are not completions. `sent` means the provider accepted the request. The latency includes queue waiting and retries; in the Compose stack it also includes the worker's idle wait (`IDLE_WAIT`, 200 ms) before it claims a new notification. The endpoint summarizes completed notifications: it is not the proof of the rate limit, which counts the actual send starts ([Rate limit and priority](#rate-limit-and-priority)). With 100,000 notifications the whole call took about 11 ms; the `processing` count is a sequential scan (about 5 ms), the queue counts read the claim index and the completions the `completed_at` index.
+
 ### Idempotency
 
 `Idempotency-Key` is optional. When present it must be sent once and hold 1 to 128 characters from `A–Z a–z 0–9 . _ -`; otherwise the request gets `400` and nothing is saved.
@@ -404,9 +432,9 @@ cmd/loadgen/            sends the rate-limit load through the API
 cmd/ratecount/          counts send starts per one-second window from worker logs
 internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
-internal/service/       create, read, cancel, list and batch rules; the listing cursor
+internal/service/       create, read, cancel, list, batch and metrics rules; the listing cursor
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, claim with permit, result writes, give-back, recovery
+internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit, result writes, give-back, recovery
 internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery
 internal/provider/      provider HTTP client, start gate, response classification, Retry-After
 internal/ratecheck/     largest count in a half-open one-second window
@@ -432,7 +460,7 @@ docs/                   requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 8):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir.
+**Şu anki durum (dilim 9):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir.
 
 ## Gereksinimler
 
@@ -657,6 +685,34 @@ curl -s 'http://localhost:8080/batches/01a1f9f2-5de8-77ce-bd30-03a9e9616567?limi
 
 `counts` beş durumun hepsini, sıfırlar dahil, listeler. `items` toplu isteğin kendi bildirimleridir; listeleme sırasıyla gelir ve [Bildirimleri listeleme](#bildirimleri-listeleme) bölümündeki gibi `limit` (varsayılan 50, 1 ile 200 arası) ve `next_cursor` ile sayfalanır. Sayılar ve sayfa tek bir anlık görüntüden okunur, bu yüzden birbiriyle tutarlıdır; sonraki sayfa yeni bir okumadır. Bilinmeyen bir toplu istek `404` alır.
 
+### Metrikler
+
+```bash
+curl -s http://localhost:8080/metrics | jq '{as_of, sms: .channels.sms}'
+```
+
+```json
+{"as_of":"2026-11-20T17:23:07.414075Z","sms":{"queue":{"high":{"ready":0,"deferred":0,"oldest_ready_age_seconds":null},"normal":{…},"low":{…}},
+ "processing":0,
+ "completed":{"window_seconds":60,"sent":5,"failed":0,"sent_per_second":0.0833,"failed_per_second":0,"success_ratio":1},
+ "latency":{"samples":5,"p50_ms":193.341,"p95_ms":197.05,"p99_ms":197.569}}}
+```
+
+Bütün değerler `as_of` anında (veritabanı saati, mikrosaniyeli RFC 3339) alınan tek bir veritabanı anlık görüntüsünden okunur; bu yüzden bir yanıttaki sayılar birbiriyle tutarlıdır. `channels` her zaman `sms`, `email` ve `push`'u, `queue` da her zaman `high`, `normal` ve `low`'u taşır.
+
+| Alan | Neyi sayar |
+|---|---|
+| `queue.<priority>.ready` | `available_at`'i `as_of`'ta ya da öncesinde olan `queued` bildirimler |
+| `queue.<priority>.deferred` | Tekrar deneme gibi, daha sonraki bir `available_at`'i bekleyen `queued` bildirimler |
+| `queue.<priority>.oldest_ready_age_seconds` | `as_of` eksi hazır olanların en erken `available_at`'i; hazır yoksa `null`. `high` gelmeye devam ederken `low` için büyüyen yaş açlığı gösterir |
+| `processing` | `as_of` anında bir worker'ın tuttuğu bildirimler; hiçbir şey tamamlanmazken yüksekse takılmış bir worker vardır |
+| `completed.sent`, `completed.failed` | `completed_at`'i `as_of − 60 s`'den sonra ve `as_of`'ta ya da öncesinde olup `sent` ya da `failed` olan bildirimler |
+| `completed.sent_per_second`, `completed.failed_per_second` | Sayıların 60'a bölümü; hiçbir şey tamamlanmadıysa `0` |
+| `completed.success_ratio` | `sent / (sent + failed)`; hiçbir şey tamamlanmadıysa `null` |
+| `latency.samples`, `latency.p50_ms`, `p95_ms`, `p99_ms` | Pencerede gönderilen bildirimlerin `created_at → sent_at` süresi, `percentile_cont` ile; örnek yoksa `null` |
+
+İptaller ve hâlâ bekleyen tekrar denemeler tamamlanma sayılmaz. `sent`, provider'ın isteği kabul ettiği anlamına gelir. Gecikme kuyrukta bekleme ve tekrar denemeleri de içerir; Compose stack'inde worker'ın yeni bir bildirim claim etmeden önceki boş bekleme süresini de (`IDLE_WAIT`, 200 ms) içerir. Endpoint tamamlanan bildirimleri özetler: hız sınırının kanıtı değildir; o kanıt gerçek gönderim başlangıçlarını sayar ([Hız sınırı ve öncelik](#hız-sınırı-ve-öncelik)). 100.000 bildirimle bütün çağrı yaklaşık 11 ms sürdü; `processing` sayısı sıralı bir taramadır (yaklaşık 5 ms), kuyruk sayıları claim index'ini, tamamlananlar `completed_at` index'ini okur.
+
 ### Idempotency
 
 `Idempotency-Key` isteğe bağlıdır. Gönderildiğinde bir kez gönderilmeli ve `A–Z a–z 0–9 . _ -` karakterlerinden 1 ile 128 karakter arası olmalıdır; aksi halde istek `400` alır ve hiçbir şey kaydedilmez.
@@ -832,9 +888,9 @@ cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
 cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
 internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
-internal/service/       oluşturma, okuma, iptal, listeleme ve toplu istek kuralları; listeleme cursor'ı
+internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek ve metrik kuralları; listeleme cursor'ı
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, izinli claim, sonuç yazma, geri verme, kurtarma
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli claim, sonuç yazma, geri verme, kurtarma
 internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma
 internal/provider/      provider HTTP istemcisi, başlatma kapısı, cevap sınıflandırması, Retry-After
 internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı

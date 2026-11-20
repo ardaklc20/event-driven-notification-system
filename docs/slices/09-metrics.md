@@ -41,7 +41,7 @@ Without the backfill, rows completed shortly before the migration would be missi
 Writes that change with this slice:
 
 - `sent`: `completed_at` gets the same database time as `sent_at` (one `clock_timestamp()` value used for both).
-- `failed`, from a result or from lease recovery: `completed_at = clock_timestamp()`.
+- `failed`, from a result or from lease recovery: `completed_at = clock_timestamp()`, the same value as `updated_at` (recovery reads the clock once per statement for both).
 
 ## The snapshot ([K20])
 
@@ -73,7 +73,7 @@ Cancelled notifications and retries still waiting are not completions ([K20]).
 
 ## Steps
 
-1. **Migration** `00007` with its backfill, and the changed result writes; extend `TestMigrations` (a `sent` and a `failed` row written before the migration get their `completed_at`), and assert `completed_at` in the existing delivery and retry tests.
+1. **Migration** `00007` with its backfill, and the changed result writes; extend `TestMigrations` (the completion index) and add `TestCompletedAtBackfill`, which migrates to version 6, writes a `sent`, a `failed`, a `queued` and a `cancelled` row, migrates to the end and checks that only the first two got their `completed_at`; assert `completed_at` in the existing delivery, retry and recovery tests.
 2. **Snapshot queries** with `as_of` as a parameter.
 3. **Response assembly** and the operation; OpenAPI regenerated.
 4. **Tests** below.

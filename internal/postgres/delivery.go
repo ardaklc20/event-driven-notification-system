@@ -88,6 +88,7 @@ const (
 		UPDATE notifications AS n
 		SET status              = 'sent',
 		    sent_at             = c.now,
+		    completed_at        = c.now,
 		    provider_message_id = $3,
 		    provider_timestamp  = $4,
 		    lease_token         = NULL,
@@ -100,6 +101,7 @@ const (
 		    last_error       = $3,
 		    lease_token      = NULL,
 		    lease_expires_at = NULL,
+		    completed_at     = c.now,
 		    updated_at       = c.now` + resultFrom
 
 	// markRetrySQL puts a temporary failure back in the queue; the wait is
@@ -146,8 +148,9 @@ const (
 		    last_error       = $3,
 		    lease_token      = NULL,
 		    lease_expires_at = NULL,
-		    updated_at       = clock_timestamp()
-		FROM expired
+		    completed_at     = CASE WHEN n.attempts < $1 THEN NULL ELSE c.now END,
+		    updated_at       = c.now
+		FROM expired, (SELECT clock_timestamp() AS now) AS c
 		WHERE n.id = expired.id
 		RETURNING n.id::text, n.correlation_id, n.status::text, n.attempts`
 )

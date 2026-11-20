@@ -58,6 +58,7 @@ func runServer() int {
 	}
 	defer pool.Close()
 
+	store := postgres.NewStore(pool)
 	readiness := &httpapi.Readiness{}
 	handler := httpapi.New(httpapi.Deps{
 		Logger:    logger,
@@ -66,7 +67,8 @@ func runServer() int {
 			Name: "database",
 			Run:  func(ctx context.Context) error { return postgres.Ping(ctx, pool) },
 		}},
-		Notifications:     service.NewNotifications(postgres.NewStore(pool), cfg.Limits()),
+		Notifications:     service.NewNotifications(store, cfg.Limits()),
+		Metrics:           service.NewMetrics(store),
 		BatchMaxBodyBytes: cfg.BatchMaxBodyBytes,
 	})
 	srv := &http.Server{

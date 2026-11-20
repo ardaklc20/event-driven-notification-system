@@ -53,7 +53,7 @@ Every slice passes all of these before its pull request is merged.
 | 6 | [Cancellation](slices/06-cancellation.md) | Core | R5 | K5, K9, K22 | 5 | `feat/cancel` | done ([#13](https://github.com/ardaklc20/event-driven-notification-system/pull/13)) |
 | 7 | [Listing](slices/07-listing.md) | Core | R6 | K13, K17, K19, K44 | 2 | `feat/listing` | done ([#14](https://github.com/ardaklc20/event-driven-notification-system/pull/14)) |
 | 8 | [Batches](slices/08-batches.md) | Core | R2, R4, R10, R11, R15 | K10, K11, K12, K13, K17, K19, K21 | 2, 7 | `feat/batches` | done ([#15](https://github.com/ardaklc20/event-driven-notification-system/pull/15)) |
-| 9 | [Metrics](slices/09-metrics.md) | Core | R14 | K8, K19, K20, K30 | 4 | `feat/metrics` | planned |
+| 9 | [Metrics](slices/09-metrics.md) | Core | R14 | K8, K19, K20, K30 | 4 | `feat/metrics` | done ([#16](https://github.com/ardaklc20/event-driven-notification-system/pull/16)) |
 | 10 | [Core release check](slices/10-core-release-check.md) | Core | D1–D6, A1, R13 | K3, K4, K10, K11, K14, K18, K19, K29, K31, K32, K39 | 1–9 | `docs/core-readme` | planned |
 | 11 | [Circuit breaker](slices/11-circuit-breaker.md) | Optional | B1 | K3, K5, K7, K9, K21, K34, K41, K42 | 5, 10 | `feat/circuit-breaker` | planned |
 | 12 | [Scheduled notifications](slices/12-scheduled-notifications.md) | Optional | B2 | K5, K8, K9, K10, K12, K20, K26, K42 | 6, 8, 9, 10 | `feat/scheduled` | planned |
