@@ -4,7 +4,7 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 5):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`.
+**Current state (slice 6):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled.
 
 ## Requirements
 
@@ -149,6 +149,29 @@ curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
 ```
 
 Returns `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` and `updated_at`. An unknown ID gets `404`, a malformed one `422`. The three provider fields are filled when the notification is `sent`: `provider_message_id` and `provider_timestamp` come from the provider's `202` body, `sent_at` is when the acceptance was recorded. `provider_message_id` is not unique: a provider with a static response, such as a free webhook.site URL, gives every notification the same ID.
+
+### Cancel a notification
+
+```bash
+curl -s -X POST http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40/cancel
+```
+
+Only a **pending** notification can be cancelled, and pending means `queued`: waiting for its first attempt, for its channel's rate limit or for its retry time. No worker holds it then, so stopping it is safe.
+
+| Status when the cancel arrives | Answer |
+|---|---|
+| `queued` | `200` with the notification, now `cancelled` |
+| `cancelled` | `200` with the notification, unchanged |
+| `processing`, `sent` or `failed` | `409`: a worker holds the notification or it has ended, and its POST may already be on its way |
+| Unknown ID | `404`; a malformed ID gets `422` |
+
+The `409` is an RFC 9457 problem whose `current_status` names the notification's status:
+
+```json
+{"title":"Conflict","status":409,"detail":"the notification is sent; only a queued notification can be cancelled","current_status":"sent"}
+```
+
+The cancel locks the row and decides from the status it reads under the lock. A cancel and a worker's claim racing for the same notification always end with one winner: either the notification is `cancelled` and no POST goes out for it, or the worker holds it and the cancel gets `409`. A notification waiting for a retry is `queued`, so it can be cancelled then, and no further POST follows. There is no batch cancel.
 
 ### Idempotency
 
@@ -323,9 +346,9 @@ cmd/loadgen/            sends the rate-limit load through the API
 cmd/ratecount/          counts send starts per one-second window from worker logs
 internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
-internal/service/       create and read rules
+internal/service/       create, read and cancel rules
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, read, claim with permit, result writes, give-back, recovery
+internal/postgres/      connection pool and all SQL: create, read, cancel, claim with permit, result writes, give-back, recovery
 internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery
 internal/provider/      provider HTTP client, start gate, response classification, Retry-After
 internal/ratecheck/     largest count in a half-open one-second window
@@ -351,7 +374,7 @@ docs/                   requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 5):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir.
+**Şu anki durum (dilim 6):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir.
 
 ## Gereksinimler
 
@@ -496,6 +519,29 @@ curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
 ```
 
 `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` ve `updated_at` döner. Bilinmeyen bir ID `404`, bozuk biçimli bir ID `422` alır. Üç provider alanı bildirim `sent` olduğunda dolar: `provider_message_id` ve `provider_timestamp` provider'ın `202` gövdesinden gelir, `sent_at` kabulün kaydedildiği andır. `provider_message_id` benzersiz değildir: ücretsiz bir webhook.site URL'i gibi sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
+
+### Bildirim iptal etme
+
+```bash
+curl -s -X POST http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40/cancel
+```
+
+Yalnızca **bekleyen** bir bildirim iptal edilebilir ve bekleyen, `queued` demektir: ilk denemesini, kanalının hız sınırını ya da tekrar deneme zamanını bekliyordur. O sırada onu hiçbir worker tutmaz; bu yüzden durdurmak güvenlidir.
+
+| İptal geldiğinde durum | Cevap |
+|---|---|
+| `queued` | Artık `cancelled` olan bildirimle `200` |
+| `cancelled` | Değişmeden bildirimle `200` |
+| `processing`, `sent` ya da `failed` | `409`: bildirimi bir worker tutuyor ya da bildirim bitmiş; POST'u yola çıkmış olabilir |
+| Bilinmeyen ID | `404`; bozuk biçimli bir ID `422` alır |
+
+`409`, `current_status` alanı bildirimin durumunu veren bir RFC 9457 problem'idir:
+
+```json
+{"title":"Conflict","status":409,"detail":"the notification is sent; only a queued notification can be cancelled","current_status":"sent"}
+```
+
+İptal satırı kilitler ve kilit altında okuduğu duruma göre karar verir. Aynı bildirim için yarışan bir iptal ile bir worker claim'i her zaman tek bir kazananla biter: ya bildirim `cancelled` olur ve onun için hiçbir POST çıkmaz, ya da onu worker tutar ve iptal `409` alır. Tekrar denemeyi bekleyen bir bildirim `queued`'dır; o sırada iptal edilebilir ve ardından başka POST gelmez. Toplu iptal yoktur.
 
 ### Idempotency
 
@@ -670,9 +716,9 @@ cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
 cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
 internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
-internal/service/       oluşturma ve okuma kuralları
+internal/service/       oluşturma, okuma ve iptal kuralları
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, izinli claim, sonuç yazma, geri verme, kurtarma
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, iptal, izinli claim, sonuç yazma, geri verme, kurtarma
 internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma
 internal/provider/      provider HTTP istemcisi, başlatma kapısı, cevap sınıflandırması, Retry-After
 internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı

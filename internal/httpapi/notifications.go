@@ -144,6 +144,37 @@ type getNotificationInput struct {
 	ID string `path:"id" format:"uuid" doc:"Notification ID"`
 }
 
+// CancelConflictBody is the 409 answer of a cancel: an RFC 9457 problem with
+// the status the notification has now (K9). The problem's own status member
+// is the HTTP status, so the notification's is current_status.
+type CancelConflictBody struct {
+	huma.ErrorModel
+	CurrentStatus string `json:"current_status" enum:"processing,sent,failed" doc:"The notification's status, read under its row lock"`
+}
+
+func (e *CancelConflictBody) Error() string { return e.Detail }
+
+// GetStatus returns 409.
+func (e *CancelConflictBody) GetStatus() int { return http.StatusConflict }
+
+func toBody(n domain.Notification) NotificationBody {
+	return NotificationBody{
+		ID:                n.ID,
+		Recipient:         n.Recipient,
+		Channel:           string(n.Channel),
+		Content:           n.Content,
+		Priority:          string(n.Priority),
+		Status:            string(n.Status),
+		Attempts:          n.Attempts,
+		LastError:         n.LastError,
+		ProviderMessageID: n.ProviderMessageID,
+		ProviderTimestamp: n.ProviderTimestamp,
+		SentAt:            n.SentAt,
+		CreatedAt:         n.CreatedAt,
+		UpdatedAt:         n.UpdatedAt,
+	}
+}
+
 func registerNotifications(api huma.API, deps Deps) {
 	registry := api.OpenAPI().Components.Schemas
 	acceptedSchema := registry.Schema(reflect.TypeFor[AcceptedBody](), true, "AcceptedBody")
@@ -195,21 +226,35 @@ func registerNotifications(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, problemFor(ctx, loggerFrom(ctx, deps.Logger), err)
 		}
-		return &notificationOutput{Body: NotificationBody{
-			ID:                n.ID,
-			Recipient:         n.Recipient,
-			Channel:           string(n.Channel),
-			Content:           n.Content,
-			Priority:          string(n.Priority),
-			Status:            string(n.Status),
-			Attempts:          n.Attempts,
-			LastError:         n.LastError,
-			ProviderMessageID: n.ProviderMessageID,
-			ProviderTimestamp: n.ProviderTimestamp,
-			SentAt:            n.SentAt,
-			CreatedAt:         n.CreatedAt,
-			UpdatedAt:         n.UpdatedAt,
-		}}, nil
+		return &notificationOutput{Body: toBody(n)}, nil
+	})
+
+	conflictSchema := registry.Schema(reflect.TypeFor[CancelConflictBody](), true, "CancelConflictBody")
+	huma.Register(api, huma.Operation{
+		OperationID: "cancel-notification",
+		Method:      http.MethodPost,
+		Path:        "/notifications/{id}/cancel",
+		Summary:     "Cancel a queued notification",
+		Description: "Cancels the notification while it is queued: waiting for its first attempt, for its channel's rate limit " +
+			"or for its retry time. A notification that is already cancelled answers 200 again. One that a worker holds " +
+			"(processing) or that has ended (sent, failed) answers 409 with its current status: its POST may already be on " +
+			"its way. After a 200, no new POST goes out for it. An unknown ID gets 404, a malformed one 422.",
+		Tags: []string{"Notifications"},
+		Responses: map[string]*huma.Response{
+			"409": {
+				Description: "The notification is processing, sent or failed and can no longer be cancelled",
+				Content:     map[string]*huma.MediaType{"application/problem+json": {Schema: conflictSchema}},
+			},
+		},
+		Errors: []int{http.StatusNotFound, http.StatusUnprocessableEntity},
+	}, func(ctx context.Context, in *getNotificationInput) (*notificationOutput, error) {
+		logger := loggerFrom(ctx, deps.Logger)
+		n, err := deps.Notifications.Cancel(ctx, in.ID)
+		if err != nil {
+			return nil, problemFor(ctx, logger, err)
+		}
+		logger.LogAttrs(ctx, slog.LevelInfo, "notification cancelled", slog.String("notification_id", n.ID))
+		return &notificationOutput{Body: toBody(n)}, nil
 	})
 }
 
@@ -220,7 +265,10 @@ func marshalAccepted(n domain.Notification) ([]byte, error) {
 // problemFor maps a service error to an RFC 9457 response. Unexpected errors
 // are logged and answered with a generic 500, so no internal detail leaks.
 func problemFor(ctx context.Context, logger *slog.Logger, err error) error {
-	var verr *domain.ValidationError
+	var (
+		verr     *domain.ValidationError
+		conflict *domain.CancelConflictError
+	)
 	switch {
 	case errors.As(err, &verr):
 		details := make([]error, len(verr.Errors))
@@ -233,6 +281,15 @@ func problemFor(ctx context.Context, logger *slog.Logger, err error) error {
 			&huma.ErrorDetail{Location: "header." + IdempotencyKeyHeader, Message: "already used with a different request"})
 	case errors.Is(err, domain.ErrNotFound):
 		return huma.Error404NotFound("notification not found")
+	case errors.As(err, &conflict):
+		return &CancelConflictBody{
+			ErrorModel: huma.ErrorModel{
+				Title:  http.StatusText(http.StatusConflict),
+				Status: http.StatusConflict,
+				Detail: "the notification is " + string(conflict.Status) + "; only a queued notification can be cancelled",
+			},
+			CurrentStatus: string(conflict.Status),
+		}
 	default:
 		logger.LogAttrs(ctx, slog.LevelError, "request failed", slog.String("error", err.Error()))
 		return huma.Error500InternalServerError("internal error")

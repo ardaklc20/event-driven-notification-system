@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,14 +88,25 @@ func accept(w http.ResponseWriter) {
 
 // stack is the API, a worker and a provider stub on one test database.
 type stack struct {
-	pool       *pgxpool.Pool
-	apiURL     string
-	provider   *providerStub
-	apiLogs    *logBuffer
-	workerLogs *logBuffer
+	pool        *pgxpool.Pool
+	apiURL      string
+	provider    *providerStub
+	providerURL string
+	apiLogs     *logBuffer
+	workerLogs  *logBuffer
 }
 
+// newStack starts the API, the provider stub and the worker.
 func newStack(t *testing.T, answer http.HandlerFunc) *stack {
+	t.Helper()
+	s := newPausedStack(t, answer)
+	s.startWorker(t)
+	return s
+}
+
+// newPausedStack starts the API and the provider stub; the worker starts
+// only with startWorker.
+func newPausedStack(t *testing.T, answer http.HandlerFunc) *stack {
 	t.Helper()
 	s := &stack{
 		pool:       testdb.New(t),
@@ -112,9 +124,15 @@ func newStack(t *testing.T, answer http.HandlerFunc) *stack {
 	}))
 	t.Cleanup(apiSrv.Close)
 	s.apiURL = apiSrv.URL
+	s.providerURL = providerSrv.URL + "/"
+	return s
+}
 
+// startWorker runs a worker against the stack until the end of the test.
+func (s *stack) startWorker(t *testing.T) {
+	t.Helper()
 	logger := slog.New(slog.NewJSONHandler(s.workerLogs, nil)).With(slog.String("worker_id", "e2e-worker"))
-	w := worker.New(postgres.NewStore(s.pool), provider.NewClient(providerSrv.URL+"/", 5*time.Second, 4), logger, worker.Config{
+	w := worker.New(postgres.NewStore(s.pool), provider.NewClient(s.providerURL, 5*time.Second, 4), logger, worker.Config{
 		Profile:          provider.ProfileStandard,
 		LeaseDuration:    15 * time.Second,
 		ResultBudget:     5 * time.Second,
@@ -143,7 +161,6 @@ func newStack(t *testing.T, answer http.HandlerFunc) *stack {
 			t.Error("worker did not stop within 15 seconds")
 		}
 	})
-	return s
 }
 
 type reply struct {
@@ -423,4 +440,103 @@ func TestBurstAccepted(t *testing.T) {
 	}
 	t.Logf("3,000 creates accepted in %s; all sent %s after the first create",
 		accepted.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+}
+
+// cancel posts to /notifications/{id}/cancel.
+func (s *stack) cancel(t *testing.T, id string) reply {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, s.apiURL+"/notifications/"+id+"/cancel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return do(t, req)
+}
+
+// requestsFor counts the POSTs the provider received with correlation ID.
+func (s *stack) requestsFor(correlationID string) int {
+	n := 0
+	for _, h := range s.provider.headers() {
+		if h.Get(provider.CorrelationIDHeader) == correlationID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestNoPostAfterCancel: with the worker not yet running, a notification is
+// created and cancelled; the worker then runs for several claim cycles and
+// never posts it, while a notification created after it is sent (R5, K9).
+func TestNoPostAfterCancel(t *testing.T) {
+	s := newPausedStack(t, func(w http.ResponseWriter, _ *http.Request) { accept(w) })
+	id := idOf(t, s.create(t, smsBody, correlation("cancel-me")))
+	if r := s.cancel(t, id); r.status != http.StatusOK {
+		t.Fatalf("cancel: status %d, body %s; want 200", r.status, r.body)
+	}
+	s.startWorker(t)
+	// A later notification on the same channel shows the worker has claimed
+	// past the cancelled one.
+	marker := idOf(t, s.create(t, smsBody, correlation("after-cancel")))
+	s.waitSent(t, marker, 10*time.Second)
+	time.Sleep(200 * time.Millisecond) // several 20 ms idle cycles more
+
+	n := s.get(t, id)
+	if n.Status != "cancelled" || n.Attempts != 0 || s.requestsFor("cancel-me") != 0 {
+		t.Fatalf("cancelled notification: status %s, attempts %d, %d POSTs; want cancelled, 0, 0",
+			n.Status, n.Attempts, s.requestsFor("cancel-me"))
+	}
+}
+
+// TestCancelDuringRetryWait: the provider answers 503 with Retry-After: 2
+// once; while the notification waits in queued for its retry, it is
+// cancelled. After the retry time has passed, no second POST arrives (R5,
+// K9).
+func TestCancelDuringRetryWait(t *testing.T) {
+	var calls atomic.Int32
+	s := newStack(t, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		accept(w)
+	})
+	id := idOf(t, s.create(t, smsBody, correlation("retry-wait")))
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n := s.get(t, id)
+		if n.Status == "queued" && n.Attempts == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("notification %s with %d attempts, want queued after the first 503", n.Status, n.Attempts)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var due time.Time
+	if err := s.pool.QueryRow(t.Context(), `SELECT available_at FROM notifications WHERE id = $1::uuid`, id).Scan(&due); err != nil {
+		t.Fatal(err)
+	}
+	if r := s.cancel(t, id); r.status != http.StatusOK {
+		t.Fatalf("cancel during the retry wait: status %d, body %s; want 200", r.status, r.body)
+	}
+	// Wait until the retry time has passed by the database clock, then a few
+	// idle cycles more.
+	for {
+		var passed bool
+		if err := s.pool.QueryRow(t.Context(), `SELECT clock_timestamp() > $1`, due).Scan(&passed); err != nil {
+			t.Fatal(err)
+		}
+		if passed {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	n := s.get(t, id)
+	if n.Status != "cancelled" || n.Attempts != 1 || s.requestsFor("retry-wait") != 1 {
+		t.Fatalf("after the retry time: status %s, attempts %d, %d POSTs; want cancelled, 1, 1",
+			n.Status, n.Attempts, s.requestsFor("retry-wait"))
+	}
 }

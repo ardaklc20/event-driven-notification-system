@@ -164,6 +164,17 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency key already used with a different request")
 )
 
+// CancelConflictError means the notification can no longer be cancelled: a
+// worker holds it (processing) or it has ended (sent, failed). Status is the
+// status read under the row lock (K9).
+type CancelConflictError struct {
+	Status Status
+}
+
+func (e *CancelConflictError) Error() string {
+	return "notification is " + string(e.Status) + "; only a queued notification can be cancelled"
+}
+
 // CreateCommand is what the store needs to save one notification under the
 // K10 rules, in one transaction.
 type CreateCommand struct {

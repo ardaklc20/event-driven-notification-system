@@ -53,7 +53,7 @@ Race tests use committed data, separate connections and controlled steps instead
 ## Steps
 
 1. **Cancel transaction** and its repository tests.
-2. **Service and operation:** `POST /notifications/{id}/cancel`, responses `200`, `404`, `409` with `{status}`; OpenAPI regenerated.
+2. **Service and operation:** `POST /notifications/{id}/cancel`, responses `200`, `404`, `409` as an RFC 9457 problem whose `current_status` names the notification's status (the problem's own `status` is the HTTP code); OpenAPI regenerated.
 3. **Race tests**, both orders for each race.
 4. **End-to-end tests:** no POST after a successful cancel; cancel during a retry wait.
 5. **README:** cancel example; what "pending" means ([K9]).
