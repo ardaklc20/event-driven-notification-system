@@ -31,17 +31,28 @@ func TestMain(m *testing.M) {
 type settings struct {
 	httpTimeout time.Duration
 	cfg         worker.Config
+	// hooks stop a delivery at a chosen point (crash simulation).
+	hooks worker.Hooks
+	// wrap, when set, wraps the store the worker uses.
+	wrap func(worker.Store) worker.Store
 }
 
+// defaults retry at once (zero backoff), so attempt sequences run fast.
 func defaults() settings {
 	return settings{
 		httpTimeout: 5 * time.Second,
 		cfg: worker.Config{
-			LeaseDuration:  15 * time.Second,
-			ResultBudget:   5 * time.Second,
-			InFlight:       4,
-			IdleWait:       20 * time.Millisecond,
-			ShutdownBudget: 10 * time.Second,
+			Profile:          provider.ProfileStandard,
+			LeaseDuration:    15 * time.Second,
+			ResultBudget:     5 * time.Second,
+			InFlight:         4,
+			IdleWait:         20 * time.Millisecond,
+			ShutdownBudget:   10 * time.Second,
+			MaxAttempts:      5,
+			BackoffBase:      0,
+			BackoffCap:       0,
+			RecoveryInterval: 100 * time.Millisecond,
+			RecoveryBatch:    100,
 		},
 	}
 }
@@ -87,7 +98,12 @@ func startWorker(t *testing.T, pool *pgxpool.Pool, providerURL string, s setting
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})).
 		With(slog.String("worker_id", "test-worker"))
 	client := provider.NewClient(providerURL, s.httpTimeout, s.cfg.InFlight)
-	w := worker.New(postgres.NewStore(pool), client, logger, s.cfg)
+	var store worker.Store = postgres.NewStore(pool)
+	if s.wrap != nil {
+		store = s.wrap(store)
+	}
+	w := worker.New(store, client, logger, s.cfg)
+	worker.SetHooks(w, s.hooks)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{cancel: cancel, done: make(chan error, 1), logs: logs}
@@ -163,14 +179,20 @@ func readRow(t *testing.T, pool *pgxpool.Pool, id string) row {
 // waitStatus polls the row until it has status want, for at most within.
 func waitStatus(t *testing.T, pool *pgxpool.Pool, id, want string, within time.Duration) row {
 	t.Helper()
+	return waitRow(t, pool, id, within, want, func(r row) bool { return r.status == want })
+}
+
+// waitRow polls the row until ok holds, for at most within.
+func waitRow(t *testing.T, pool *pgxpool.Pool, id string, within time.Duration, what string, ok func(row) bool) row {
+	t.Helper()
 	deadline := time.Now().Add(within)
 	for {
 		r := readRow(t, pool, id)
-		if r.status == want {
+		if ok(r) {
 			return r
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("row %s is %s after %s, want %s", id, r.status, within, want)
+			t.Fatalf("row %s after %s: %+v, want %s", id, within, r, what)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -339,8 +361,8 @@ func TestAcceptedBodyTimeout(t *testing.T) {
 }
 
 // TestNoRedirect: a 307 or 308 is not followed, so the redirect target gets
-// no POST, and the notification is not sent (K14). Until slice 4 the row
-// fails (interim rule).
+// no POST, and the notification is not sent (K14). The 3xx is a terminal
+// protocol error, so the row fails on this attempt (K41).
 func TestNoRedirect(t *testing.T) {
 	for _, code := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
 		t.Run(http.StatusText(code), func(t *testing.T) {
@@ -363,8 +385,8 @@ func TestNoRedirect(t *testing.T) {
 			if n := len(target.all()); n != 0 {
 				t.Errorf("redirect target got %d requests, want 0", n)
 			}
-			if r.sentAt != nil || r.lastError == nil || *r.lastError != "unexpected status "+strconv.Itoa(code) {
-				t.Errorf("row = %+v, want not sent, last_error unexpected status %d", r, code)
+			if r.sentAt != nil || r.lastError == nil || *r.lastError != "terminal: unexpected status "+strconv.Itoa(code) {
+				t.Errorf("row = %+v, want not sent, last_error terminal: unexpected status %d", r, code)
 			}
 		})
 	}

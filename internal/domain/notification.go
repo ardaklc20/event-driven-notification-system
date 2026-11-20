@@ -96,6 +96,15 @@ type Claim struct {
 	LeaseRemaining time.Duration
 }
 
+// Recovered is a notification whose expired lease recovery took back (K3, K9,
+// K40): queued again while attempts are left, otherwise failed.
+type Recovered struct {
+	ID            string
+	CorrelationID string
+	Status        Status
+	Attempts      int
+}
+
 // Acceptance is the provider's 202 body. A field the provider sent broken is
 // left empty: MessageID "" or a zero Timestamp (K15).
 type Acceptance struct {

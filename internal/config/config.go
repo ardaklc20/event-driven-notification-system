@@ -92,6 +92,16 @@ type Worker struct {
 	IdleWait       time.Duration `env:"IDLE_WAIT" envDefault:"200ms"`
 	ShutdownBudget time.Duration `env:"SHUTDOWN_BUDGET" envDefault:"10s"`
 	LogLevel       slog.Level    `env:"LOG_LEVEL" envDefault:"info"`
+
+	// Retries (K7): attempts in total, the first one included, and the
+	// full-jitter backoff between them.
+	MaxAttempts int           `env:"MAX_ATTEMPTS" envDefault:"5"`
+	BackoffBase time.Duration `env:"BACKOFF_BASE" envDefault:"2s"`
+	BackoffCap  time.Duration `env:"BACKOFF_CAP" envDefault:"60s"`
+
+	// Lease recovery (K40).
+	RecoveryInterval time.Duration `env:"RECOVERY_INTERVAL" envDefault:"5s"`
+	RecoveryBatch    int           `env:"RECOVERY_BATCH" envDefault:"100"`
 }
 
 // Validate checks what the struct tags cannot (K32).
@@ -106,11 +116,12 @@ func (c Worker) Validate() error {
 			provider.ProfileStandard, provider.ProfileWebhookSiteFree, c.ProviderProfile))
 	}
 	for name, d := range map[string]time.Duration{
-		"HTTP_TIMEOUT":    c.HTTPTimeout,
-		"RESULT_BUDGET":   c.ResultBudget,
-		"LEASE_DURATION":  c.LeaseDuration,
-		"IDLE_WAIT":       c.IdleWait,
-		"SHUTDOWN_BUDGET": c.ShutdownBudget,
+		"HTTP_TIMEOUT":      c.HTTPTimeout,
+		"RESULT_BUDGET":     c.ResultBudget,
+		"LEASE_DURATION":    c.LeaseDuration,
+		"IDLE_WAIT":         c.IdleWait,
+		"SHUTDOWN_BUDGET":   c.ShutdownBudget,
+		"RECOVERY_INTERVAL": c.RecoveryInterval,
 	} {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %s", name, d))
@@ -123,6 +134,16 @@ func (c Worker) Validate() error {
 	}
 	if c.InFlight < 1 {
 		errs = append(errs, fmt.Errorf("IN_FLIGHT must be at least 1, got %d", c.InFlight))
+	}
+	if c.MaxAttempts < 1 {
+		errs = append(errs, fmt.Errorf("MAX_ATTEMPTS must be at least 1, got %d", c.MaxAttempts))
+	}
+	if c.BackoffBase < 0 || c.BackoffCap < c.BackoffBase {
+		errs = append(errs, fmt.Errorf("BACKOFF_BASE (%s) must not be negative and BACKOFF_CAP (%s) not below it",
+			c.BackoffBase, c.BackoffCap))
+	}
+	if c.RecoveryBatch < 1 {
+		errs = append(errs, fmt.Errorf("RECOVERY_BATCH must be at least 1, got %d", c.RecoveryBatch))
 	}
 	return errors.Join(errs...)
 }

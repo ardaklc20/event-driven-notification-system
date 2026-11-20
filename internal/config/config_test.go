@@ -127,16 +127,21 @@ func TestWorkerConfig(t *testing.T) {
 			t.Fatalf("LoadWorker: %v", err)
 		}
 		want := config.Worker{
-			DatabaseURL:     testURL,
-			ProviderURL:     testProviderURL,
-			ProviderProfile: provider.ProfileStandard,
-			HTTPTimeout:     5 * time.Second,
-			ResultBudget:    5 * time.Second,
-			LeaseDuration:   30 * time.Second,
-			InFlight:        20,
-			IdleWait:        200 * time.Millisecond,
-			ShutdownBudget:  10 * time.Second,
-			LogLevel:        slog.LevelInfo,
+			DatabaseURL:      testURL,
+			ProviderURL:      testProviderURL,
+			ProviderProfile:  provider.ProfileStandard,
+			HTTPTimeout:      5 * time.Second,
+			ResultBudget:     5 * time.Second,
+			LeaseDuration:    30 * time.Second,
+			InFlight:         20,
+			IdleWait:         200 * time.Millisecond,
+			ShutdownBudget:   10 * time.Second,
+			LogLevel:         slog.LevelInfo,
+			MaxAttempts:      5,
+			BackoffBase:      2 * time.Second,
+			BackoffCap:       60 * time.Second,
+			RecoveryInterval: 5 * time.Second,
+			RecoveryBatch:    100,
 		}
 		if cfg != want {
 			t.Errorf("got %+v\nwant %+v", cfg, want)
@@ -180,6 +185,11 @@ func TestWorkerConfig(t *testing.T) {
 			"zero idle wait":                      {"IDLE_WAIT": "0s"},
 			"zero shutdown budget":                {"SHUTDOWN_BUDGET": "0s"},
 			"negative HTTP timeout":               {"HTTP_TIMEOUT": "-1s"},
+			"zero recovery interval":              {"RECOVERY_INTERVAL": "0s"},
+			"recovery batch below 1":              {"RECOVERY_BATCH": "0"},
+			"zero attempts":                       {"MAX_ATTEMPTS": "0"},
+			"backoff cap below base":              {"BACKOFF_BASE": "10s", "BACKOFF_CAP": "5s"},
+			"negative backoff base":               {"BACKOFF_BASE": "-1s"},
 		} {
 			vars := map[string]string{"DATABASE_URL": testURL, "PROVIDER_URL": testProviderURL}
 			for k, v := range extra {

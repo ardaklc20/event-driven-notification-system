@@ -20,7 +20,7 @@ type slowClaimer struct {
 	answeredAt time.Time
 }
 
-func (s *slowClaimer) ClaimNext(context.Context, time.Duration) (domain.Claim, bool, error) {
+func (s *slowClaimer) ClaimNext(context.Context, time.Duration, int) (domain.Claim, bool, error) {
 	s.calledAt = time.Now()
 	time.Sleep(s.delay)
 	s.answeredAt = time.Now()
@@ -35,6 +35,14 @@ func (s *slowClaimer) MarkFailed(context.Context, string, string, string) (bool,
 	return false, errors.New("not used")
 }
 
+func (s *slowClaimer) MarkRetry(context.Context, string, string, string, time.Duration) (bool, error) {
+	return false, errors.New("not used")
+}
+
+func (s *slowClaimer) RecoverExpired(context.Context, int, int) ([]domain.Recovered, error) {
+	return nil, errors.New("not used")
+}
+
 // TestLeaseDeadlineFromClaimStart: the claim takes 1 second and returns a
 // remaining lease of 30 seconds. The deadline must come from the time read
 // before the claim was sent, never from the time its answer arrived (K3).
@@ -44,7 +52,7 @@ func TestLeaseDeadlineFromClaimStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const remaining = 30 * time.Second
 		store := &slowClaimer{delay: time.Second, remaining: remaining}
-		w := New(store, nil, slog.New(slog.DiscardHandler), Config{LeaseDuration: remaining})
+		w := New(store, nil, slog.New(slog.DiscardHandler), Config{LeaseDuration: remaining, MaxAttempts: 5})
 
 		c, ok, err := w.claim(t.Context())
 		if err != nil || !ok {
