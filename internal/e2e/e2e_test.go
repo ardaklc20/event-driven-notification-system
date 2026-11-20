@@ -115,11 +115,17 @@ func newStack(t *testing.T, answer http.HandlerFunc) *stack {
 
 	logger := slog.New(slog.NewJSONHandler(s.workerLogs, nil)).With(slog.String("worker_id", "e2e-worker"))
 	w := worker.New(postgres.NewStore(s.pool), provider.NewClient(providerSrv.URL+"/", 5*time.Second, 4), logger, worker.Config{
-		LeaseDuration:  15 * time.Second,
-		ResultBudget:   5 * time.Second,
-		InFlight:       4,
-		IdleWait:       20 * time.Millisecond,
-		ShutdownBudget: 10 * time.Second,
+		Profile:          provider.ProfileStandard,
+		LeaseDuration:    15 * time.Second,
+		ResultBudget:     5 * time.Second,
+		InFlight:         4,
+		IdleWait:         20 * time.Millisecond,
+		ShutdownBudget:   10 * time.Second,
+		MaxAttempts:      5,
+		BackoffBase:      0,
+		BackoffCap:       0,
+		RecoveryInterval: time.Second,
+		RecoveryBatch:    100,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

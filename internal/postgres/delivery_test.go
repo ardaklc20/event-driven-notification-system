@@ -13,7 +13,10 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/testdb"
 )
 
-const testLease = 30 * time.Second
+const (
+	testLease   = 30 * time.Second
+	maxAttempts = 5
+)
 
 // insertQueued inserts n queued notifications and returns their IDs.
 func insertQueued(t *testing.T, pool *pgxpool.Pool, n int) []string {
@@ -43,7 +46,7 @@ func insertQueued(t *testing.T, pool *pgxpool.Pool, n int) []string {
 
 func mustClaim(t *testing.T, store *postgres.Store) domain.Claim {
 	t.Helper()
-	c, ok, err := store.ClaimNext(t.Context(), testLease)
+	c, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts)
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -100,7 +103,7 @@ func TestClaimSetsLease(t *testing.T) {
 		t.Fatalf("lease expiry in the future = %v (err %v)", inFuture, err)
 	}
 
-	if _, ok, err := store.ClaimNext(t.Context(), testLease); ok || err != nil {
+	if _, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts); ok || err != nil {
 		t.Fatalf("second claim on an empty queue: ok=%v err=%v", ok, err)
 	}
 }
@@ -129,7 +132,7 @@ func TestSingleLease(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			for {
-				c, ok, err := store.ClaimNext(ctx, testLease)
+				c, ok, err := store.ClaimNext(ctx, testLease, maxAttempts)
 				if err != nil {
 					errs[i] = err
 					return
@@ -274,5 +277,195 @@ func TestDuplicateMessageID(t *testing.T) {
 		if r.status != "sent" || r.messageID == nil || *r.messageID != acc.MessageID || r.timestamp != nil {
 			t.Fatalf("row %s = %+v, want sent with the shared messageId and no timestamp", id, r)
 		}
+	}
+}
+
+// expire ends the row's lease by the database clock.
+func expire(t *testing.T, pool *pgxpool.Pool, id string) {
+	t.Helper()
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE notifications SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func recoverAll(t *testing.T, store *postgres.Store) []domain.Recovered {
+	t.Helper()
+	got, err := store.RecoverExpired(t.Context(), maxAttempts, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// TestRetryWrite: a temporary failure goes back to queued, due after the wait
+// by the database clock, and the claim skips it until then (K7).
+func TestRetryWrite(t *testing.T) {
+	pool := testdb.New(t)
+	store := postgres.NewStore(pool)
+	id := insertQueued(t, pool, 1)[0]
+	c := mustClaim(t, store)
+
+	changed, err := store.MarkRetry(t.Context(), id, c.LeaseToken, "temporary: status 503", 2*time.Second)
+	if err != nil || !changed {
+		t.Fatalf("mark retry: changed=%v err=%v", changed, err)
+	}
+	r := readLease(t, pool, id)
+	if r.status != "queued" || r.token != nil || r.expires != nil || r.attempts != 1 ||
+		r.lastError == nil || *r.lastError != "temporary: status 503" {
+		t.Fatalf("row = %+v, want queued, no lease, attempts 1, last_error kept", r)
+	}
+	var wait time.Duration
+	if err := pool.QueryRow(t.Context(),
+		`SELECT available_at - updated_at FROM notifications WHERE id = $1::uuid`, id).Scan(&wait); err != nil {
+		t.Fatal(err)
+	}
+	if wait != 2*time.Second {
+		t.Fatalf("available_at is %s after the write, want 2s", wait)
+	}
+	if _, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts); ok || err != nil {
+		t.Fatalf("claimed a retry before its time: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestClaimAttemptLimit: a row that has used its attempts is never claimed
+// again (K9).
+func TestClaimAttemptLimit(t *testing.T) {
+	pool := testdb.New(t)
+	store := postgres.NewStore(pool)
+	insertQueued(t, pool, 1)
+	if _, err := pool.Exec(t.Context(), `UPDATE notifications SET attempts = $1`, maxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts); ok || err != nil {
+		t.Fatalf("claimed a row with %d attempts: ok=%v err=%v", maxAttempts, ok, err)
+	}
+}
+
+// TestExpiredLeaseCannotOverwrite: A's lease expires, recovery takes the row
+// back, B claims it. A's late writes change nothing and B's lease stays (R11,
+// K3 test 2).
+func TestExpiredLeaseCannotOverwrite(t *testing.T) {
+	pool := testdb.New(t)
+	store := postgres.NewStore(pool)
+	ctx := t.Context()
+	id := insertQueued(t, pool, 1)[0]
+
+	a := mustClaim(t, store)
+	expire(t, pool, id)
+	if got := recoverAll(t, store); len(got) != 1 || got[0].Status != domain.StatusQueued {
+		t.Fatalf("recovered %+v, want the row back in queued", got)
+	}
+	b := mustClaim(t, store)
+	if b.ID != id || b.LeaseToken == a.LeaseToken || b.Attempt != 2 {
+		t.Fatalf("B's claim %+v, want the same row with a new token and attempt 2", b)
+	}
+
+	for name, write := range map[string]func() (bool, error){
+		"sent": func() (bool, error) {
+			return store.MarkSent(ctx, id, a.LeaseToken, domain.Acceptance{MessageID: "late"})
+		},
+		"failed": func() (bool, error) { return store.MarkFailed(ctx, id, a.LeaseToken, "late") },
+		"retry":  func() (bool, error) { return store.MarkRetry(ctx, id, a.LeaseToken, "late", 0) },
+	} {
+		if changed, err := write(); err != nil || changed {
+			t.Errorf("A's late %s write: changed=%v err=%v, want no row changed", name, changed, err)
+		}
+	}
+	r := readLease(t, pool, id)
+	if r.status != "processing" || r.token == nil || *r.token != b.LeaseToken || r.sentAt != nil || r.messageID != nil || r.attempts != 2 {
+		t.Fatalf("row = %+v, want B's processing lease untouched", r)
+	}
+}
+
+// TestStaleWriteAfterRecovery: the fifth attempt's lease expires and recovery
+// fails the row; the old worker's 202 write, with a fresh context, changes 0
+// rows (K3, K9).
+func TestStaleWriteAfterRecovery(t *testing.T) {
+	pool := testdb.New(t)
+	store := postgres.NewStore(pool)
+	id := insertQueued(t, pool, 1)[0]
+	if _, err := pool.Exec(t.Context(), `UPDATE notifications SET attempts = $1 - 1`, maxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	c, ok, err := store.ClaimNext(t.Context(), 200*time.Millisecond, maxAttempts)
+	if err != nil || !ok || c.Attempt != maxAttempts {
+		t.Fatalf("claim: %+v ok=%v err=%v, want attempt %d", c, ok, err, maxAttempts)
+	}
+	time.Sleep(300 * time.Millisecond) // the short lease expires by the database clock
+	got := recoverAll(t, store)
+	if len(got) != 1 || got[0].Status != domain.StatusFailed || got[0].Attempts != maxAttempts {
+		t.Fatalf("recovered %+v, want the row failed after its last attempt", got)
+	}
+
+	changed, err := store.MarkSent(context.Background(), id, c.LeaseToken,
+		domain.Acceptance{MessageID: "late", Timestamp: time.Now()})
+	if err != nil || changed {
+		t.Fatalf("late 202 write: changed=%v err=%v, want 0 rows", changed, err)
+	}
+	r := readLease(t, pool, id)
+	if r.status != "failed" || r.sentAt != nil || r.messageID != nil || r.timestamp != nil ||
+		r.lastError == nil || *r.lastError != postgres.RecoveredError {
+		t.Fatalf("row = %+v, want failed by recovery with no sent_at and no provider fields", r)
+	}
+}
+
+// TestRecoveryConcurrent: two recovery statements with a batch of 100 run at
+// the same time on separate pools over 150 expired leases. Every row changes
+// exactly once (K40).
+func TestRecoveryConcurrent(t *testing.T) {
+	pool := testdb.New(t)
+	other, err := pgxpool.New(t.Context(), pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(other.Close)
+
+	const rows = 150
+	insertQueued(t, pool, rows)
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE notifications SET status = 'processing', attempts = 2, lease_token = gen_random_uuid(),
+		        lease_expires_at = clock_timestamp() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+
+	results := make([][]domain.Recovered, 2)
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, p := range []*pgxpool.Pool{pool, other} {
+		store := postgres.NewStore(p)
+		wg.Go(func() {
+			<-start
+			results[i], errs[i] = store.RecoverExpired(t.Context(), maxAttempts, 100)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	seen := map[string]int{}
+	for i := range results {
+		if errs[i] != nil {
+			t.Fatalf("recovery %d: %v", i, errs[i])
+		}
+		if len(results[i]) > 100 {
+			t.Fatalf("recovery %d changed %d rows, more than its batch", i, len(results[i]))
+		}
+		for _, r := range results[i] {
+			seen[r.ID]++
+		}
+	}
+	t.Logf("recovery 0 changed %d rows, recovery 1 changed %d", len(results[0]), len(results[1]))
+	if len(seen) != rows || len(results[0])+len(results[1]) != rows {
+		t.Fatalf("%d distinct rows in %d changes, want %d once each", len(seen), len(results[0])+len(results[1]), rows)
+	}
+	var queued int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM notifications
+		 WHERE status = 'queued' AND lease_token IS NULL AND lease_expires_at IS NULL AND attempts = 2`).Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued != rows {
+		t.Fatalf("%d rows queued with no lease and attempts unchanged, want %d", queued, rows)
 	}
 }

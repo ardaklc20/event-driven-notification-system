@@ -4,7 +4,7 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 3):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Retries arrive in slice 4: until then, any provider answer other than `202`, and any network error or timeout, ends the notification as `failed` on its first attempt.
+**Current state (slice 4):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires.
 
 ## Requirements
 
@@ -53,6 +53,8 @@ client ──POST /notifications──► api ──INSERT──► notification
 - The `notifications` table is the queue. A worker claims the oldest due `queued` row with `FOR UPDATE SKIP LOCKED` and, in the same statement, puts it under a lease: `processing`, a new `lease_token`, `lease_expires_at` 30 seconds ahead and `attempts + 1`. Several workers can run against the same table (`docker compose up --scale worker=2`); a notification has one valid lease at a time.
 - The worker posts `{to, channel, content}` to `PROVIDER_URL` with the notification's `X-Correlation-ID`, a 5-second timeout and no redirects. The call ends at least `RESULT_BUDGET` before the lease does.
 - The result is written only while the row is still `processing` under the same token and the lease has not expired by the database clock. A `202` ends as `sent` with `provider_message_id`, `provider_timestamp` and `sent_at`. A `202` whose body is broken, or never finishes arriving, still ends as `sent`, with those fields empty and a warning in the log: the provider accepted the notification, and a second POST could deliver it twice.
+- A temporary failure goes back to `queued` with a later `available_at`; a permanent one ends as `failed` ([Retries and failures](#retries-and-failures)).
+- Every worker also takes back leases that expired because their worker crashed or stalled.
 - On `SIGTERM` the worker stops claiming at once, lets the calls in flight finish and write their results, and exits within 10 seconds.
 
 ### Follow a notification to `sent`
@@ -65,7 +67,26 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, attempts, provi
 docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 ```
 
-The worker writes two JSON lines per attempt: `provider call started` before the POST, and `provider call finished` after it with `status_code`, `duration_ms` and `outcome`. Both carry `worker_id`, `correlation_id`, `notification_id`, `channel` and `attempt`. Recipients and content are never logged.
+The worker writes two JSON lines per attempt: `provider call started` before the POST, and `provider call finished` after it with `status_code`, `duration_ms`, `class` and `outcome` (`sent`, `queued` for a retry, or `failed`). Both carry `worker_id`, `correlation_id`, `notification_id`, `channel` and `attempt`. Recipients and content are never logged.
+
+## Retries and failures
+
+Each attempt's result is classified, and the notification's next state follows from the class:
+
+| Provider answer | Class | What happens |
+|---|---|---|
+| `202` | accepted | `sent`, on any attempt, the fifth included |
+| Network error, timeout, `408`, `500`, `502`, `503`, `504` | temporary | Back to `queued` with a later `available_at`; `failed` after the fifth attempt |
+| `429` | temporary under `standard`; permanent under `webhook_site_free` | A free webhook.site URL answers `429` only when its request quota is used up, and waiting does not reopen it, so that profile stops at once |
+| `400`, `501` | permanent | `failed` on this attempt, whatever attempts are left |
+| Any other code: another `2xx`, a `3xx` (redirects are never followed), another `4xx` or `5xx` | terminal | `failed` on this attempt and never retried: an unexpected `2xx` may mean the provider processed the request |
+
+- **Backoff:** the n-th retry waits a random time between 0 and min(60 s, 2 s × 2^(n−1)) (full jitter). A valid `Retry-After`, in seconds or as an HTTP date, that asks for longer wins, even beyond 60 s. The wait is written to `available_at` in PostgreSQL, so a waiting retry holds no worker and survives a restart.
+- **`last_error`** reads `<class>: <detail>`, for example `temporary: status 503`, `permanent: status 400` or `terminal: unexpected status 200`.
+- **Attempts** are counted when a worker claims the notification, so an attempt counts even if the worker crashes right after its POST. At most five attempts are made.
+- **Crash recovery:** every `RECOVERY_INTERVAL` (5 s) each worker takes back at most `RECOVERY_BATCH` (100) notifications whose lease has expired by the database clock: back to `queued`, or `failed` if that was the fifth attempt, with `last_error` `temporary: lease expired before a result was written`. Workers recovering at the same time never take the same row. With a 30-second lease, a crashed worker's notification is expected back within about 35 seconds while any worker runs; nothing is recovered while no worker runs. A worker whose lease has ended can never change the row, and it does not start a POST it could not finish within its lease.
+- **What `failed` means:** the attempts ran out or the error was permanent. It does not prove the notification was never delivered: an earlier attempt may have timed out after the provider had already accepted it.
+- **Duplicates are possible:** this is not exactly-once delivery. When the outcome of an attempt is unclear, a retry can become a second send: for example, the provider accepts the request but its answer is lost or arrives after the timeout, or the worker receives `202` and crashes before writing it. webhook.site documents no deduplication. Repeated **API requests** never create a second notification when they carry the same `Idempotency-Key`.
 
 ## API
 
@@ -128,7 +149,32 @@ Compose points the worker at the `mockprovider` service by default, so the stack
 curl -s http://localhost:8081/stats | jq .
 ```
 
-The mock records when requests **arrive**, not when the worker starts them; its counters start from zero whenever the container starts. To slow it down: `MOCK_DELAY=3s docker compose up`. To send to another provider, set `PROVIDER_URL` and `PROVIDER_PROFILE` in the shell before `docker compose up`; the webhook.site check arrives in slice 4.
+The mock records when requests **arrive**, not when the worker starts them; its counters start from zero whenever the container starts. To slow it down: `MOCK_DELAY=3s docker compose up`. To send to another provider, set `PROVIDER_URL` and `PROVIDER_PROFILE` in the shell before `docker compose up`, for example `PROVIDER_URL=https://webhook.site/<token> PROVIDER_PROFILE=webhook_site_free docker compose up -d`.
+
+## webhook.site check
+
+[`scripts/webhook-check.sh`](scripts/webhook-check.sh) proves the integration against a real webhook.site URL:
+
+```bash
+docker compose stop          # the main stack; frees the host ports, keeps its volume
+scripts/webhook-check.sh; echo "exit=$?"
+docker compose start
+```
+
+It creates a free webhook.site URL that answers `202` with `{messageId, status, timestamp}` for this run, starts its own Compose project (empty database, one worker, `PROVIDER_PROFILE=webhook_site_free`), sends one synthetic notification and checks both sides: the notification is `sent` with the run's `messageId` and timestamp, and webhook.site received exactly one `POST` with the expected body and correlation ID. Any failed step prints `FAIL: <step>` and exits with 1; the last line of a good run is `PASS`. The project is removed on every exit. Anyone who knows a free URL can read what it received, so the script prints only the token's first group. webhook.site allows one new free URL per minute; a free URL accepts 100 requests and is deleted after 7 days.
+
+Last run (slice 4):
+
+```
+date:           2026-11-20T16:21:44Z
+url:            https://webhook.site/a05481b0-…
+correlation_id: wh-check-1795191694
+payload:        {"channel":"sms","content":"webhook.site check","to":"+905551234567"}
+status:         sent
+message_id:     msg-wh-check-1795191694
+PASS
+exit=0
+```
 
 ## Host ports
 
@@ -165,13 +211,18 @@ Each program reads typed environment variables and refuses to start with an inva
 |---|---|---|
 | `DATABASE_URL` | — (required, not empty) | PostgreSQL connection string |
 | `PROVIDER_URL` | — (required, not empty) | The one provider URL for every channel, absolute `http` or `https`; the channel travels in the body. Compose: `http://mockprovider:8081/` |
-| `PROVIDER_PROFILE` | `standard` | `standard` or `webhook_site_free`; decides how a `429` is retried once retries arrive (slice 4) |
+| `PROVIDER_PROFILE` | `standard` | `standard` or `webhook_site_free`; decides whether a `429` is retried ([Retries and failures](#retries-and-failures)) |
 | `HTTP_TIMEOUT` | `5s` | Limit of one provider call |
 | `RESULT_BUDGET` | `5s` | Part of the lease kept for writing the result; the call ends at least this long before the lease |
 | `LEASE_DURATION` | `30s` | How long a claim holds its notification; at least `HTTP_TIMEOUT + RESULT_BUDGET` |
 | `IN_FLIGHT` | `20` | Provider calls one worker runs at once |
 | `IDLE_WAIT` | `200ms` | Pause after a claim that found no due notification |
 | `SHUTDOWN_BUDGET` | `10s` | Wait for calls in flight after `SIGTERM` |
+| `MAX_ATTEMPTS` | `5` | Attempts in total, the first one included |
+| `BACKOFF_BASE` | `2s` | Backoff of the first retry; it doubles with each retry |
+| `BACKOFF_CAP` | `60s` | Longest backoff; a longer `Retry-After` still wins |
+| `RECOVERY_INTERVAL` | `5s` | How often the worker takes back expired leases |
+| `RECOVERY_BATCH` | `100` | Most expired leases taken back in one round |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 ### Mock provider settings
@@ -233,16 +284,16 @@ internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
 internal/service/       create and read rules
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, read, claim, result writes
-internal/worker/        claim loop, lease deadline, result handling
-internal/provider/      provider HTTP client
+internal/postgres/      connection pool and all SQL: create, read, claim, result writes, recovery
+internal/worker/        claim loop, lease deadline, retries and backoff, lease recovery
+internal/provider/      provider HTTP client, response classification, Retry-After
 internal/mockprovider/  mock provider handlers and /stats
 internal/e2e/           end-to-end tests: API, worker and a test provider on one database
 internal/testdb/        test helper: PostgreSQL container and one database per test
-migrations/         SQL migrations and the embed.go that embeds them
-api/openapi.yaml    generated OpenAPI document
-scripts/            stack check helpers
-docs/               requirements, decisions, plan, AI usage
+migrations/             SQL migrations and the embed.go that embeds them
+api/openapi.yaml        generated OpenAPI document
+scripts/                stack check helpers and the webhook.site check
+docs/                   requirements, decisions, plan, AI usage
 ```
 
 ## Documentation
@@ -258,7 +309,7 @@ docs/               requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 3):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Tekrar denemeler dilim 4'te gelir: o zamana kadar provider'ın `202` dışındaki her cevabı, her ağ hatası ve her zaman aşımı bildirimi ilk denemesinde `failed` olarak bitirir.
+**Şu anki durum (dilim 4):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır.
 
 ## Gereksinimler
 
@@ -307,6 +358,8 @@ istemci ──POST /notifications──► api ──INSERT──► notificatio
 - Kuyruk `notifications` tablosunun kendisidir. Worker, zamanı gelmiş en eski `queued` satırı `FOR UPDATE SKIP LOCKED` ile alır ve aynı ifadede onu bir lease altına koyar: `processing`, yeni bir `lease_token`, 30 saniye sonrası için `lease_expires_at` ve `attempts + 1`. Aynı tabloya karşı birden fazla worker çalışabilir (`docker compose up --scale worker=2`); bir bildirimin aynı anda tek bir geçerli lease'i olur.
 - Worker `{to, channel, content}` gövdesini, bildirimin `X-Correlation-ID`'siyle, 5 saniyelik zaman aşımıyla ve yönlendirmeleri izlemeden `PROVIDER_URL`'e POST eder. Çağrı, lease bitmeden en az `RESULT_BUDGET` önce sona erer.
 - Sonuç yalnızca satır hâlâ aynı token altında `processing` iken ve lease veritabanı saatine göre dolmamışken yazılır. `202`, `provider_message_id`, `provider_timestamp` ve `sent_at` ile `sent` olarak biter. Gövdesi bozuk olan ya da gelmesi hiç bitmeyen bir `202` de `sent` olarak biter; bu alanlar boş kalır ve log'a bir uyarı yazılır: provider bildirimi kabul etmiştir ve ikinci bir POST onu iki kez teslim edebilir.
+- Geçici bir hata bildirimi daha sonraki bir `available_at` ile `queued`'a döndürür; kalıcı bir hata `failed` ile bitirir ([Tekrar denemeler ve hatalar](#tekrar-denemeler-ve-hatalar)).
+- Her worker, worker'ı çöktüğü ya da takıldığı için süresi dolan lease'leri de geri alır.
 - `SIGTERM` gelince worker yeni iş almayı hemen bırakır, süren çağrıların bitip sonuçlarını yazmasına izin verir ve 10 saniye içinde çıkar.
 
 ### Bir bildirimi `sent` olana kadar izlemek
@@ -319,7 +372,26 @@ curl -s "http://localhost:8080/notifications/$ID" | jq '{status, attempts, provi
 docker compose logs --no-log-prefix worker | grep '"correlation_id":"demo-1"'
 ```
 
-Worker her deneme için iki JSON satırı yazar: POST'tan önce `provider call started`, sonra da `status_code`, `duration_ms` ve `outcome` ile `provider call finished`. İkisi de `worker_id`, `correlation_id`, `notification_id`, `channel` ve `attempt` taşır. Alıcılar ve içerik asla loglanmaz.
+Worker her deneme için iki JSON satırı yazar: POST'tan önce `provider call started`, sonra da `status_code`, `duration_ms`, `class` ve `outcome` (`sent`, tekrar deneme için `queued` ya da `failed`) ile `provider call finished`. İkisi de `worker_id`, `correlation_id`, `notification_id`, `channel` ve `attempt` taşır. Alıcılar ve içerik asla loglanmaz.
+
+## Tekrar denemeler ve hatalar
+
+Her denemenin sonucu sınıflandırılır ve bildirimin sonraki durumu sınıftan çıkar:
+
+| Provider cevabı | Sınıf | Ne olur |
+|---|---|---|
+| `202` | accepted | Beşinci dahil herhangi bir denemede `sent` |
+| Ağ hatası, zaman aşımı, `408`, `500`, `502`, `503`, `504` | temporary | Daha sonraki bir `available_at` ile `queued`'a döner; beşinci denemeden sonra `failed` |
+| `429` | `standard` altında temporary; `webhook_site_free` altında permanent | Ücretsiz bir webhook.site URL'i `429`'u yalnızca istek kotası bittiğinde döner ve beklemek kotayı açmaz; bu profil hemen durur |
+| `400`, `501` | permanent | Kalan deneme sayısı ne olursa olsun bu denemede `failed` |
+| Başka herhangi bir kod: başka bir `2xx`, bir `3xx` (yönlendirmeler hiç izlenmez), başka bir `4xx` ya da `5xx` | terminal | Bu denemede `failed` ve hiç tekrar denenmez: beklenmeyen bir `2xx`, provider'ın isteği işlediği anlamına gelebilir |
+
+- **Backoff:** n'inci tekrar deneme 0 ile min(60 s, 2 s × 2^(n−1)) arasında rastgele bir süre bekler (full jitter). Saniye ya da HTTP tarihi olarak geçerli bir `Retry-After` daha uzun bir süre isterse o kazanır, 60 saniyeyi aşsa bile. Bekleme PostgreSQL'de `available_at`'e yazılır; böylece bekleyen bir tekrar deneme hiçbir worker'ı tutmaz ve yeniden başlatmadan etkilenmez.
+- **`last_error`** `<sınıf>: <ayrıntı>` biçimindedir, örneğin `temporary: status 503`, `permanent: status 400` ya da `terminal: unexpected status 200`.
+- **Denemeler** worker bildirimi claim ettiği anda sayılır; worker POST'undan hemen sonra çökse bile deneme sayılmış olur. En fazla beş deneme yapılır.
+- **Çökme sonrası kurtarma:** her `RECOVERY_INTERVAL`'de (5 s) her worker, lease'i veritabanı saatine göre dolmuş en fazla `RECOVERY_BATCH` (100) bildirimi geri alır: `queued`'a, beşinci denemeyse `failed`'a, `last_error` `temporary: lease expired before a result was written` ile. Aynı anda kurtarma yapan worker'lar asla aynı satırı almaz. 30 saniyelik lease ile, herhangi bir worker çalıştığı sürece çöken bir worker'ın bildiriminin yaklaşık 35 saniye içinde geri gelmesi beklenir; hiçbir worker çalışmıyorsa hiçbir şey geri alınmaz. Lease'i bitmiş bir worker satırı asla değiştiremez ve lease'i içinde bitiremeyeceği bir POST'a başlamaz.
+- **`failed` ne demek:** denemeler bitti ya da hata kalıcıydı. Bildirimin hiç teslim edilmediğini kanıtlamaz: daha önceki bir deneme, provider isteği kabul ettikten sonra zaman aşımına uğramış olabilir.
+- **Tekrar gönderim mümkün:** bu tam olarak bir kez (exactly-once) teslim değildir. Bir denemenin sonucu belirsiz olduğunda tekrar deneme ikinci bir gönderim olabilir: örneğin provider isteği kabul eder ama cevabı kaybolur ya da zaman aşımından sonra gelir, veya worker `202` alır ve onu yazmadan çöker. webhook.site herhangi bir tekilleştirme belgelemiyor. Aynı `Idempotency-Key`'i taşıyan tekrarlanan **API istekleri** ise asla ikinci bir bildirim oluşturmaz.
 
 ## API
 
@@ -382,7 +454,32 @@ Compose worker'ı varsayılan olarak `mockprovider` servisine yönlendirir; böy
 curl -s http://localhost:8081/stats | jq .
 ```
 
-Mock isteklerin **geliş** anını kaydeder, worker'ın onları başlattığı anı değil; sayaçları container her başladığında sıfırdan başlar. Yavaşlatmak için: `MOCK_DELAY=3s docker compose up`. Başka bir provider'a göndermek için `docker compose up`'tan önce shell'de `PROVIDER_URL` ve `PROVIDER_PROFILE` verilir; webhook.site kontrolü dilim 4'te gelir.
+Mock isteklerin **geliş** anını kaydeder, worker'ın onları başlattığı anı değil; sayaçları container her başladığında sıfırdan başlar. Yavaşlatmak için: `MOCK_DELAY=3s docker compose up`. Başka bir provider'a göndermek için `docker compose up`'tan önce shell'de `PROVIDER_URL` ve `PROVIDER_PROFILE` verilir, örneğin `PROVIDER_URL=https://webhook.site/<token> PROVIDER_PROFILE=webhook_site_free docker compose up -d`.
+
+## webhook.site kontrolü
+
+[`scripts/webhook-check.sh`](scripts/webhook-check.sh) entegrasyonu gerçek bir webhook.site URL'ine karşı kanıtlar:
+
+```bash
+docker compose stop          # ana stack; host portlarını boşaltır, volume'ünü korur
+scripts/webhook-check.sh; echo "exit=$?"
+docker compose start
+```
+
+Script, bu çalıştırmaya ait `{messageId, status, timestamp}` ile `202` dönen ücretsiz bir webhook.site URL'i oluşturur, kendi Compose projesini başlatır (boş veritabanı, tek worker, `PROVIDER_PROFILE=webhook_site_free`), tek bir sentetik bildirim gönderir ve iki tarafı da kontrol eder: bildirim çalıştırmanın `messageId`'si ve timestamp'iyle `sent` olur, webhook.site da beklenen gövde ve correlation ID ile tam olarak bir `POST` almıştır. Başarısız her adım `FAIL: <adım>` yazar ve 1 ile çıkar; başarılı bir çalıştırmanın son satırı `PASS`'tir. Proje her çıkışta silinir. Ücretsiz bir URL'i bilen herkes aldıklarını okuyabildiği için script token'ın yalnızca ilk grubunu yazar. webhook.site dakikada bir yeni ücretsiz URL'e izin verir; ücretsiz bir URL 100 istek kabul eder ve 7 gün sonra silinir.
+
+Son çalıştırma (dilim 4):
+
+```
+date:           2026-11-20T16:21:44Z
+url:            https://webhook.site/a05481b0-…
+correlation_id: wh-check-1795191694
+payload:        {"channel":"sms","content":"webhook.site check","to":"+905551234567"}
+status:         sent
+message_id:     msg-wh-check-1795191694
+PASS
+exit=0
+```
 
 ## Host portları
 
@@ -419,13 +516,18 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 |---|---|---|
 | `DATABASE_URL` | — (zorunlu, boş olamaz) | PostgreSQL bağlantı adresi |
 | `PROVIDER_URL` | — (zorunlu, boş olamaz) | Bütün kanallar için tek provider URL'i, mutlak `http` ya da `https`; kanal gövdede gider. Compose: `http://mockprovider:8081/` |
-| `PROVIDER_PROFILE` | `standard` | `standard` ya da `webhook_site_free`; tekrar denemeler gelince (dilim 4) bir `429`'un nasıl ele alınacağını belirler |
+| `PROVIDER_PROFILE` | `standard` | `standard` ya da `webhook_site_free`; bir `429`'un tekrar denenip denenmeyeceğini belirler ([Tekrar denemeler ve hatalar](#tekrar-denemeler-ve-hatalar)) |
 | `HTTP_TIMEOUT` | `5s` | Tek bir provider çağrısının sınırı |
 | `RESULT_BUDGET` | `5s` | Lease'in sonucu yazmak için ayrılan kısmı; çağrı lease'ten en az bu kadar önce biter |
 | `LEASE_DURATION` | `30s` | Bir claim'in bildirimi ne kadar tuttuğu; en az `HTTP_TIMEOUT + RESULT_BUDGET` |
 | `IN_FLIGHT` | `20` | Bir worker'ın aynı anda yürüttüğü provider çağrısı sayısı |
 | `IDLE_WAIT` | `200ms` | Zamanı gelmiş bildirim bulamayan bir claim'den sonraki bekleme |
 | `SHUTDOWN_BUDGET` | `10s` | `SIGTERM` sonrasında süren çağrılar için bekleme |
+| `MAX_ATTEMPTS` | `5` | İlki dahil toplam deneme sayısı |
+| `BACKOFF_BASE` | `2s` | İlk tekrar denemenin backoff'u; her tekrar denemede iki katına çıkar |
+| `BACKOFF_CAP` | `60s` | En uzun backoff; daha uzun bir `Retry-After` yine kazanır |
+| `RECOVERY_INTERVAL` | `5s` | Worker'ın süresi dolan lease'leri ne sıklıkla geri aldığı |
+| `RECOVERY_BATCH` | `100` | Bir turda geri alınan en fazla lease sayısı |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ya da `error` |
 
 ### Mock provider ayarları
@@ -487,16 +589,16 @@ internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
 internal/service/       oluşturma ve okuma kuralları
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, claim, sonuç yazma
-internal/worker/        claim döngüsü, lease bitiş anı, sonuçların işlenmesi
-internal/provider/      provider HTTP istemcisi
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, claim, sonuç yazma, kurtarma
+internal/worker/        claim döngüsü, lease bitiş anı, tekrar denemeler ve backoff, lease kurtarma
+internal/provider/      provider HTTP istemcisi, cevap sınıflandırması, Retry-After
 internal/mockprovider/  mock provider handler'ları ve /stats
 internal/e2e/           uçtan uca testler: API, worker ve bir test provider'ı tek veritabanında
 internal/testdb/        test yardımcısı: PostgreSQL container'ı ve test başına bir veritabanı
-migrations/         SQL migration'ları ve onları gömen embed.go
-api/openapi.yaml    üretilmiş OpenAPI dokümanı
-scripts/            stack kontrolü yardımcıları
-docs/               gereksinimler, kararlar, plan, yapay zekâ kullanımı
+migrations/             SQL migration'ları ve onları gömen embed.go
+api/openapi.yaml        üretilmiş OpenAPI dokümanı
+scripts/                stack kontrolü yardımcıları ve webhook.site kontrolü
+docs/                   gereksinimler, kararlar, plan, yapay zekâ kullanımı
 ```
 
 ## Dokümantasyon

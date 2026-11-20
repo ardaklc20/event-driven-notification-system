@@ -18,7 +18,7 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 )
 
-// Profile decides how the provider's 429 is handled (K7, K14). Slice 4 uses it.
+// Profile decides how the provider's 429 is handled (K7, K14).
 type Profile string
 
 // The two profiles.
@@ -57,6 +57,9 @@ type requestBody struct {
 // Response is what the provider answered.
 type Response struct {
 	StatusCode int
+	// RetryAfter is the raw Retry-After header of a response other than 202,
+	// or "" (K7).
+	RetryAfter string
 	// Acceptance is the decoded 202 body; empty for any other status.
 	Acceptance domain.Acceptance
 	// BodyProblem says why a 202 body could not be used in full, or "". The
@@ -90,8 +93,20 @@ func NewClient(providerURL string, timeout time.Duration, maxIdleConns int) *Cli
 	}
 }
 
+// TransportError means the call produced no status line: a network error or
+// a timeout. The provider may still have processed the request (K3).
+type TransportError struct {
+	Err error
+}
+
+func (e *TransportError) Error() string { return "provider call: " + e.Err.Error() }
+
+// Unwrap returns the cause, so errors.Is(err, context.DeadlineExceeded) works.
+func (e *TransportError) Unwrap() error { return e.Err }
+
 // Send posts req. The call ends at the earlier of ctx's deadline and the
-// client's timeout. An error means no status line arrived. Once a 202 status
+// client's timeout. A *TransportError means no status line arrived; any other
+// error means the request could not be built. Once a 202 status
 // line has arrived, Send never returns an error: a body that is broken, or
 // that stops arriving before the deadline, only sets BodyProblem.
 func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
@@ -118,14 +133,14 @@ func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
 		if errors.As(err, &urlErr) {
 			err = urlErr.Err
 		}
-		return Response{}, fmt.Errorf("provider call: %w", err)
+		return Response{}, &TransportError{Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusAccepted {
 		// Read a little so the connection can be reused; the body is not used.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-		return Response{StatusCode: resp.StatusCode}, nil
+		return Response{StatusCode: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}, nil
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))

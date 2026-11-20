@@ -48,7 +48,7 @@ Every slice passes all of these before its pull request is merged.
 | 1 | [Walking skeleton](slices/01-walking-skeleton.md) | Core + B6 | R16, D3, D4, D5, D6, B6 | K1, K6, K8, K16, K17, K18, K19, K21, K22, K23, K28, K29, K30, K31, K32, K36, K37, K38, K39 | — | `feat/skeleton` | done ([#8](https://github.com/ardaklc20/event-driven-notification-system/pull/8)) |
 | 2 | [Create and read a notification](slices/02-create-and-read.md) | Core | R1, R3, R10, R11, R15, D4 | K2, K9, K10, K11, K16, K17, K19, K21, K36 | 1 | `feat/create-notification` | done ([#9](https://github.com/ardaklc20/event-driven-notification-system/pull/9)) |
 | 3 | [Delivery to the provider](slices/03-delivery.md) | Core | R7, R11, R12, R13, R15, N2, A2 | K2, K3, K6, K9, K14, K15, K21, K23, K31, K32, K39 | 2 | `feat/delivery` | done ([#10](https://github.com/ardaklc20/event-driven-notification-system/pull/10)) |
-| 4 | [Retries and crash recovery](slices/04-retries-and-recovery.md) | Core | R11, R12, R13, N3 | K3, K7, K9, K14, K15, K21, K31, K32, K39, K40, K41 | 3 | `feat/retries-recovery` | planned |
+| 4 | [Retries and crash recovery](slices/04-retries-and-recovery.md) | Core | R11, R12, R13, N3 | K3, K7, K9, K14, K15, K21, K31, K32, K39, K40, K41 | 3 | `feat/retries-recovery` | done ([#11](https://github.com/ardaklc20/event-driven-notification-system/pull/11)) |
 | 5 | [Rate limit and priority](slices/05-rate-limit-and-priority.md) | Core | R8, R9, N1, N2 | K2, K5, K6, K8, K14, K21, K32, K42, K43 | 4 | `feat/rate-limit-priority` | planned |
 | 6 | [Cancellation](slices/06-cancellation.md) | Core | R5 | K5, K9, K22 | 5 | `feat/cancel` | planned |
 | 7 | [Listing](slices/07-listing.md) | Core | R6 | K13, K17, K19, K44 | 2 | `feat/listing` | planned |

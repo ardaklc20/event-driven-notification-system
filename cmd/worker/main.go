@@ -1,5 +1,6 @@
-// Command worker claims queued notifications and delivers them to the
-// provider (K2, K3, K6). Several copies can run against the same database:
+// Command worker claims queued notifications, delivers them to the provider,
+// retries temporary failures and takes back expired leases (K2, K3, K6, K7,
+// K40). Several copies can run against the same database:
 //
 //	docker compose up --scale worker=2
 //
@@ -54,11 +55,17 @@ func run() int {
 		slog.String("http_timeout", cfg.HTTPTimeout.String()))
 	client := provider.NewClient(cfg.ProviderURL, cfg.HTTPTimeout, cfg.InFlight)
 	w := worker.New(postgres.NewStore(pool), client, logger, worker.Config{
-		LeaseDuration:  cfg.LeaseDuration,
-		ResultBudget:   cfg.ResultBudget,
-		InFlight:       cfg.InFlight,
-		IdleWait:       cfg.IdleWait,
-		ShutdownBudget: cfg.ShutdownBudget,
+		Profile:          cfg.ProviderProfile,
+		LeaseDuration:    cfg.LeaseDuration,
+		ResultBudget:     cfg.ResultBudget,
+		InFlight:         cfg.InFlight,
+		IdleWait:         cfg.IdleWait,
+		ShutdownBudget:   cfg.ShutdownBudget,
+		MaxAttempts:      cfg.MaxAttempts,
+		BackoffBase:      cfg.BackoffBase,
+		BackoffCap:       cfg.BackoffCap,
+		RecoveryInterval: cfg.RecoveryInterval,
+		RecoveryBatch:    cfg.RecoveryBatch,
 	})
 
 	// After the first signal, a second one terminates the process at once.

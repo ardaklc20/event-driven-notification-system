@@ -76,6 +76,11 @@ services:
       IN_FLIGHT: "20"
       IDLE_WAIT: 200ms
       SHUTDOWN_BUDGET: 10s
+      MAX_ATTEMPTS: "5"
+      BACKOFF_BASE: 2s
+      BACKOFF_CAP: 60s
+      RECOVERY_INTERVAL: 5s
+      RECOVERY_BATCH: "100"
       LOG_LEVEL: info
     depends_on:
       postgres:
