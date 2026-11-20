@@ -4,7 +4,9 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 9):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel.
+One image holds four programs, each a Compose service: `api` (the HTTP API), `worker` (claims and delivers notifications; several can run), `migrate` (applies the database migrations and exits) and `mockprovider` (a local stand-in for the external provider). There is no message broker: the `notifications` table in PostgreSQL is the queue.
+
+**Current state (core complete, slice 10):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel.
 
 ## Requirements
 
@@ -56,6 +58,14 @@ client ──POST /notifications──► api ──INSERT──► notification
 - A temporary failure goes back to `queued` with a later `available_at`; a permanent one ends as `failed` ([Retries and failures](#retries-and-failures)).
 - Every worker also takes back leases that expired because their worker crashed or stalled.
 - On `SIGTERM` the worker stops claiming at once, lets the calls in flight finish and write their results, and exits within 10 seconds.
+
+### Claim, lease and permit
+
+**Claim.** A worker takes work with one SQL statement per channel. It locks the channel's row in `channel_limits` and the channel's next due `queued` notification, both with `SKIP LOCKED`, so two workers never wait for each other and never take the same row. The notification order is `high`, `normal`, `low`, then the earliest `available_at`, then the lowest ID. The claim counts the attempt at once (`attempts + 1`), so a worker that crashes mid-send still used one of the five attempts.
+
+**Lease.** The claimed row becomes `processing` with a new `lease_token` and a `lease_expires_at` 30 seconds ahead by the database clock. Every result write (`sent`, `failed`, back to `queued`) needs the same token and an unexpired lease, so a worker that stalled past its lease can no longer change the row. Every worker regularly takes back expired leases: the row goes back to `queued`, or to `failed` after its last attempt. A notification therefore has one valid lease at a time, but the provider may receive it twice when an outcome was unclear ([Known limits](#known-limits)).
+
+**Permit.** The same statement takes the channel's permit: it claims only when `next_permit_at` has come and then moves it 11 ms ahead. The send must start within 100 ms of its permit or it is not sent and the notification goes back to `queued`. Together these bound every channel to 100 send starts in any one-second window across all workers ([Rate limit and priority](#rate-limit-and-priority)).
 
 ### Follow a notification to `sent`
 
@@ -421,6 +431,33 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull request and every push to `main`: golangci-lint, `go test -count=1 -race ./...`, the OpenAPI check and `docker build`. Each job tests the pull request's head commit and logs it as `tested-sha`. There is no delivery step: Compose builds the image locally.
 
+## Release check
+
+[`scripts/release-check.sh`](scripts/release-check.sh) checks a pull request the way a reviewer would meet it: it clones the pull request's head commit into a new temporary folder and, in its own Compose project, checks the merge-commit history of `main`, the one-command start, a second migration run that applies nothing, the served OpenAPI paths and responses, `go test -count=1 ./...` without cached results, and the CI run for that commit. It needs the main stack's ports free, prints `PASS` and leaves its stack running for the README commands; `--cleanup` with the file it wrote removes that stack and clone only after checking that they belong to the run. The full procedure is in [slice 10](docs/slices/10-core-release-check.md#release-check).
+
+## Known limits
+
+- **No authentication** (A1). Anyone who reaches the API can create, read, list and cancel notifications. For that reason Compose publishes every port on `127.0.0.1` only.
+- **Duplicate sends are possible** ([K3](docs/DECISIONS.md#k3--delivery-guarantee-a-durable-queue-lease-recovery-and-bounded-retries)). Delivery is at least once. When the outcome of a call is unclear (a timeout, a `500` or `504` after the provider may have acted, or a worker that crashes after the `202` and before writing it), the notification is retried and the provider can receive it twice. The provider is not asked to deduplicate; webhook.site documents no such feature.
+- **Idempotency keys are global and kept as long as their record** ([K10](docs/DECISIONS.md#k10--idempotency-key-an-optional-idempotency-key-header-one-key-per-create-request)). Without authentication there is no client to scope them to, and nothing expires them.
+- **The SMS limit counts code points, not segments** ([K11](docs/DECISIONS.md#k11--validation-one-set-of-rules-at-the-api-limits-counted-in-unicode-code-points)). 160 code points fit one segment only in the GSM-7 set.
+- **`low` can starve** ([K8](docs/DECISIONS.md#k8--priority-strict-order-within-each-channel)). Priority is strict within a channel; `GET /metrics` shows the age of the oldest ready notification per priority.
+- **Listing pages are not one snapshot** ([K13](docs/DECISIONS.md#k13--listing-filter-dates-on-created_at-paginate-with-a-created_at-id-cursor)). A notification whose status changes between pages can move into or out of a filtered list.
+- **`provider_message_id` is not unique** ([K15](docs/DECISIONS.md#k15--provider-response-store-messageid-and-timestamp)). A provider with a static response gives every notification the same ID.
+- **What the rate-limit measurement proves** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). The limit is on send starts at the worker. A remote provider sees arrivals, which network delays can bunch together, so it may observe more than 100 in some second. A full channel uses about 82 to 89 starts per second, not 100. The measurements are single runs on one machine.
+- **No delivery step in CI** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lints, tests, checks the OpenAPI document and builds the image; nothing is published or deployed.
+
+## Bonuses
+
+| Bonus | State |
+|---|---|
+| B6 — GitHub Actions pipeline for tests and linting | Done ([CI](#ci)) |
+| B1 — Failure handling: a circuit breaker | Planned ([slice 11](docs/slices/11-circuit-breaker.md)) |
+| B2 — Scheduled notifications | Planned ([slice 12](docs/slices/12-scheduled-notifications.md)) |
+| B4 — Real-time status updates over WebSocket | Planned ([slice 13](docs/slices/13-realtime-status.md)) |
+| B3 — Message templates | Planned ([slice 14](docs/slices/14-templates.md)) |
+| B5 — Distributed tracing | Planned ([slice 15](docs/slices/15-distributed-tracing.md)) |
+
 ## Project layout
 
 ```
@@ -443,7 +480,7 @@ internal/e2e/           end-to-end tests: API, worker and a test provider on one
 internal/testdb/        test helper: PostgreSQL container and one database per test
 migrations/             SQL migrations and the embed.go that embeds them
 api/openapi.yaml        generated OpenAPI document
-scripts/                stack check helpers and the webhook.site check
+scripts/                stack check helpers, the webhook.site check and the release check
 docs/                   requirements, decisions, plan, AI usage
 ```
 
@@ -460,7 +497,9 @@ docs/                   requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 9):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir.
+Tek bir imaj, her biri bir Compose servisi olan dört program taşır: `api` (HTTP API), `worker` (bildirimleri claim edip teslim eder; birden fazla çalışabilir), `migrate` (veritabanı migration'larını uygulayıp çıkar) ve `mockprovider` (harici provider'ın yerel yerine geçeni). Mesaj kuyruğu sunucusu yoktur: kuyruk, PostgreSQL'deki `notifications` tablosudur.
+
+**Şu anki durum (çekirdek tamam, dilim 10):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir.
 
 ## Gereksinimler
 
@@ -512,6 +551,14 @@ istemci ──POST /notifications──► api ──INSERT──► notificatio
 - Geçici bir hata bildirimi daha sonraki bir `available_at` ile `queued`'a döndürür; kalıcı bir hata `failed` ile bitirir ([Tekrar denemeler ve hatalar](#tekrar-denemeler-ve-hatalar)).
 - Her worker, worker'ı çöktüğü ya da takıldığı için süresi dolan lease'leri de geri alır.
 - `SIGTERM` gelince worker yeni iş almayı hemen bırakır, süren çağrıların bitip sonuçlarını yazmasına izin verir ve 10 saniye içinde çıkar.
+
+### Claim, lease ve izin
+
+**Claim.** Bir worker işi kanal başına tek bir SQL ifadesiyle alır. Kanalın `channel_limits`'teki satırını ve kanalın vakti gelmiş bir sonraki `queued` bildirimini, ikisini de `SKIP LOCKED` ile kilitler; böylece iki worker birbirini hiç beklemez ve aynı satırı hiç almaz. Bildirim sırası `high`, `normal`, `low`, sonra en erken `available_at`, sonra en küçük ID'dir. Claim denemeyi hemen sayar (`attempts + 1`); bu yüzden gönderim ortasında çöken bir worker da beş denemeden birini kullanmış olur.
+
+**Lease.** Claim edilen satır yeni bir `lease_token` ve veritabanı saatine göre 30 saniye sonrasına bir `lease_expires_at` ile `processing` olur. Her sonuç yazması (`sent`, `failed`, `queued`'a dönüş) aynı token'ı ve süresi dolmamış bir lease'i ister; bu yüzden lease'ini aşacak kadar takılan bir worker satırı artık değiştiremez. Her worker süresi dolmuş lease'leri düzenli olarak geri alır: satır `queued`'a, son denemesinden sonra da `failed`'a döner. Böylece bir bildirimin aynı anda tek geçerli lease'i olur; ama sonucu belirsiz kalan bir çağrıda provider onu iki kez alabilir ([Bilinen sınırlar](#bilinen-sınırlar)).
+
+**İzin.** Aynı ifade kanalın iznini de alır: yalnızca `next_permit_at` geldiğinde claim eder ve onu 11 ms ileri taşır. Gönderim izninden sonraki 100 ms içinde başlamalıdır; başlamazsa gönderilmez ve bildirim `queued`'a döner. Bunlar birlikte, bütün worker'lar için her kanalı herhangi bir bir saniyelik pencerede 100 gönderim başlangıcıyla sınırlar ([Hız sınırı ve öncelik](#hız-sınırı-ve-öncelik)).
 
 ### Bir bildirimi `sent` olana kadar izlemek
 
@@ -877,6 +924,33 @@ docker compose run --rm migrate
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) her pull request'te ve `main`'e her push'ta çalışır: golangci-lint, `go test -count=1 -race ./...`, OpenAPI kontrolü ve `docker build`. Her job pull request'in head commit'ini test eder ve onu `tested-sha` olarak loglar. Bir teslim adımı yoktur: imajı Compose yerelde derler.
 
+## Sürüm kontrolü
+
+[`scripts/release-check.sh`](scripts/release-check.sh) bir pull request'i, bir değerlendiricinin karşılaşacağı haliyle kontrol eder: pull request'in head commit'ini yeni bir geçici klasöre klonlar ve kendi Compose projesinde `main`'in merge commit geçmişini, tek komutla başlatmayı, hiçbir şey uygulamayan ikinci bir migration çalıştırmasını, sunulan OpenAPI yollarını ve yanıtlarını, önbelleğe alınmış sonuç olmadan `go test -count=1 ./...`'i ve o commit için CI çalıştırmasını kontrol eder. Ana stack'in portlarının boş olmasını ister, `PASS` yazar ve stack'ini README komutları için çalışır halde bırakır; yazdığı dosyayla `--cleanup`, o stack'i ve klonu ancak bu çalıştırmaya ait olduklarını kontrol ettikten sonra kaldırır. Bütün prosedür [dilim 10](docs/slices/10-core-release-check.md#release-check)'dadır.
+
+## Bilinen sınırlar
+
+- **Kimlik doğrulama yok** (A1). API'ye ulaşan herkes bildirim oluşturabilir, okuyabilir, listeleyebilir ve iptal edebilir. Bu yüzden Compose her portu yalnızca `127.0.0.1` üzerinde yayınlar.
+- **Çift gönderim mümkün** ([K3](docs/DECISIONS.md#k3--delivery-guarantee-a-durable-queue-lease-recovery-and-bounded-retries)). Teslim en az bir kezdir. Bir çağrının sonucu belirsiz kaldığında (zaman aşımı, provider işlem yapmış olabilecekken gelen `500` ya da `504`, ya da `202`'den sonra ve onu yazmadan çöken bir worker) bildirim tekrar denenir ve provider onu iki kez alabilir. Provider'dan tekilleştirme beklenmez; webhook.site böyle bir özellik belgelemiyor.
+- **Idempotency anahtarları globaldir ve kayıtları kadar saklanır** ([K10](docs/DECISIONS.md#k10--idempotency-key-an-optional-idempotency-key-header-one-key-per-create-request)). Kimlik doğrulama olmadığı için ayrılacakları bir istemci yoktur ve onları silen bir süre yoktur.
+- **SMS sınırı parçaları değil kod noktalarını sayar** ([K11](docs/DECISIONS.md#k11--validation-one-set-of-rules-at-the-api-limits-counted-in-unicode-code-points)). 160 kod noktası tek bir parçaya yalnızca GSM-7 kümesinde sığar.
+- **`low` aç kalabilir** ([K8](docs/DECISIONS.md#k8--priority-strict-order-within-each-channel)). Bir kanal içinde öncelik katıdır; `GET /metrics` her öncelik için en eski hazır bildirimin yaşını gösterir.
+- **Listeleme sayfaları tek bir anlık görüntü değildir** ([K13](docs/DECISIONS.md#k13--listing-filter-dates-on-created_at-paginate-with-a-created_at-id-cursor)). Durumu sayfalar arasında değişen bir bildirim filtreli bir listeye girebilir ya da listeden çıkabilir.
+- **`provider_message_id` benzersiz değildir** ([K15](docs/DECISIONS.md#k15--provider-response-store-messageid-and-timestamp)). Sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
+- **Hız sınırı ölçümünün kanıtladığı** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). Sınır worker'daki gönderim başlangıçları üzerindedir. Uzak bir provider gelişleri görür; ağ gecikmeleri gelişleri bir araya toplayabilir, bu yüzden provider bir saniyede 100'den fazlasını görebilir. Dolu bir kanal saniyede 100 değil yaklaşık 82 ile 89 başlangıç kullanır. Ölçümler tek makinede tekil çalıştırmalardır.
+- **CI'da teslim adımı yok** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lint, test, OpenAPI kontrolü ve imaj derlemesi yapar; hiçbir şey yayımlanmaz ya da dağıtılmaz.
+
+## Bonuslar
+
+| Bonus | Durum |
+|---|---|
+| B6 — Testler ve lint için GitHub Actions hattı | Tamam ([CI](#ci-1)) |
+| B1 — Hata yönetimi: devre kesici | Planlandı ([dilim 11](docs/slices/11-circuit-breaker.md)) |
+| B2 — Zamanlanmış bildirimler | Planlandı ([dilim 12](docs/slices/12-scheduled-notifications.md)) |
+| B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Planlandı ([dilim 13](docs/slices/13-realtime-status.md)) |
+| B3 — Mesaj şablonları | Planlandı ([dilim 14](docs/slices/14-templates.md)) |
+| B5 — Dağıtık izleme | Planlandı ([dilim 15](docs/slices/15-distributed-tracing.md)) |
+
 ## Proje yapısı
 
 ```
@@ -899,7 +973,7 @@ internal/e2e/           uçtan uca testler: API, worker ve bir test provider'ı 
 internal/testdb/        test yardımcısı: PostgreSQL container'ı ve test başına bir veritabanı
 migrations/             SQL migration'ları ve onları gömen embed.go
 api/openapi.yaml        üretilmiş OpenAPI dokümanı
-scripts/                stack kontrolü yardımcıları ve webhook.site kontrolü
+scripts/                stack kontrolü yardımcıları, webhook.site kontrolü ve sürüm kontrolü
 docs/                   gereksinimler, kararlar, plan, yapay zekâ kullanımı
 ```
 
