@@ -6,7 +6,7 @@ A notification service in Go that queues SMS, email and push notifications in Po
 
 One image holds four programs, each a Compose service: `api` (the HTTP API), `worker` (claims and delivers notifications; several can run), `migrate` (applies the database migrations and exits) and `mockprovider` (a local stand-in for the external provider). There is no message broker: the `notifications` table in PostgreSQL is the queue.
 
-**Current state (core complete, slice 10):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel.
+**Current state (core complete; circuit breaker, slice 11):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume.
 
 ## Requirements
 
@@ -57,6 +57,7 @@ client ──POST /notifications──► api ──INSERT──► notification
 - The result is written only while the row is still `processing` under the same token and the lease has not expired by the database clock. A `202` ends as `sent` with `provider_message_id`, `provider_timestamp` and `sent_at`. A `202` whose body is broken, or never finishes arriving, still ends as `sent`, with those fields empty and a warning in the log: the provider accepted the notification, and a second POST could deliver it twice.
 - A temporary failure goes back to `queued` with a later `available_at`; a permanent one ends as `failed` ([Retries and failures](#retries-and-failures)).
 - Every worker also takes back leases that expired because their worker crashed or stalled.
+- While the provider is failing, one circuit breaker shared by every worker stops new claims on all channels, so waiting notifications keep their attempts ([Provider outage](#provider-outage)).
 - On `SIGTERM` the worker stops claiming at once, lets the calls in flight finish and write their results, and exits within 10 seconds.
 
 ### Claim, lease and permit
@@ -98,6 +99,22 @@ Each attempt's result is classified, and the notification's next state follows f
 - **Crash recovery:** every `RECOVERY_INTERVAL` (5 s) each worker takes back at most `RECOVERY_BATCH` (100) notifications whose lease has expired by the database clock: back to `queued`, or `failed` if that was the fifth attempt, with `last_error` `temporary: lease expired before a result was written`. Workers recovering at the same time never take the same row. With a 30-second lease, a crashed worker's notification is expected back within about 35 seconds while any worker runs; nothing is recovered while no worker runs. A worker whose lease has ended can never change the row, and it does not start a POST it could not finish within its lease.
 - **What `failed` means:** the attempts ran out or the error was permanent. It does not prove the notification was never delivered: an earlier attempt may have timed out after the provider had already accepted it.
 - **Duplicates are possible:** this is not exactly-once delivery. When the outcome of an attempt is unclear, a retry can become a second send: for example, the provider accepts the request but its answer is lost or arrives after the timeout, or the worker receives `202` and crashes before writing it. webhook.site documents no deduplication. Repeated **API requests** never create a second notification when they carry the same `Idempotency-Key`.
+
+## Provider outage
+
+All three channels post to the one `PROVIDER_URL`, so one circuit breaker guards the provider. Every worker shares it through a single PostgreSQL row, `provider_breaker` ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)).
+
+- **Opening.** Outage failures count: a network error, a timeout, `408`, `500`, `502`, `503` and `504`. After `BREAKER_THRESHOLD` (5) in a row, the breaker opens for `BREAKER_COOLDOWN` (30 s). A `429` and permanent or terminal errors do not count, because they concern the request, not the provider. A success clears the count.
+- **While open.** No worker claims on any channel, so waiting notifications stay `queued` and their attempts do not move. Calls that had already started finish and write their result: a late `202` still marks its notification `sent`, but no result from before the opening moves the breaker.
+- **One probe.** When the cooldown ends, exactly one claim across all workers becomes the probe.
+  - A `202` closes the breaker, and the queue moves on.
+  - An outage failure reopens it with the cooldown doubled, up to `BREAKER_MAX_COOLDOWN` (5 min).
+  - Any other answer (`400`, a terminal code, a `429`) or a missed start deadline only frees the probe slot, and the next claim becomes the probe.
+  - A probe whose worker crashed holds the slot until its lease ends. A probe that answers after its lease ended moves nothing.
+- **`429` and `Retry-After`.** A `Retry-After` delays only its own notification. Neither profile states that the provider's quota covers the whole URL, so a `429` never opens the breaker.
+- **Logs.** The result write that moves the breaker writes `breaker opened` or `breaker reopened` (`warn`, with `generation`, `cooldown` and `open_for`) or `breaker closed` (`info`, with `generation` and `cooldown`). The probe's own lines carry `"breaker_probe":true`.
+
+A failure that hits only one channel at the provider still pauses all three ([Known limits](#known-limits)). The [slice 11 stack check](docs/slices/11-circuit-breaker.md#stack-check) shows the breaker on the running stack: it points the worker at a closed port, then back at the mock.
 
 ## Rate limit and priority
 
@@ -384,6 +401,9 @@ Each program reads typed environment variables and refuses to start with an inva
 | `RECOVERY_BATCH` | `100` | Most expired leases taken back in one round |
 | `PERMIT_INTERVAL` | `11ms` | Least time between two permits of a channel |
 | `PERMIT_GRACE` | `100ms` | How long after its time a permit may start a send; 100 × `PERMIT_INTERVAL` − `PERMIT_GRACE` must be at least `1s` |
+| `BREAKER_THRESHOLD` | `5` | Outage failures in a row that open the circuit breaker; at least 1 ([Provider outage](#provider-outage)) |
+| `BREAKER_COOLDOWN` | `30s` | Pause after the breaker opens from closed; at most `BREAKER_MAX_COOLDOWN` |
+| `BREAKER_MAX_COOLDOWN` | `5m` | Cap of the cooldown, which doubles on each reopening |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 ### Mock provider settings
@@ -448,6 +468,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 - **Listing pages are not one snapshot** ([K13](docs/DECISIONS.md#k13--listing-filter-dates-on-created_at-paginate-with-a-created_at-id-cursor)). A notification whose status changes between pages can move into or out of a filtered list.
 - **`provider_message_id` is not unique** ([K15](docs/DECISIONS.md#k15--provider-response-store-messageid-and-timestamp)). A provider with a static response gives every notification the same ID.
 - **What the rate-limit measurement proves** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). The limit is on send starts at the worker. A remote provider sees arrivals, which network delays can bunch together, so it may observe more than 100 in some second. A full channel uses about 82 to 89 starts per second, not 100. The measurements are single runs on one machine.
+- **An outage on one channel pauses all three** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). The circuit breaker is per provider, because the three channels share one URL: a failure that only one channel meets at the provider still stops every claim until a probe succeeds. The probe uses one attempt of the notification it carries, and `failed` notifications are never resent.
 - **No delivery step in CI** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lints, tests, checks the OpenAPI document and builds the image; nothing is published or deployed.
 
 ## Bonuses
@@ -455,7 +476,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 | Bonus | State |
 |---|---|
 | B6 — GitHub Actions pipeline for tests and linting | Done ([CI](#ci)) |
-| B1 — Failure handling: a circuit breaker | Planned ([slice 11](docs/slices/11-circuit-breaker.md)) |
+| B1 — Failure handling: a circuit breaker | Done ([Provider outage](#provider-outage)) |
 | B2 — Scheduled notifications | Planned ([slice 12](docs/slices/12-scheduled-notifications.md)) |
 | B4 — Real-time status updates over WebSocket | Planned ([slice 13](docs/slices/13-realtime-status.md)) |
 | B3 — Message templates | Planned ([slice 14](docs/slices/14-templates.md)) |
@@ -474,9 +495,9 @@ internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
 internal/service/       create, read, cancel, list, batch and metrics rules; the listing cursor
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit, result writes, give-back, recovery
-internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery
-internal/provider/      provider HTTP client, start gate, response classification, Retry-After
+internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit and probe slot, result writes with the circuit breaker, give-back, recovery
+internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery, breaker pauses
+internal/provider/      provider HTTP client, start gate, response classification with outage flags, Retry-After
 internal/ratecheck/     largest count in a half-open one-second window
 internal/mockprovider/  mock provider handlers and /stats
 internal/e2e/           end-to-end tests: API, worker and a test provider on one database
@@ -502,7 +523,7 @@ SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başın
 
 Tek bir imaj, her biri bir Compose servisi olan dört program taşır: `api` (HTTP API), `worker` (bildirimleri claim edip teslim eder; birden fazla çalışabilir), `migrate` (veritabanı migration'larını uygulayıp çıkar) ve `mockprovider` (harici provider'ın yerel yerine geçeni). Mesaj kuyruğu sunucusu yoktur: kuyruk, PostgreSQL'deki `notifications` tablosudur.
 
-**Şu anki durum (çekirdek tamam, dilim 10):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir.
+**Şu anki durum (çekirdek tamam; devre kesici, dilim 11):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener.
 
 ## Gereksinimler
 
@@ -553,6 +574,7 @@ istemci ──POST /notifications──► api ──INSERT──► notificatio
 - Sonuç yalnızca satır hâlâ aynı token altında `processing` iken ve lease veritabanı saatine göre dolmamışken yazılır. `202`, `provider_message_id`, `provider_timestamp` ve `sent_at` ile `sent` olarak biter. Gövdesi bozuk olan ya da gelmesi hiç bitmeyen bir `202` de `sent` olarak biter; bu alanlar boş kalır ve log'a bir uyarı yazılır: provider bildirimi kabul etmiştir ve ikinci bir POST onu iki kez teslim edebilir.
 - Geçici bir hata bildirimi daha sonraki bir `available_at` ile `queued`'a döndürür; kalıcı bir hata `failed` ile bitirir ([Tekrar denemeler ve hatalar](#tekrar-denemeler-ve-hatalar)).
 - Her worker, worker'ı çöktüğü ya da takıldığı için süresi dolan lease'leri de geri alır.
+- Provider hata verirken tüm worker'ların paylaştığı tek bir devre kesici her kanalda yeni claim'leri durdurur; bekleyen bildirimlerin denemeleri harcanmaz ([Provider kesintisi](#provider-kesintisi)).
 - `SIGTERM` gelince worker yeni iş almayı hemen bırakır, süren çağrıların bitip sonuçlarını yazmasına izin verir ve 10 saniye içinde çıkar.
 
 ### Claim, lease ve izin
@@ -594,6 +616,22 @@ Her denemenin sonucu sınıflandırılır ve bildirimin sonraki durumu sınıfta
 - **Çökme sonrası kurtarma:** her `RECOVERY_INTERVAL`'de (5 s) her worker, lease'i veritabanı saatine göre dolmuş en fazla `RECOVERY_BATCH` (100) bildirimi geri alır: `queued`'a, beşinci denemeyse `failed`'a, `last_error` `temporary: lease expired before a result was written` ile. Aynı anda kurtarma yapan worker'lar asla aynı satırı almaz. 30 saniyelik lease ile, herhangi bir worker çalıştığı sürece çöken bir worker'ın bildiriminin yaklaşık 35 saniye içinde geri gelmesi beklenir; hiçbir worker çalışmıyorsa hiçbir şey geri alınmaz. Lease'i bitmiş bir worker satırı asla değiştiremez ve lease'i içinde bitiremeyeceği bir POST'a başlamaz.
 - **`failed` ne demek:** denemeler bitti ya da hata kalıcıydı. Bildirimin hiç teslim edilmediğini kanıtlamaz: daha önceki bir deneme, provider isteği kabul ettikten sonra zaman aşımına uğramış olabilir.
 - **Tekrar gönderim mümkün:** bu tam olarak bir kez (exactly-once) teslim değildir. Bir denemenin sonucu belirsiz olduğunda tekrar deneme ikinci bir gönderim olabilir: örneğin provider isteği kabul eder ama cevabı kaybolur ya da zaman aşımından sonra gelir, veya worker `202` alır ve onu yazmadan çöker. webhook.site herhangi bir tekilleştirme belgelemiyor. Aynı `Idempotency-Key`'i taşıyan tekrarlanan **API istekleri** ise asla ikinci bir bildirim oluşturmaz.
+
+## Provider kesintisi
+
+Üç kanal da aynı `PROVIDER_URL`'e POST eder; bu yüzden provider'ı tek bir devre kesici korur. Tüm worker'lar onu PostgreSQL'deki tek bir satır üzerinden paylaşır: `provider_breaker` ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)).
+
+- **Açılma.** Kesinti hataları sayılır: ağ hatası, zaman aşımı, `408`, `500`, `502`, `503` ve `504`. Art arda `BREAKER_THRESHOLD` (5) tane olunca devre kesici `BREAKER_COOLDOWN` (30 s) boyunca açılır. `429` ile kalıcı ve terminal hatalar sayılmaz; çünkü provider'la değil istekle ilgilidirler. Bir başarı sayacı sıfırlar.
+- **Açıkken.** Hiçbir worker hiçbir kanalda claim yapmaz; bekleyen bildirimler `queued` kalır ve denemeleri artmaz. Önceden başlamış çağrılar biter ve sonuçlarını yazar: geç gelen bir `202` bildirimini yine `sent` yapar, ama açılmadan önceki hiçbir sonuç devre kesiciyi değiştirmez.
+- **Tek yoklama.** Bekleme süresi bitince tüm worker'lar arasında tam olarak bir claim yoklama (probe) olur.
+  - `202` devre kesiciyi kapatır ve kuyruk ilerler.
+  - Bir kesinti hatası onu bekleme süresini ikiye katlayarak yeniden açar; en fazla `BREAKER_MAX_COOLDOWN` (5 dk).
+  - Başka her cevap (`400`, terminal bir kod, `429`) ya da kaçırılan başlama son anı yalnızca yoklama yerini boşaltır; sonraki claim yeni yoklama olur.
+  - Worker'ı çöken bir yoklama yeri lease'i bitene kadar tutar. Lease'i bittikten sonra cevap veren bir yoklama hiçbir şeyi değiştirmez.
+- **`429` ve `Retry-After`.** `Retry-After` yalnızca kendi bildirimini erteler. İki profil de provider'ın kotasının tüm URL'yi kapsadığını belirtmez; bu yüzden `429` devre kesiciyi asla açmaz.
+- **Log'lar.** Devre kesiciyi değiştiren sonuç yazımı `breaker opened` ya da `breaker reopened` (`warn`; `generation`, `cooldown` ve `open_for` ile) veya `breaker closed` (`info`; `generation` ve `cooldown` ile) satırını yazar. Yoklamanın kendi satırlarında `"breaker_probe":true` bulunur.
+
+Provider'da yalnızca bir kanalı etkileyen bir hata da üç kanalı birden durdurur ([Bilinen sınırlar](#bilinen-sınırlar)). [Dilim 11'in stack kontrolü](docs/slices/11-circuit-breaker.md#stack-check) devre kesiciyi çalışan stack üzerinde gösterir: worker'ı kapalı bir porta, sonra yeniden mock'a yönlendirir.
 
 ## Hız sınırı ve öncelik
 
@@ -880,6 +918,9 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 | `RECOVERY_BATCH` | `100` | Bir turda geri alınan en fazla lease sayısı |
 | `PERMIT_INTERVAL` | `11ms` | Bir kanalın iki izni arasındaki en kısa süre |
 | `PERMIT_GRACE` | `100ms` | Bir iznin, zamanından ne kadar sonrasına kadar gönderim başlatabileceği; 100 × `PERMIT_INTERVAL` − `PERMIT_GRACE` en az `1s` olmalı |
+| `BREAKER_THRESHOLD` | `5` | Devre kesiciyi açan art arda kesinti hatası sayısı; en az 1 ([Provider kesintisi](#provider-kesintisi)) |
+| `BREAKER_COOLDOWN` | `30s` | Devre kesici kapalıyken açıldığında bekleme süresi; en fazla `BREAKER_MAX_COOLDOWN` |
+| `BREAKER_MAX_COOLDOWN` | `5m` | Her yeniden açılışta ikiye katlanan bekleme süresinin üst sınırı |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ya da `error` |
 
 ### Mock provider ayarları
@@ -944,6 +985,7 @@ docker compose run --rm migrate
 - **Listeleme sayfaları tek bir anlık görüntü değildir** ([K13](docs/DECISIONS.md#k13--listing-filter-dates-on-created_at-paginate-with-a-created_at-id-cursor)). Durumu sayfalar arasında değişen bir bildirim filtreli bir listeye girebilir ya da listeden çıkabilir.
 - **`provider_message_id` benzersiz değildir** ([K15](docs/DECISIONS.md#k15--provider-response-store-messageid-and-timestamp)). Sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
 - **Hız sınırı ölçümünün kanıtladığı** ([K5](docs/DECISIONS.md#k5--rate-limiter-one-shared-permit-row-per-channel-in-postgresql)). Sınır worker'daki gönderim başlangıçları üzerindedir. Uzak bir provider gelişleri görür; ağ gecikmeleri gelişleri bir araya toplayabilir, bu yüzden provider bir saniyede 100'den fazlasını görebilir. Dolu bir kanal saniyede 100 değil yaklaşık 82 ile 89 başlangıç kullanır. Ölçümler tek makinede tekil çalıştırmalardır.
+- **Bir kanaldaki kesinti üç kanalı da durdurur** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). Üç kanal aynı URL'yi paylaştığı için devre kesici provider başınadır: provider'da yalnızca bir kanalın karşılaştığı bir hata da bir yoklama başarılı olana kadar tüm claim'leri durdurur. Yoklama taşıdığı bildirimin bir denemesini kullanır ve `failed` bildirimler asla yeniden gönderilmez.
 - **CI'da teslim adımı yok** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lint, test, OpenAPI kontrolü ve imaj derlemesi yapar; hiçbir şey yayımlanmaz ya da dağıtılmaz.
 
 ## Bonuslar
@@ -951,7 +993,7 @@ docker compose run --rm migrate
 | Bonus | Durum |
 |---|---|
 | B6 — Testler ve lint için GitHub Actions hattı | Tamam ([CI](#ci-1)) |
-| B1 — Hata yönetimi: devre kesici | Planlandı ([dilim 11](docs/slices/11-circuit-breaker.md)) |
+| B1 — Hata yönetimi: devre kesici | Tamam ([Provider kesintisi](#provider-kesintisi)) |
 | B2 — Zamanlanmış bildirimler | Planlandı ([dilim 12](docs/slices/12-scheduled-notifications.md)) |
 | B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Planlandı ([dilim 13](docs/slices/13-realtime-status.md)) |
 | B3 — Mesaj şablonları | Planlandı ([dilim 14](docs/slices/14-templates.md)) |
@@ -970,9 +1012,9 @@ internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
 internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek ve metrik kuralları; listeleme cursor'ı
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli claim, sonuç yazma, geri verme, kurtarma
-internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma
-internal/provider/      provider HTTP istemcisi, başlatma kapısı, cevap sınıflandırması, Retry-After
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli ve yoklama yerli claim, devre kesiciyle sonuç yazma, geri verme, kurtarma
+internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma, devre kesici beklemeleri
+internal/provider/      provider HTTP istemcisi, başlatma kapısı, kesinti işaretli cevap sınıflandırması, Retry-After
 internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı
 internal/mockprovider/  mock provider handler'ları ve /stats
 internal/e2e/           uçtan uca testler: API, worker ve bir test provider'ı tek veritabanında

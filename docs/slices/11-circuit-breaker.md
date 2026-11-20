@@ -133,12 +133,12 @@ for i in $(seq 1 30); do       # at most 30 s: the breaker opens and a probe fai
   sleep 1
 done
 docker compose -p "$P" logs --no-log-prefix worker | grep -cE '"msg":"breaker (opened|reopened)"'
-docker compose -p "$P" exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -tAc \
+docker compose -p "$P" exec -T postgres psql -U notifications -d notifications -tAc \
   "select status, count(*) from notifications group by 1 order by 1"
 PROVIDER_URL=http://mockprovider:8081/ PROVIDER_PROFILE=standard MOCK_DELAY=0s \
   docker compose -p "$P" up -d --force-recreate worker      # restore: the mock answers 202
 for i in $(seq 1 30); do       # at most 30 s: one probe closes the breaker, the queue drains
-  LEFT=$(docker compose -p "$P" exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -tAc \
+  LEFT=$(docker compose -p "$P" exec -T postgres psql -U notifications -d notifications -tAc \
     "select count(*) from notifications where status <> 'sent'")
   [ "$LEFT" = 0 ] && break
   sleep 1
