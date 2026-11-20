@@ -73,7 +73,7 @@ services:
       HTTP_TIMEOUT: 5s
       RESULT_BUDGET: 5s
       LEASE_DURATION: 30s
-      IN_FLIGHT: "20"
+      IN_FLIGHT: "30"
       IDLE_WAIT: 200ms
       SHUTDOWN_BUDGET: 10s
       MAX_ATTEMPTS: "5"
@@ -81,6 +81,8 @@ services:
       BACKOFF_CAP: 60s
       RECOVERY_INTERVAL: 5s
       RECOVERY_BATCH: "100"
+      PERMIT_INTERVAL: 11ms
+      PERMIT_GRACE: 100ms
       LOG_LEVEL: info
     depends_on:
       postgres:

@@ -1,6 +1,6 @@
-// Package worker claims queued notifications under a lease, delivers them to
-// the provider, retries temporary failures and takes back expired leases (K2,
-// K3, K6, K7, K21, K40). It defines the store it needs; internal/postgres
+// Package worker claims queued notifications under a lease and a channel
+// permit, delivers them to the provider, retries temporary failures and takes
+// back expired leases (K2, K3, K5, K6, K7, K8, K21, K40, K42). It defines the store it needs; internal/postgres
 // implements it without importing this package (K23).
 package worker
 
@@ -22,10 +22,11 @@ import (
 // conditioned on the claim's lease and reports false when the lease was no
 // longer valid (K3).
 type Store interface {
-	ClaimNext(ctx context.Context, lease time.Duration, maxAttempts int) (domain.Claim, bool, error)
+	ClaimNext(ctx context.Context, req domain.ClaimRequest) (domain.ClaimResult, error)
 	MarkSent(ctx context.Context, id, leaseToken string, acc domain.Acceptance) (bool, error)
 	MarkRetry(ctx context.Context, id, leaseToken, lastError string, wait time.Duration) (bool, error)
 	MarkFailed(ctx context.Context, id, leaseToken, lastError string) (bool, error)
+	GiveBack(ctx context.Context, id, leaseToken string) (bool, error)
 	RecoverExpired(ctx context.Context, maxAttempts, batch int) ([]domain.Recovered, error)
 }
 
@@ -40,7 +41,8 @@ type Config struct {
 	ResultBudget time.Duration
 	// InFlight is the number of provider calls this worker runs at once.
 	InFlight int
-	// IdleWait is the pause after a claim that found nothing.
+	// IdleWait is the pause on a channel after a claim found its permit due
+	// but no notification.
 	IdleWait time.Duration
 	// ShutdownBudget bounds the wait for calls in flight after a stop (K6).
 	ShutdownBudget time.Duration
@@ -52,6 +54,10 @@ type Config struct {
 	// RecoveryInterval and RecoveryBatch bound the recovery step (K40).
 	RecoveryInterval time.Duration
 	RecoveryBatch    int
+	// PermitInterval is the least time between two permits of a channel, and
+	// PermitGrace how long after its time a permit may start a send (K5, K42).
+	PermitInterval time.Duration
+	PermitGrace    time.Duration
 }
 
 // queryTimeout bounds one claim or recovery statement.
@@ -70,10 +76,11 @@ type Worker struct {
 	hooks    hooks
 }
 
-// hooks let tests stop a delivery at a chosen point to simulate a crash. They
-// are nil in production; export_test.go sets them.
+// hooks let tests stop a delivery at a chosen point to simulate a crash or a
+// pause. They are nil in production; export_test.go sets them.
 type hooks struct {
 	afterClaim  func(domain.Claim)
+	beforeGate  func(domain.Claim)
 	beforeWrite func(domain.Claim)
 }
 
@@ -91,28 +98,49 @@ func NewID() string {
 	return host + "-" + strings.ToLower(rand.Text()[:8])
 }
 
-// claimed is a claim with its local lease deadline.
+// claimed is a claim with its local deadlines.
 type claimed struct {
 	domain.Claim
 	// deadline is t0 + LeaseRemaining, where t0 was read just before the claim
 	// was sent. t0 comes before the moment the database computed the remaining
 	// time, so this deadline falls at or before the database's lease end.
 	deadline time.Time
+	// startBy is t0 + PermitRemaining, the permit's start deadline, read the
+	// same way (K42).
+	startBy time.Time
 }
 
-// Run claims while it finds work and a call slot is free, and waits IdleWait
-// when the queue is empty. Beside the claim loop it runs the recovery step
-// every RecoveryInterval (K40). When ctx ends it stops claiming and
-// recovering at once, lets the calls in flight finish and write their results,
-// and returns when they are done or ShutdownBudget has passed.
+// attempt is the answer to one claim attempt, with the local deadlines when
+// it claimed a notification.
+type attempt struct {
+	domain.ClaimResult
+	claimed claimed
+	// sent is when the claim was sent (t0).
+	sent time.Time
+}
+
+// Run claims on each channel when its next try has come and a call slot is
+// free. Each claim attempt sets that channel's next try from its outcome: at
+// once after a claim, after the returned wait (at most PermitInterval, counted
+// from when the claim was sent) when the permit is not due, after PermitInterval when another worker holds the
+// channel's limiter row, and after IdleWait when the channel has no due work.
+// The loop always takes the channel whose next try comes first, so one
+// channel's wait never delays another's claims. Beside the claim loop it runs
+// the recovery step every RecoveryInterval (K40). When ctx ends it stops
+// claiming and recovering at once, lets the calls in flight finish and write
+// their results, and returns when they are done or ShutdownBudget has passed.
 func (w *Worker) Run(ctx context.Context) error {
 	slots := make(chan struct{}, w.cfg.InFlight)
 	var calls, background sync.WaitGroup
 	w.logger.Info("worker started", slog.Int("in_flight", w.cfg.InFlight),
 		slog.String("lease", w.cfg.LeaseDuration.String()), slog.Int("max_attempts", w.cfg.MaxAttempts),
+		slog.String("permit_interval", w.cfg.PermitInterval.String()),
+		slog.String("permit_grace", w.cfg.PermitGrace.String()),
 		slog.String("profile", string(w.cfg.Profile)))
 	background.Go(func() { w.recoverLoop(ctx) })
 
+	// nextTry holds each channel's next claim attempt; the zero time is now.
+	nextTry := make(map[domain.Channel]time.Time, len(domain.Channels))
 loop:
 	for {
 		select {
@@ -120,30 +148,48 @@ loop:
 		case <-ctx.Done():
 			break loop
 		}
-		// select picks at random when a slot and the stop are both ready, so
-		// the stop is checked again: no claim after a stop.
+		ch := earliest(nextTry)
+		if wait := time.Until(nextTry[ch]); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+			}
+		}
+		// select picks at random when two cases are ready, so the stop is
+		// checked again: no claim after a stop.
 		if ctx.Err() != nil {
 			<-slots
 			break loop
 		}
 
-		c, ok, err := w.claim(ctx)
-		if err != nil || !ok {
+		a, err := w.claim(ctx, ch)
+		now := time.Now()
+		if err != nil {
 			<-slots
-			if err != nil {
-				w.logger.Error("claim failed", slog.String("error", err.Error()))
-			}
-			select {
-			case <-time.After(w.cfg.IdleWait):
-			case <-ctx.Done():
-				break loop
-			}
+			w.logger.Error("claim failed", slog.String("channel", string(ch)), slog.String("error", err.Error()))
+			nextTry[ch] = now.Add(w.cfg.IdleWait)
 			continue
 		}
-		calls.Go(func() {
-			defer func() { <-slots }()
-			w.deliver(c)
-		})
+		switch a.Outcome {
+		case domain.ClaimClaimed:
+			nextTry[ch] = now
+			calls.Go(func() {
+				defer func() { <-slots }()
+				w.deliver(a.claimed)
+			})
+			continue
+		case domain.ClaimThrottled:
+			// The wait runs from the database's permit reading, which came
+			// after t0, so t0 + wait is the earliest the permit can be due.
+			nextTry[ch] = a.sent.Add(min(a.Wait, w.cfg.PermitInterval))
+		case domain.ClaimBusy:
+			nextTry[ch] = now.Add(w.cfg.PermitInterval)
+		default:
+			nextTry[ch] = now.Add(w.cfg.IdleWait)
+		}
+		<-slots
 	}
 
 	w.logger.Info("stop requested, no new claims", slog.Int("calls_in_flight", len(slots)),
@@ -164,20 +210,47 @@ loop:
 	}
 }
 
-// claim reads the monotonic clock just before it sends the claim and sets the
-// lease deadline from that reading (K3). The claim statement is not cancelled
+// earliest returns the channel whose next try comes first; on a tie, the
+// first in domain.Channels.
+func earliest(nextTry map[domain.Channel]time.Time) domain.Channel {
+	best := domain.Channels[0]
+	for _, ch := range domain.Channels[1:] {
+		if nextTry[ch].Before(nextTry[best]) {
+			best = ch
+		}
+	}
+	return best
+}
+
+// claim makes one claim attempt on ch. It reads the monotonic clock just
+// before it sends the claim and sets the lease deadline and the start
+// deadline from that reading (K3, K42). The claim statement is not cancelled
 // by a stop: cancelling a statement that may already have committed would
 // leave a lease nobody holds until recovery.
-func (w *Worker) claim(ctx context.Context) (claimed, bool, error) {
+func (w *Worker) claim(ctx context.Context, ch domain.Channel) (attempt, error) {
 	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 
 	t0 := time.Now()
-	c, ok, err := w.store.ClaimNext(qctx, w.cfg.LeaseDuration, w.cfg.MaxAttempts)
-	if err != nil || !ok {
-		return claimed{}, false, err
+	res, err := w.store.ClaimNext(qctx, domain.ClaimRequest{
+		Channel:        ch,
+		Lease:          w.cfg.LeaseDuration,
+		MaxAttempts:    w.cfg.MaxAttempts,
+		PermitInterval: w.cfg.PermitInterval,
+		PermitGrace:    w.cfg.PermitGrace,
+	})
+	if err != nil {
+		return attempt{}, err
 	}
-	return claimed{Claim: c, deadline: t0.Add(c.LeaseRemaining)}, true, nil
+	a := attempt{ClaimResult: res, sent: t0}
+	if res.Outcome == domain.ClaimClaimed {
+		a.claimed = claimed{
+			Claim:    res.Claim,
+			deadline: t0.Add(res.Claim.LeaseRemaining),
+			startBy:  t0.Add(res.Claim.PermitRemaining),
+		}
+	}
+	return a, nil
 }
 
 // recoverLoop runs the recovery step at once and then every RecoveryInterval
@@ -246,8 +319,18 @@ func (w *Worker) deliver(c claimed) {
 	}
 	callCtx, cancelCall := context.WithDeadline(context.Background(), callDeadline)
 	defer cancelCall()
+	// The start gate checks the permit's start deadline and, when it passes,
+	// writes the start line with the send start it read (K21, K42).
+	callCtx = provider.WithPermit(callCtx, provider.Permit{
+		Deadline: c.startBy,
+		OnStart: func(start time.Time) {
+			log.Info("provider call started", slog.Time("started_at", start))
+		},
+	})
 
-	log.Info("provider call started")
+	if w.hooks.beforeGate != nil {
+		w.hooks.beforeGate(c.Claim)
+	}
 	start := time.Now()
 	resp, callErr := w.provider.Send(callCtx, provider.Request{
 		To:            c.Recipient,
@@ -256,6 +339,10 @@ func (w *Worker) deliver(c claimed) {
 		CorrelationID: c.CorrelationID,
 	})
 	duration := time.Since(start)
+	if errors.Is(callErr, provider.ErrStartDeadline) {
+		w.giveBack(log, c)
+		return
+	}
 	outcome := provider.Classify(resp, callErr, w.cfg.Profile)
 
 	if w.hooks.beforeWrite != nil {
@@ -309,5 +396,25 @@ func (w *Worker) deliver(c claimed) {
 		log.LogAttrs(dbCtx, slog.LevelWarn, "provider call finished, lease lost, result not written", attrs...)
 	default:
 		log.LogAttrs(dbCtx, slog.LevelInfo, "provider call finished", attrs...)
+	}
+}
+
+// giveBack returns a claim whose send never started because its start
+// deadline had passed (K42). No start line was written. The row goes back to
+// queued with its attempt returned, once, under the lease and token check;
+// the permit is not given back.
+func (w *Worker) giveBack(log *slog.Logger, c claimed) {
+	ctx, cancel := context.WithDeadline(context.Background(), c.deadline)
+	defer cancel()
+	late := slog.Float64("late_ms", float64(time.Since(c.startBy).Microseconds())/1000)
+	given, err := w.store.GiveBack(ctx, c.ID, c.LeaseToken)
+	switch {
+	case err != nil:
+		log.LogAttrs(ctx, slog.LevelError, "start deadline missed, no request sent, attempt not given back",
+			late, slog.String("write_error", err.Error()))
+	case !given:
+		log.LogAttrs(ctx, slog.LevelWarn, "start deadline missed, no request sent, lease lost", late)
+	default:
+		log.LogAttrs(ctx, slog.LevelWarn, "start deadline missed, no request sent, notification given back", late)
 	}
 }

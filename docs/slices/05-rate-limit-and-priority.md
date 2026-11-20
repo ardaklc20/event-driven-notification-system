@@ -53,13 +53,13 @@ A window is half-open: `[t, t + 1 s)`. The count for a channel is the largest nu
 
 ## The claim, final shape ([K5], [K8])
 
-One short transaction:
+One short transaction, written as a single statement whose common table expressions are these steps (the limiter row stays locked for one round trip):
 
 1. Lock the channel's `channel_limits` row with `FOR UPDATE SKIP LOCKED`. If another worker holds it, return `busy` at once.
 2. Read `clock_timestamp()` **once**, together with the row lock; this reading is the permit time. If `next_permit_at` is still after it, return `throttled` with the wait `next_permit_at − permit time`, computed by the database, and no notification.
 3. Select one due notification on that channel: `status = 'queued'`, `available_at <= clock_timestamp()`, `attempts < MAX_ATTEMPTS`, ordered by the explicit priority order, then `available_at`, then `id`, `FOR UPDATE SKIP LOCKED`.
 4. If none: return `empty`; the permit time is not moved.
-5. Otherwise: write the lease and the attempt (slice 3). The permit's start, its deadline and the next permit are all derived from the one reading of step 2, passed back as a parameter: `next_permit_at = permit time + PERMIT_INTERVAL` ([K5]) and deadline `= permit time + PERMIT_GRACE` ([K42]). Only the time left until that deadline is read later, from `clock_timestamp()` at the end of the statement; a later reading can only shorten it. Commit.
+5. Otherwise: write the lease and the attempt (slice 3). The permit's start, its deadline and the next permit are all derived from the one reading of step 2, used again within the same statement: `next_permit_at = permit time + PERMIT_INTERVAL` ([K5]) and deadline `= permit time + PERMIT_GRACE` ([K42]). Only the time left until that deadline is read later, from `clock_timestamp()` at the end of the statement; a later reading can only shorten it. Commit.
 6. The worker adds the time left to the monotonic time it read just before the claim, as for the lease ([K3]), and passes that deadline to the provider adapter with the request.
 
 ## Claim outcomes and the worker loop
@@ -159,13 +159,13 @@ The measurement runs in its own Compose project, so its database, its worker log
 
    ```bash
    for i in $(seq 1 120); do
-     LEFT=$(docker compose -p "$P" exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -tAc \
+     LEFT=$(docker compose -p "$P" exec -T postgres psql -U notifications -d notifications -tAc \
        "select count(*) from notifications where status in ('queued','processing')")
      [ "$LEFT" = 0 ] && break
      sleep 1
    done
    echo "left=$LEFT"
-   docker compose -p "$P" exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -tAc \
+   docker compose -p "$P" exec -T postgres psql -U notifications -d notifications -tAc \
      "select channel, status, count(*) from notifications group by 1, 2 order by 1, 2"
    ```
 

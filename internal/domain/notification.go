@@ -17,6 +17,9 @@ const (
 	ChannelPush  Channel = "push"
 )
 
+// Channels lists the three channels; each has its own rate limit (K5).
+var Channels = []Channel{ChannelSMS, ChannelEmail, ChannelPush}
+
 // Priority orders work within a channel (K8). The database enum declares the
 // same values in this order (K37).
 type Priority string
@@ -94,6 +97,47 @@ type Claim struct {
 	// returned the claim. The worker adds it to the time it took before sending
 	// the claim, never to the time the answer arrived.
 	LeaseRemaining time.Duration
+	// PermitRemaining is the time left until the permit's start deadline,
+	// computed by the database in the same way (K42). The send must start
+	// before that deadline.
+	PermitRemaining time.Duration
+}
+
+// ClaimRequest is one claim attempt on one channel (K5, K42).
+type ClaimRequest struct {
+	Channel     Channel
+	Lease       time.Duration
+	MaxAttempts int
+	// PermitInterval is the least time between two permits of the channel.
+	PermitInterval time.Duration
+	// PermitGrace is how long after its time a permit may start a send.
+	PermitGrace time.Duration
+}
+
+// ClaimOutcome is what a claim attempt found (K5).
+type ClaimOutcome string
+
+// The four claim outcomes.
+const (
+	// ClaimClaimed: a notification and a permit.
+	ClaimClaimed ClaimOutcome = "claimed"
+	// ClaimThrottled: the channel's next permit is not due yet.
+	ClaimThrottled ClaimOutcome = "throttled"
+	// ClaimBusy: another worker holds the channel's limiter row.
+	ClaimBusy ClaimOutcome = "busy"
+	// ClaimEmpty: the permit is due, but no notification is; the permit was
+	// not used.
+	ClaimEmpty ClaimOutcome = "empty"
+)
+
+// ClaimResult is the answer to one claim attempt.
+type ClaimResult struct {
+	Outcome ClaimOutcome
+	// Claim is set when Outcome is ClaimClaimed.
+	Claim Claim
+	// Wait is the time until the next permit is due, computed by the
+	// database, when Outcome is ClaimThrottled.
+	Wait time.Duration
 }
 
 // Recovered is a notification whose expired lease recovery took back (K3, K9,

@@ -66,6 +66,8 @@ func run() int {
 		BackoffCap:       cfg.BackoffCap,
 		RecoveryInterval: cfg.RecoveryInterval,
 		RecoveryBatch:    cfg.RecoveryBatch,
+		PermitInterval:   cfg.PermitInterval,
+		PermitGrace:      cfg.PermitGrace,
 	})
 
 	// After the first signal, a second one terminates the process at once.

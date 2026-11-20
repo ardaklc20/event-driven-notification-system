@@ -11,60 +11,82 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 )
 
-// slowClaimer answers a claim after delay with a fixed remaining lease and
+// unusedStore fails every call; fakes embed it and override what they use.
+type unusedStore struct{}
+
+var errNotUsed = errors.New("not used")
+
+func (unusedStore) ClaimNext(context.Context, domain.ClaimRequest) (domain.ClaimResult, error) {
+	return domain.ClaimResult{}, errNotUsed
+}
+
+func (unusedStore) MarkSent(context.Context, string, string, domain.Acceptance) (bool, error) {
+	return false, errNotUsed
+}
+
+func (unusedStore) MarkFailed(context.Context, string, string, string) (bool, error) {
+	return false, errNotUsed
+}
+
+func (unusedStore) MarkRetry(context.Context, string, string, string, time.Duration) (bool, error) {
+	return false, errNotUsed
+}
+
+func (unusedStore) GiveBack(context.Context, string, string) (bool, error) {
+	return false, errNotUsed
+}
+
+func (unusedStore) RecoverExpired(context.Context, int, int) ([]domain.Recovered, error) {
+	return nil, errNotUsed
+}
+
+// slowClaimer answers a claim after delay with fixed remaining times and
 // records when it was called and when it answered.
 type slowClaimer struct {
+	unusedStore
 	delay      time.Duration
-	remaining  time.Duration
+	lease      time.Duration
+	permit     time.Duration
 	calledAt   time.Time
 	answeredAt time.Time
 }
 
-func (s *slowClaimer) ClaimNext(context.Context, time.Duration, int) (domain.Claim, bool, error) {
+func (s *slowClaimer) ClaimNext(context.Context, domain.ClaimRequest) (domain.ClaimResult, error) {
 	s.calledAt = time.Now()
 	time.Sleep(s.delay)
 	s.answeredAt = time.Now()
-	return domain.Claim{ID: "n-1", LeaseToken: "token", Attempt: 1, LeaseRemaining: s.remaining}, true, nil
-}
-
-func (s *slowClaimer) MarkSent(context.Context, string, string, domain.Acceptance) (bool, error) {
-	return false, errors.New("not used")
-}
-
-func (s *slowClaimer) MarkFailed(context.Context, string, string, string) (bool, error) {
-	return false, errors.New("not used")
-}
-
-func (s *slowClaimer) MarkRetry(context.Context, string, string, string, time.Duration) (bool, error) {
-	return false, errors.New("not used")
-}
-
-func (s *slowClaimer) RecoverExpired(context.Context, int, int) ([]domain.Recovered, error) {
-	return nil, errors.New("not used")
+	return domain.ClaimResult{Outcome: domain.ClaimClaimed, Claim: domain.Claim{
+		ID: "n-1", LeaseToken: "token", Attempt: 1, LeaseRemaining: s.lease, PermitRemaining: s.permit,
+	}}, nil
 }
 
 // TestLeaseDeadlineFromClaimStart: the claim takes 1 second and returns a
-// remaining lease of 30 seconds. The deadline must come from the time read
-// before the claim was sent, never from the time its answer arrived (K3).
-// synctest's clock moves only when every goroutine waits, so the times are
-// exact.
+// remaining lease of 30 seconds and a remaining permit of 100 ms. Both
+// deadlines must come from the time read before the claim was sent, never
+// from the time its answer arrived (K3, K42). synctest's clock moves only when
+// every goroutine waits, so the times are exact.
 func TestLeaseDeadlineFromClaimStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		const remaining = 30 * time.Second
-		store := &slowClaimer{delay: time.Second, remaining: remaining}
-		w := New(store, nil, slog.New(slog.DiscardHandler), Config{LeaseDuration: remaining, MaxAttempts: 5})
+		const lease, permit = 30 * time.Second, 100 * time.Millisecond
+		store := &slowClaimer{delay: time.Second, lease: lease, permit: permit}
+		w := New(store, nil, slog.New(slog.DiscardHandler), Config{LeaseDuration: lease, MaxAttempts: 5})
 
-		c, ok, err := w.claim(t.Context())
-		if err != nil || !ok {
-			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		a, err := w.claim(t.Context(), domain.ChannelSMS)
+		if err != nil || a.Outcome != domain.ClaimClaimed {
+			t.Fatalf("claim: %+v err=%v", a, err)
 		}
-		if c.deadline.After(store.calledAt.Add(remaining)) {
-			t.Errorf("deadline %s is after t0 + 30 s = %s", c.deadline, store.calledAt.Add(remaining))
+		c := a.claimed
+		if !c.deadline.Equal(store.calledAt.Add(lease)) {
+			t.Errorf("lease deadline %s, want t0 + 30 s = %s", c.deadline, store.calledAt.Add(lease))
 		}
-		if latest := store.answeredAt.Add(remaining - time.Second); c.deadline.After(latest) {
-			t.Errorf("deadline %s is later than the answer's arrival + 30 s − 1 s = %s", c.deadline, latest)
+		if !c.startBy.Equal(store.calledAt.Add(permit)) {
+			t.Errorf("start deadline %s, want t0 + 100 ms = %s", c.startBy, store.calledAt.Add(permit))
 		}
-		t.Logf("t0=%s answer=%s deadline=%s", store.calledAt.Format(time.TimeOnly),
-			store.answeredAt.Format(time.TimeOnly), c.deadline.Format(time.TimeOnly))
+		if !c.startBy.Before(store.answeredAt) {
+			t.Errorf("start deadline %s is not before the answer's arrival %s: the 1 s claim used up the permit",
+				c.startBy, store.answeredAt)
+		}
+		t.Logf("t0=%s answer=%s lease deadline=%s start deadline=%s", store.calledAt.Format(time.TimeOnly),
+			store.answeredAt.Format(time.TimeOnly), c.deadline.Format(time.TimeOnly), c.startBy.Format(time.StampMilli))
 	})
 }

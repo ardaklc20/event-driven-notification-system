@@ -44,9 +44,39 @@ func insertQueued(t *testing.T, pool *pgxpool.Pool, n int) []string {
 	return ids
 }
 
+// request is a claim on ch with no spacing between permits, so tests that
+// are not about the rate limit can claim back to back.
+func request(ch domain.Channel) domain.ClaimRequest {
+	return domain.ClaimRequest{
+		Channel: ch, Lease: testLease, MaxAttempts: maxAttempts,
+		PermitInterval: 0, PermitGrace: time.Minute,
+	}
+}
+
+// claim makes claim attempts until one claims a notification (ok) or finds
+// the channel empty. It tries again after busy or throttled: another claimer
+// held the limiter row or had just taken the permit.
+func claim(ctx context.Context, store *postgres.Store, req domain.ClaimRequest) (domain.Claim, bool, error) {
+	for {
+		res, err := store.ClaimNext(ctx, req)
+		if err != nil {
+			return domain.Claim{}, false, err
+		}
+		switch res.Outcome {
+		case domain.ClaimClaimed:
+			return res.Claim, true, nil
+		case domain.ClaimEmpty:
+			return domain.Claim{}, false, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return domain.Claim{}, false, err
+		}
+	}
+}
+
 func mustClaim(t *testing.T, store *postgres.Store) domain.Claim {
 	t.Helper()
-	c, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts)
+	c, ok, err := claim(t.Context(), store, request(domain.ChannelSMS))
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -103,7 +133,7 @@ func TestClaimSetsLease(t *testing.T) {
 		t.Fatalf("lease expiry in the future = %v (err %v)", inFuture, err)
 	}
 
-	if _, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts); ok || err != nil {
+	if _, ok, err := claim(t.Context(), store, request(domain.ChannelSMS)); ok || err != nil {
 		t.Fatalf("second claim on an empty queue: ok=%v err=%v", ok, err)
 	}
 }
@@ -132,7 +162,7 @@ func TestSingleLease(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			for {
-				c, ok, err := store.ClaimNext(ctx, testLease, maxAttempts)
+				c, ok, err := claim(ctx, store, request(domain.ChannelSMS))
 				if err != nil {
 					errs[i] = err
 					return
@@ -323,7 +353,7 @@ func TestRetryWrite(t *testing.T) {
 	if wait != 2*time.Second {
 		t.Fatalf("available_at is %s after the write, want 2s", wait)
 	}
-	if _, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts); ok || err != nil {
+	if _, ok, err := claim(t.Context(), store, request(domain.ChannelSMS)); ok || err != nil {
 		t.Fatalf("claimed a retry before its time: ok=%v err=%v", ok, err)
 	}
 }
@@ -337,7 +367,7 @@ func TestClaimAttemptLimit(t *testing.T) {
 	if _, err := pool.Exec(t.Context(), `UPDATE notifications SET attempts = $1`, maxAttempts); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := store.ClaimNext(t.Context(), testLease, maxAttempts); ok || err != nil {
+	if _, ok, err := claim(t.Context(), store, request(domain.ChannelSMS)); ok || err != nil {
 		t.Fatalf("claimed a row with %d attempts: ok=%v err=%v", maxAttempts, ok, err)
 	}
 }
@@ -388,7 +418,9 @@ func TestStaleWriteAfterRecovery(t *testing.T) {
 	if _, err := pool.Exec(t.Context(), `UPDATE notifications SET attempts = $1 - 1`, maxAttempts); err != nil {
 		t.Fatal(err)
 	}
-	c, ok, err := store.ClaimNext(t.Context(), 200*time.Millisecond, maxAttempts)
+	short := request(domain.ChannelSMS)
+	short.Lease = 200 * time.Millisecond
+	c, ok, err := claim(t.Context(), store, short)
 	if err != nil || !ok || c.Attempt != maxAttempts {
 		t.Fatalf("claim: %+v ok=%v err=%v, want attempt %d", c, ok, err, maxAttempts)
 	}

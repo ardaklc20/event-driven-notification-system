@@ -88,7 +88,7 @@ type Worker struct {
 	// ResultBudget is the part of the lease kept for writing a result.
 	ResultBudget   time.Duration `env:"RESULT_BUDGET" envDefault:"5s"`
 	LeaseDuration  time.Duration `env:"LEASE_DURATION" envDefault:"30s"`
-	InFlight       int           `env:"IN_FLIGHT" envDefault:"20"`
+	InFlight       int           `env:"IN_FLIGHT" envDefault:"30"`
 	IdleWait       time.Duration `env:"IDLE_WAIT" envDefault:"200ms"`
 	ShutdownBudget time.Duration `env:"SHUTDOWN_BUDGET" envDefault:"10s"`
 	LogLevel       slog.Level    `env:"LOG_LEVEL" envDefault:"info"`
@@ -102,7 +102,19 @@ type Worker struct {
 	// Lease recovery (K40).
 	RecoveryInterval time.Duration `env:"RECOVERY_INTERVAL" envDefault:"5s"`
 	RecoveryBatch    int           `env:"RECOVERY_BATCH" envDefault:"100"`
+
+	// Channel permits (K5, K42): the least time between two permits of a
+	// channel, and how long after its time a permit may start a send.
+	PermitInterval time.Duration `env:"PERMIT_INTERVAL" envDefault:"11ms"`
+	PermitGrace    time.Duration `env:"PERMIT_GRACE" envDefault:"100ms"`
 }
+
+// rateWindow and rateLimit are the case's limit: 100 send starts per channel
+// in any one-second window (R8).
+const (
+	rateWindow = time.Second
+	rateLimit  = 100
+)
 
 // Validate checks what the struct tags cannot (K32).
 func (c Worker) Validate() error {
@@ -122,6 +134,7 @@ func (c Worker) Validate() error {
 		"IDLE_WAIT":         c.IdleWait,
 		"SHUTDOWN_BUDGET":   c.ShutdownBudget,
 		"RECOVERY_INTERVAL": c.RecoveryInterval,
+		"PERMIT_GRACE":      c.PermitGrace,
 	} {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %s", name, d))
@@ -144,6 +157,15 @@ func (c Worker) Validate() error {
 	}
 	if c.RecoveryBatch < 1 {
 		errs = append(errs, fmt.Errorf("RECOVERY_BATCH must be at least 1, got %d", c.RecoveryBatch))
+	}
+	// K42's bound: 101 starts need 101 permits, the first and the last at
+	// least 100 × PERMIT_INTERVAL apart, and a start comes at most
+	// PERMIT_GRACE after its permit. The first and the last start are then at
+	// least 100 × PERMIT_INTERVAL − PERMIT_GRACE apart, which must not be
+	// below one second.
+	if time.Duration(rateLimit)*c.PermitInterval-c.PermitGrace < rateWindow {
+		errs = append(errs, fmt.Errorf("100 × PERMIT_INTERVAL (%s) − PERMIT_GRACE (%s) must be at least 1s",
+			c.PermitInterval, c.PermitGrace))
 	}
 	return errors.Join(errs...)
 }

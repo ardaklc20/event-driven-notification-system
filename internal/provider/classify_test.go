@@ -119,7 +119,7 @@ func TestRetryAfterHeaderReturned(t *testing.T) {
 		w.Header().Set("Retry-After", "7")
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	resp, err := provider.NewClient(srv.URL, time.Second, 1).Send(t.Context(), provider.Request{To: "x", Channel: "sms", Content: "c"})
+	resp, err := provider.NewClient(srv.URL, time.Second, 1).Send(permitted(t), provider.Request{To: "x", Channel: "sms", Content: "c"})
 	if err != nil || resp.StatusCode != 503 || resp.RetryAfter != "7" {
 		t.Fatalf("resp %+v, err %v; want 503 with Retry-After 7", resp, err)
 	}

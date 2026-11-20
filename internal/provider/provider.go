@@ -85,7 +85,8 @@ func NewClient(providerURL string, timeout time.Duration, maxIdleConns int) *Cli
 		url:     providerURL,
 		timeout: timeout,
 		http: &http.Client{
-			Transport: transport,
+			// Every request passes the start gate (K42).
+			Transport: startGate{next: transport},
 			// Redirects are not followed: the first response comes back as it
 			// is, so a POST never reaches a second address (K14).
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -104,11 +105,14 @@ func (e *TransportError) Error() string { return "provider call: " + e.Err.Error
 // Unwrap returns the cause, so errors.Is(err, context.DeadlineExceeded) works.
 func (e *TransportError) Unwrap() error { return e.Err }
 
-// Send posts req. The call ends at the earlier of ctx's deadline and the
-// client's timeout. A *TransportError means no status line arrived; any other
-// error means the request could not be built. Once a 202 status
-// line has arrived, Send never returns an error: a body that is broken, or
-// that stops arriving before the deadline, only sets BodyProblem.
+// Send posts req. ctx must carry a Permit (WithPermit): the request starts
+// only before the permit's start deadline (K42). The call ends at the earlier
+// of ctx's deadline and the client's timeout. ErrStartDeadline means the
+// request was never handed to the transport; a *TransportError means no
+// status line arrived; any other error means the request could not be built
+// or had no permit. Once a 202 status line has arrived, Send never returns an
+// error: a body that is broken, or that stops arriving before the deadline,
+// only sets BodyProblem.
 func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -132,6 +136,10 @@ func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) {
 			err = urlErr.Err
+		}
+		// The gate's own refusals: nothing reached the transport.
+		if errors.Is(err, ErrStartDeadline) || errors.Is(err, ErrNoPermit) {
+			return Response{}, err
 		}
 		return Response{}, &TransportError{Err: err}
 	}

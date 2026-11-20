@@ -12,31 +12,66 @@ import (
 )
 
 const (
-	// claimSQL takes the oldest due queued row that still has attempts left
-	// and that no other transaction has locked, puts it under a new lease and
-	// counts the attempt, in one statement (K2, K3, K9). The remaining lease
-	// comes back as microseconds computed by the database clock, so the worker
-	// never adds its own idea of the claim's round trip to it.
+	// claimSQL is one claim attempt on one channel, in one statement and so
+	// in one short transaction (K5, K8, K42). $1 channel, $2 max attempts,
+	// $3 lease, $4 permit interval, $5 permit grace (microseconds).
+	//
+	//  1. permit locks the channel's limiter row, skipping it when another
+	//     worker holds it (no row: busy), and reads the database clock once:
+	//     the permit time. MATERIALIZED keeps it one reading.
+	//  2. next takes one due notification of that channel, only when the
+	//     permit is due (otherwise the scalar subquery is NULL and nothing
+	//     matches): high → normal → low as the enum declares them, then
+	//     available_at, then id, served by notifications_claim_idx.
+	//  3. claimed writes the lease and counts the attempt (K3, K9).
+	//  4. moved sets the next permit PERMIT_INTERVAL after this one, only when
+	//     a notification was claimed: an empty channel keeps its permit.
+	//
+	// The lease, the next permit and the start deadline all derive from the
+	// one permit time. The time left until the lease's end and until the start
+	// deadline is read at the end of the statement; a later reading can only
+	// shorten it. wait_us is how long until the permit is due; it is above
+	// zero only when the attempt was throttled.
 	claimSQL = `
-		WITH next AS (
-			SELECT id
-			FROM notifications
-			WHERE status = 'queued' AND available_at <= clock_timestamp() AND attempts < $2
-			ORDER BY available_at, id
+		WITH permit AS MATERIALIZED (
+			SELECT l.channel, l.next_permit_at, c.permit_at
+			FROM channel_limits AS l, (SELECT clock_timestamp() AS permit_at) AS c
+			WHERE l.channel = $1
+			FOR UPDATE OF l SKIP LOCKED
+		), next AS (
+			SELECT n.id
+			FROM notifications AS n
+			WHERE n.channel = $1
+			  AND n.status = 'queued'
+			  AND n.available_at <= (SELECT p.permit_at FROM permit AS p WHERE p.next_permit_at <= p.permit_at)
+			  AND n.attempts < $2
+			ORDER BY n.priority, n.available_at, n.id
 			LIMIT 1
-			FOR UPDATE SKIP LOCKED
+			FOR UPDATE OF n SKIP LOCKED
+		), claimed AS (
+			UPDATE notifications AS n
+			SET status           = 'processing',
+			    lease_token      = gen_random_uuid(),
+			    lease_expires_at = p.permit_at + $3::bigint * interval '1 microsecond',
+			    attempts         = n.attempts + 1,
+			    updated_at       = p.permit_at
+			FROM next, permit AS p
+			WHERE n.id = next.id
+			RETURNING n.id, n.recipient, n.channel, n.content, n.correlation_id, n.attempts,
+			          n.lease_token, n.lease_expires_at
+		), moved AS (
+			UPDATE channel_limits AS l
+			SET next_permit_at = p.permit_at + $4::bigint * interval '1 microsecond'
+			FROM permit AS p
+			WHERE l.channel = p.channel AND EXISTS (SELECT 1 FROM claimed)
 		)
-		UPDATE notifications AS n
-		SET status           = 'processing',
-		    lease_token      = gen_random_uuid(),
-		    lease_expires_at = clock_timestamp() + $1::bigint * interval '1 microsecond',
-		    attempts         = n.attempts + 1,
-		    updated_at       = clock_timestamp()
-		FROM next
-		WHERE n.id = next.id
-		RETURNING n.id::text, n.recipient, n.channel, n.content, n.correlation_id, n.attempts,
-		          n.lease_token::text,
-		          floor(extract(epoch FROM n.lease_expires_at - clock_timestamp()) * 1000000)::bigint`
+		SELECT floor(extract(epoch FROM p.next_permit_at - p.permit_at) * 1000000)::bigint,
+		       c.id::text, c.recipient, c.channel, c.content, c.correlation_id, c.attempts,
+		       c.lease_token::text,
+		       floor(extract(epoch FROM c.lease_expires_at - clock_timestamp()) * 1000000)::bigint,
+		       floor(extract(epoch FROM p.permit_at + $5::bigint * interval '1 microsecond' - clock_timestamp())
+		             * 1000000)::bigint
+		FROM permit AS p LEFT JOIN claimed AS c ON true`
 
 	// Every result write reads the database clock once (c.now) and carries the
 	// lease condition (K3, K9): the row is still processing, under this claim's
@@ -79,6 +114,19 @@ const (
 		    lease_expires_at = NULL,
 		    updated_at       = c.now` + resultFrom
 
+	// giveBackSQL undoes a claim whose send never started because its permit's
+	// start deadline had passed (K42): the request certainly never reached the
+	// HTTP transport, so the attempt is returned. It carries the lease
+	// condition and clears the token, so it can change the row only once. The
+	// permit is not given back.
+	giveBackSQL = `
+		UPDATE notifications AS n
+		SET status           = 'queued',
+		    attempts         = n.attempts - 1,
+		    lease_token      = NULL,
+		    lease_expires_at = NULL,
+		    updated_at       = c.now` + resultFrom
+
 	// recoverSQL takes back at most $2 rows whose lease has expired by the
 	// database clock (K3, K9, K40). SKIP LOCKED lets several workers recover at
 	// the same time without taking the same row. A row with attempts left goes
@@ -107,25 +155,41 @@ const (
 // RecoveredError is the last_error recovery writes.
 const RecoveredError = "temporary: lease expired before a result was written"
 
-// ClaimNext claims one due queued notification that has had fewer than
-// maxAttempts attempts. ok is false when there is none.
-func (s *Store) ClaimNext(ctx context.Context, lease time.Duration, maxAttempts int) (claim domain.Claim, ok bool, err error) {
+// ClaimNext makes one claim attempt on req.Channel (K5). It takes the
+// channel's permit and one due notification together, or neither.
+func (s *Store) ClaimNext(ctx context.Context, req domain.ClaimRequest) (domain.ClaimResult, error) {
 	var (
-		channel     string
-		remainingUS int64
+		waitUS                                       int64
+		id, recipient, channel, content, corr, token *string
+		attempt                                      *int
+		leaseUS, permitUS                            *int64
 	)
-	err = s.pool.QueryRow(ctx, claimSQL, lease.Microseconds(), maxAttempts).Scan(
-		&claim.ID, &claim.Recipient, &channel, &claim.Content, &claim.CorrelationID, &claim.Attempt,
-		&claim.LeaseToken, &remainingUS)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Claim{}, false, nil
+	err := s.pool.QueryRow(ctx, claimSQL, string(req.Channel), req.MaxAttempts, req.Lease.Microseconds(),
+		req.PermitInterval.Microseconds(), req.PermitGrace.Microseconds()).Scan(
+		&waitUS, &id, &recipient, &channel, &content, &corr, &attempt, &token, &leaseUS, &permitUS)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// SKIP LOCKED found the limiter row held by another worker.
+		return domain.ClaimResult{Outcome: domain.ClaimBusy}, nil
+	case err != nil:
+		return domain.ClaimResult{}, fmt.Errorf("claim: %w", err)
+	case id != nil:
+		return domain.ClaimResult{Outcome: domain.ClaimClaimed, Claim: domain.Claim{
+			ID:              *id,
+			Recipient:       *recipient,
+			Channel:         domain.Channel(*channel),
+			Content:         *content,
+			CorrelationID:   *corr,
+			Attempt:         *attempt,
+			LeaseToken:      *token,
+			LeaseRemaining:  time.Duration(*leaseUS) * time.Microsecond,
+			PermitRemaining: time.Duration(*permitUS) * time.Microsecond,
+		}}, nil
+	case waitUS > 0:
+		return domain.ClaimResult{Outcome: domain.ClaimThrottled, Wait: time.Duration(waitUS) * time.Microsecond}, nil
+	default:
+		return domain.ClaimResult{Outcome: domain.ClaimEmpty}, nil
 	}
-	if err != nil {
-		return domain.Claim{}, false, fmt.Errorf("claim: %w", err)
-	}
-	claim.Channel = domain.Channel(channel)
-	claim.LeaseRemaining = time.Duration(remainingUS) * time.Microsecond
-	return claim, true, nil
 }
 
 // MarkSent records the provider's acceptance. It reports false when the lease
@@ -153,6 +217,13 @@ func (s *Store) MarkFailed(ctx context.Context, id, leaseToken, lastError string
 // in which case no row changed.
 func (s *Store) MarkRetry(ctx context.Context, id, leaseToken, lastError string, wait time.Duration) (bool, error) {
 	return s.exec(ctx, "mark retry", markRetrySQL, id, leaseToken, lastError, wait.Microseconds())
+}
+
+// GiveBack returns a claim whose send never started (K42): queued again with
+// its attempt returned. It reports false when the lease was no longer valid
+// or the claim was already given back, in which case no row changed.
+func (s *Store) GiveBack(ctx context.Context, id, leaseToken string) (bool, error) {
+	return s.exec(ctx, "give back", giveBackSQL, id, leaseToken)
 }
 
 func (s *Store) exec(ctx context.Context, what, query string, args ...any) (bool, error) {
