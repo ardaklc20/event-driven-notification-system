@@ -4,7 +4,7 @@
 
 A notification service in Go that queues SMS, email and push notifications in PostgreSQL and delivers them to an external provider under a per-channel rate limit. It is built in slices; see [`docs/PLAN.md`](docs/PLAN.md) for the delivery order and status.
 
-**Current state (slice 7):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, and notifications can be listed with filters and a cursor.
+**Current state (slice 8):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, and up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged.
 
 ## Requirements
 
@@ -49,7 +49,7 @@ client ──POST /notifications──► api ──INSERT──► notification
                                  202 at once     (PostgreSQL, the queue)
 ```
 
-- The API validates the request, saves the notification as `queued` and answers `202`. It never calls the provider, so its response time does not depend on the provider.
+- The API validates the request, saves the notification as `queued` (or, for a batch, all of up to 1,000 notifications in one transaction) and answers `202`. It never calls the provider, so its response time does not depend on the provider.
 - The `notifications` table is the queue. A worker claims on one channel at a time: in one statement it takes the channel's permit from its row in `channel_limits` and the channel's next due `queued` notification (`high → normal → low`, then the earliest `available_at`), both with `SKIP LOCKED`, and puts the notification under a lease: `processing`, a new `lease_token`, `lease_expires_at` 30 seconds ahead and `attempts + 1` ([Rate limit and priority](#rate-limit-and-priority)). Several workers can run against the same table (`docker compose up --scale worker=2`); they share each channel's permits, and a notification has one valid lease at a time.
 - The worker posts `{to, channel, content}` to `PROVIDER_URL` with the notification's `X-Correlation-ID`, a 5-second timeout and no redirects. The send starts only before the permit's start deadline, and the call ends at least `RESULT_BUDGET` before the lease does.
 - The result is written only while the row is still `processing` under the same token and the lease has not expired by the database clock. A `202` ends as `sent` with `provider_message_id`, `provider_timestamp` and `sent_at`. A `202` whose body is broken, or never finishes arriving, still ends as `sent`, with those fields empty and a warning in the log: the provider accepted the notification, and a second POST could deliver it twice.
@@ -148,7 +148,7 @@ The API answers `202 Accepted` as soon as the notification is saved; delivery ha
 curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
 ```
 
-Returns `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` and `updated_at`. An unknown ID gets `404`, a malformed one `422`. The three provider fields are filled when the notification is `sent`: `provider_message_id` and `provider_timestamp` come from the provider's `202` body, `sent_at` is when the acceptance was recorded. `provider_message_id` is not unique: a provider with a static response, such as a free webhook.site URL, gives every notification the same ID.
+Returns `id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `batch_id` (`null` for a single create), `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` and `updated_at`. An unknown ID gets `404`, a malformed one `422`. The three provider fields are filled when the notification is `sent`: `provider_message_id` and `provider_timestamp` come from the provider's `202` body, `sent_at` is when the acceptance was recorded. `provider_message_id` is not unique: a provider with a static response, such as a free webhook.site URL, gives every notification the same ID.
 
 ### List notifications
 
@@ -199,6 +199,36 @@ The `409` is an RFC 9457 problem whose `current_status` names the notification's
 
 The cancel locks the row and decides from the status it reads under the lock. A cancel and a worker's claim racing for the same notification always end with one winner: either the notification is `cancelled` and no POST goes out for it, or the worker holds it and the cancel gets `409`. A notification waiting for a retry is `queued`, so it can be cancelled then, and no further POST follows. There is no batch cancel.
 
+### Batches
+
+```bash
+curl -s -X POST http://localhost:8080/notifications/batch \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: campaign-42' \
+  -d '{"notifications":[
+        {"recipient":"+905551234567","channel":"sms","content":"one","priority":"high"},
+        {"recipient":"a@example.com","channel":"email","content":"two"},
+        {"recipient":"device-token-1","channel":"push","content":"three","priority":"low"}]}'
+```
+
+```json
+{"batch_id":"01a1f9f2-5de8-77ce-bd30-03a9e9616567","notification_ids":["…","…","…"]}
+```
+
+A batch holds 1 to 1,000 notifications, each with its own channel and priority, and is saved **all or nothing**: every item is checked with the same rules as a single create, every error is collected, and if any item is invalid the answer is `422` with each error's item in its location (`body.notifications[5].channel`) and nothing is saved. Otherwise one transaction writes the batch, all its notifications and the idempotency key. `notification_ids[i]` belongs to `notifications[i]`. Every item stores the request's `X-Correlation-ID`.
+
+There are two separate limits: the item count (1 to 1,000; `0` or `1001` gets `422`) and the request body size: 16 MiB by default, set with `BATCH_MAX_BODY_BYTES`, answered with `413`. The body limit is not derived from the content limits, because escaped JSON can take 12 bytes for one emoji (`\ud83d\ude00`). So a batch of large items can get `413` with fewer than 1,000 items; split it into smaller batches.
+
+```bash
+curl -s 'http://localhost:8080/batches/01a1f9f2-5de8-77ce-bd30-03a9e9616567?limit=50'
+```
+
+```json
+{"id":"01a1f9f2-…","item_count":3,"created_at":"…","counts":{"queued":0,"processing":0,"sent":3,"failed":0,"cancelled":0},"items":[…]}
+```
+
+`counts` lists all five statuses, zeros included. `items` are the batch's own notifications in the listing order, paged with `limit` (50 by default, 1 to 200) and `next_cursor` exactly as in [List notifications](#list-notifications). The counts and the page are read in one snapshot, so they agree with each other; the next page is a new read. An unknown batch gets `404`.
+
 ### Idempotency
 
 `Idempotency-Key` is optional. When present it must be sent once and hold 1 to 128 characters from `A–Z a–z 0–9 . _ -`; otherwise the request gets `400` and nothing is saved.
@@ -206,11 +236,12 @@ The cancel locks the row and decides from the status it reads under the lock. A 
 - The same key with the same request returns the **first** `202` response, byte for byte, and creates nothing new. `GET` shows the current state.
 - The same key with a different request gets `422`.
 - Two requests without a key are two notifications.
+- One key covers a whole batch. A key first used for a single create gets `422` when sent with a batch, and the other way round.
 - Keys are kept as long as the notification they created, and they are global, because there is no authentication. A production system would expire keys after a documented time and scope them per client.
 
 ### Validation
 
-Every rule violation gets `422` with one entry per field (`location` and `message`); malformed JSON gets `400`. Request bodies are never echoed back in errors.
+Every rule violation gets `422` with one entry per field (`location` and `message`); in a batch the location names the item, as in `body.notifications[7].recipient`. Malformed JSON gets `400`. Request bodies are never echoed back in errors.
 
 | Field | Rule |
 |---|---|
@@ -290,6 +321,7 @@ Each program reads typed environment variables and refuses to start with an inva
 | `SMS_CONTENT_LIMIT` | `160` | Content limit for `sms`, in Unicode code points |
 | `EMAIL_CONTENT_LIMIT` | `10000` | Content limit for `email` |
 | `PUSH_CONTENT_LIMIT` | `1000` | Content limit for `push` |
+| `BATCH_MAX_BODY_BYTES` | `16777216` (16 MiB) | Largest `POST /notifications/batch` body; a larger one gets `413` |
 
 ### Worker settings
 
@@ -372,9 +404,9 @@ cmd/loadgen/            sends the rate-limit load through the API
 cmd/ratecount/          counts send starts per one-second window from worker logs
 internal/config/        typed environment configuration
 internal/domain/        notification types, validation, request hash
-internal/service/       create, read, cancel and list rules; the listing cursor
+internal/service/       create, read, cancel, list and batch rules; the listing cursor
 internal/httpapi/       router, Huma operations, middleware
-internal/postgres/      connection pool and all SQL: create, read, list, cancel, claim with permit, result writes, give-back, recovery
+internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, claim with permit, result writes, give-back, recovery
 internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery
 internal/provider/      provider HTTP client, start gate, response classification, Retry-After
 internal/ratecheck/     largest count in a half-open one-second window
@@ -400,7 +432,7 @@ docs/                   requirements, decisions, plan, AI usage
 
 SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başına bir hız sınırı altında harici bir provider'a ileten, Go ile yazılmış bir bildirim servisi. Dilimler halinde geliştiriliyor; teslim sırası ve durum için [`docs/PLAN.md`](docs/PLAN.md).
 
-**Şu anki durum (dilim 7):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir.
+**Şu anki durum (dilim 8):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir.
 
 ## Gereksinimler
 
@@ -445,7 +477,7 @@ istemci ──POST /notifications──► api ──INSERT──► notificatio
                                   hemen 202       (PostgreSQL, kuyruk)
 ```
 
-- API isteği doğrular, bildirimi `queued` olarak kaydeder ve `202` döner. Provider'ı hiç çağırmaz; bu yüzden yanıt süresi provider'a bağlı değildir.
+- API isteği doğrular, bildirimi `queued` olarak kaydeder (toplu istekte en fazla 1.000 bildirimin hepsini tek bir transaction'da) ve `202` döner. Provider'ı hiç çağırmaz; bu yüzden yanıt süresi provider'a bağlı değildir.
 - Kuyruk `notifications` tablosunun kendisidir. Worker her seferinde tek bir kanalda claim yapar: tek bir ifadede kanalın `channel_limits`'teki satırından iznini ve kanalın zamanı gelmiş sıradaki `queued` bildirimini (`high → normal → low`, sonra en erken `available_at`) ikisi de `SKIP LOCKED` ile alır ve bildirimi bir lease altına koyar: `processing`, yeni bir `lease_token`, 30 saniye sonrası için `lease_expires_at` ve `attempts + 1` ([Hız sınırı ve öncelik](#hız-sınırı-ve-öncelik)). Aynı tabloya karşı birden fazla worker çalışabilir (`docker compose up --scale worker=2`); her kanalın izinlerini paylaşırlar ve bir bildirimin aynı anda tek bir geçerli lease'i olur.
 - Worker `{to, channel, content}` gövdesini, bildirimin `X-Correlation-ID`'siyle, 5 saniyelik zaman aşımıyla ve yönlendirmeleri izlemeden `PROVIDER_URL`'e POST eder. Gönderim yalnızca iznin başlama son anından önce başlar ve çağrı, lease bitmeden en az `RESULT_BUDGET` önce sona erer.
 - Sonuç yalnızca satır hâlâ aynı token altında `processing` iken ve lease veritabanı saatine göre dolmamışken yazılır. `202`, `provider_message_id`, `provider_timestamp` ve `sent_at` ile `sent` olarak biter. Gövdesi bozuk olan ya da gelmesi hiç bitmeyen bir `202` de `sent` olarak biter; bu alanlar boş kalır ve log'a bir uyarı yazılır: provider bildirimi kabul etmiştir ve ikinci bir POST onu iki kez teslim edebilir.
@@ -544,7 +576,7 @@ API, bildirim kaydedilir kaydedilmez `202 Accepted` döner; teslim daha sonra bi
 curl -s http://localhost:8080/notifications/01a1f8ad-6307-7877-9585-950a91640e40
 ```
 
-`id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` ve `updated_at` döner. Bilinmeyen bir ID `404`, bozuk biçimli bir ID `422` alır. Üç provider alanı bildirim `sent` olduğunda dolar: `provider_message_id` ve `provider_timestamp` provider'ın `202` gövdesinden gelir, `sent_at` kabulün kaydedildiği andır. `provider_message_id` benzersiz değildir: ücretsiz bir webhook.site URL'i gibi sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
+`id`, `recipient`, `channel`, `content`, `priority`, `status`, `attempts`, `last_error`, `batch_id` (tekil oluşturmada `null`), `provider_message_id`, `provider_timestamp`, `sent_at`, `created_at` ve `updated_at` döner. Bilinmeyen bir ID `404`, bozuk biçimli bir ID `422` alır. Üç provider alanı bildirim `sent` olduğunda dolar: `provider_message_id` ve `provider_timestamp` provider'ın `202` gövdesinden gelir, `sent_at` kabulün kaydedildiği andır. `provider_message_id` benzersiz değildir: ücretsiz bir webhook.site URL'i gibi sabit yanıt veren bir provider her bildirime aynı ID'yi verir.
 
 ### Bildirimleri listeleme
 
@@ -595,6 +627,36 @@ Yalnızca **bekleyen** bir bildirim iptal edilebilir ve bekleyen, `queued` demek
 
 İptal satırı kilitler ve kilit altında okuduğu duruma göre karar verir. Aynı bildirim için yarışan bir iptal ile bir worker claim'i her zaman tek bir kazananla biter: ya bildirim `cancelled` olur ve onun için hiçbir POST çıkmaz, ya da onu worker tutar ve iptal `409` alır. Tekrar denemeyi bekleyen bir bildirim `queued`'dır; o sırada iptal edilebilir ve ardından başka POST gelmez. Toplu iptal yoktur.
 
+### Toplu bildirim
+
+```bash
+curl -s -X POST http://localhost:8080/notifications/batch \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: campaign-42' \
+  -d '{"notifications":[
+        {"recipient":"+905551234567","channel":"sms","content":"one","priority":"high"},
+        {"recipient":"a@example.com","channel":"email","content":"two"},
+        {"recipient":"device-token-1","channel":"push","content":"three","priority":"low"}]}'
+```
+
+```json
+{"batch_id":"01a1f9f2-5de8-77ce-bd30-03a9e9616567","notification_ids":["…","…","…"]}
+```
+
+Bir toplu istek her biri kendi kanalı ve önceliğiyle 1 ile 1.000 arası bildirim taşır ve **ya hep ya hiç** kaydedilir: her öğe tekil oluşturmayla aynı kurallarla kontrol edilir, bütün hatalar toplanır; herhangi bir öğe geçersizse cevap, her hatanın öğesini location'ında (`body.notifications[5].channel`) veren `422` olur ve hiçbir şey kaydedilmez. Aksi halde tek bir transaction toplu isteği, bütün bildirimlerini ve idempotency anahtarını yazar. `notification_ids[i]`, `notifications[i]`'ye aittir. Her öğe isteğin `X-Correlation-ID`'sini saklar.
+
+İki ayrı sınır vardır: öğe sayısı (1 ile 1.000 arası; `0` ya da `1001` `422` alır) ve istek gövdesinin boyutu: varsayılan 16 MiB, `BATCH_MAX_BODY_BYTES` ile ayarlanır, aşılınca `413` döner. Gövde sınırı içerik sınırlarından türetilmez, çünkü kaçışlı JSON'da tek bir emoji 12 bayt tutabilir (`\ud83d\ude00`). Bu yüzden büyük öğelerden oluşan bir toplu istek 1.000 öğeye varmadan `413` alabilir; daha küçük toplu isteklere bölünmelidir.
+
+```bash
+curl -s 'http://localhost:8080/batches/01a1f9f2-5de8-77ce-bd30-03a9e9616567?limit=50'
+```
+
+```json
+{"id":"01a1f9f2-…","item_count":3,"created_at":"…","counts":{"queued":0,"processing":0,"sent":3,"failed":0,"cancelled":0},"items":[…]}
+```
+
+`counts` beş durumun hepsini, sıfırlar dahil, listeler. `items` toplu isteğin kendi bildirimleridir; listeleme sırasıyla gelir ve [Bildirimleri listeleme](#bildirimleri-listeleme) bölümündeki gibi `limit` (varsayılan 50, 1 ile 200 arası) ve `next_cursor` ile sayfalanır. Sayılar ve sayfa tek bir anlık görüntüden okunur, bu yüzden birbiriyle tutarlıdır; sonraki sayfa yeni bir okumadır. Bilinmeyen bir toplu istek `404` alır.
+
 ### Idempotency
 
 `Idempotency-Key` isteğe bağlıdır. Gönderildiğinde bir kez gönderilmeli ve `A–Z a–z 0–9 . _ -` karakterlerinden 1 ile 128 karakter arası olmalıdır; aksi halde istek `400` alır ve hiçbir şey kaydedilmez.
@@ -602,11 +664,12 @@ Yalnızca **bekleyen** bir bildirim iptal edilebilir ve bekleyen, `queued` demek
 - Aynı anahtar ve aynı istek, **ilk** `202` yanıtını bayt bayt aynı döndürür ve yeni bir şey oluşturmaz. Güncel durumu `GET` gösterir.
 - Aynı anahtar farklı bir istekle `422` alır.
 - Anahtarsız iki istek iki ayrı bildirimdir.
+- Bir anahtar bütün bir toplu isteği kapsar. Önce tekil oluşturmada kullanılmış bir anahtar toplu istekle gönderilince `422` alır; tersi de böyledir.
 - Anahtarlar oluşturdukları bildirim kadar saklanır ve kimlik doğrulama olmadığı için globaldir. Üretimde anahtarlar belgelenmiş bir süre sonra silinir ve istemci başına ayrılır.
 
 ### Doğrulama
 
-Her kural ihlali, alan başına bir kayıtla (`location` ve `message`) `422` alır; bozuk JSON `400` alır. Hata yanıtları istek gövdesini asla geri döndürmez.
+Her kural ihlali, alan başına bir kayıtla (`location` ve `message`) `422` alır; toplu istekte location öğeyi de verir, örneğin `body.notifications[7].recipient`. Bozuk JSON `400` alır. Hata yanıtları istek gövdesini asla geri döndürmez.
 
 | Alan | Kural |
 |---|---|
@@ -686,6 +749,7 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 | `SMS_CONTENT_LIMIT` | `160` | `sms` için içerik sınırı, Unicode kod noktası olarak |
 | `EMAIL_CONTENT_LIMIT` | `10000` | `email` için içerik sınırı |
 | `PUSH_CONTENT_LIMIT` | `1000` | `push` için içerik sınırı |
+| `BATCH_MAX_BODY_BYTES` | `16777216` (16 MiB) | En büyük `POST /notifications/batch` gövdesi; daha büyüğü `413` alır |
 
 ### Worker ayarları
 
@@ -768,9 +832,9 @@ cmd/loadgen/            hız sınırı yükünü API üzerinden gönderir
 cmd/ratecount/          worker loglarından bir saniyelik pencere başına gönderim başlangıçlarını sayar
 internal/config/        tipli ortam değişkeni yapılandırması
 internal/domain/        bildirim tipleri, doğrulama, istek özeti
-internal/service/       oluşturma, okuma, iptal ve listeleme kuralları; listeleme cursor'ı
+internal/service/       oluşturma, okuma, iptal, listeleme ve toplu istek kuralları; listeleme cursor'ı
 internal/httpapi/       router, Huma operasyonları, middleware
-internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, okuma, listeleme, iptal, izinli claim, sonuç yazma, geri verme, kurtarma
+internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, izinli claim, sonuç yazma, geri verme, kurtarma
 internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma
 internal/provider/      provider HTTP istemcisi, başlatma kapısı, cevap sınıflandırması, Retry-After
 internal/ratecheck/     yarı açık bir saniyelik penceredeki en büyük sayı

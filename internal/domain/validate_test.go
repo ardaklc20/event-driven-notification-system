@@ -160,3 +160,39 @@ func TestRequestHash(t *testing.T) {
 		t.Errorf("hash length %d, want 32", len(a))
 	}
 }
+
+// TestValidateBatch: a batch of 1,000 items with errors at indexes 0, 7 and
+// 999 gives exactly three errors, each naming its item and field, and the
+// valid items get their defaults (R10, K11, K12).
+func TestValidateBatch(t *testing.T) {
+	items := make([]domain.NewNotification, domain.MaxBatchItems)
+	for i := range items {
+		items[i] = valid([]domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}[i%3])
+		items[i].Priority = ""
+	}
+	items[0].Channel = "fax"
+	items[7].Recipient = "not-an-address"
+	items[7].Channel = domain.ChannelEmail
+	items[999].Content = ""
+
+	got, errs := domain.NormalizeBatch(items)
+	want := []domain.FieldError{
+		{Field: "notifications[0].channel", Code: domain.CodeUnknownValue},
+		{Field: "notifications[7].recipient", Code: domain.CodeFormat},
+		{Field: "notifications[999].content", Code: domain.CodeRequired},
+	}
+	if len(errs) != len(want) {
+		t.Fatalf("got %d errors %+v, want %d", len(errs), errs, len(want))
+	}
+	for i, w := range want {
+		if errs[i].Field != w.Field || errs[i].Code != w.Code || errs[i].Message == "" {
+			t.Errorf("error %d = %+v, want field %s code %s with a message", i, errs[i], w.Field, w.Code)
+		}
+	}
+	if got[1].Priority != domain.PriorityNormal || got[500].Priority != domain.PriorityNormal {
+		t.Errorf("priorities %s, %s; want the default normal", got[1].Priority, got[500].Priority)
+	}
+	if _, errs := domain.NormalizeBatch(items[1:7]); len(errs) != 0 {
+		t.Errorf("valid items gave errors %+v", errs)
+	}
+}

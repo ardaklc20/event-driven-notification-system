@@ -72,6 +72,9 @@ type Notification struct {
 	Attempts      int
 	LastError     *string
 	CorrelationID string
+	// BatchID is the batch the notification was created in, or nil for a
+	// single create (K12).
+	BatchID *string
 	// What the provider answered with its 202, when it was readable (K15).
 	ProviderMessageID *string
 	ProviderTimestamp *time.Time
@@ -168,6 +171,8 @@ var (
 type ListFilter struct {
 	Status  Status
 	Channel Channel
+	// BatchID keeps only the notifications of one batch (K12).
+	BatchID string
 	// From is included and To excluded: the range is half-open.
 	From, To *time.Time
 	// After, when set, returns only rows below it in the listing order.
@@ -181,6 +186,9 @@ type Cursor struct {
 	CreatedAt time.Time
 	ID        string
 }
+
+// ErrBatchNotFound means no batch has the requested ID.
+var ErrBatchNotFound = errors.New("batch not found")
 
 // ErrInvalidCursor means a cursor was not produced by a previous page.
 var ErrInvalidCursor = errors.New("cursor is not valid")
@@ -223,3 +231,37 @@ type CreateResult struct {
 	// request and the stored response is returned.
 	Replayed bool
 }
+
+// MaxBatchItems is the most items one batch request may hold (K12).
+const MaxBatchItems = 1000
+
+// BatchCommand is what the store needs to save one batch under the K10 and
+// K12 rules, in one transaction: all items or none.
+type BatchCommand struct {
+	// Items are normalized and in request order; an item's index is its
+	// batch_position.
+	Items         []NewNotification
+	CorrelationID string
+	// Key is the Idempotency-Key; empty means the request has none.
+	Key         string
+	RequestHash []byte
+	// CheckLimits runs only when this command is about to write new
+	// notifications, as for a single create.
+	CheckLimits func() error
+	// Respond builds the 202 body from the batch ID and the notification IDs
+	// in request order. Its bytes are stored with the key.
+	Respond func(batchID string, notificationIDs []string) ([]byte, error)
+}
+
+// Batch is a saved batch with its notifications counted by status.
+type Batch struct {
+	ID            string
+	ItemCount     int
+	CorrelationID string
+	CreatedAt     time.Time
+	// Counts holds every status, zeros included.
+	Counts map[Status]int
+}
+
+// Statuses lists the five statuses in their declared order.
+var Statuses = []Status{StatusQueued, StatusProcessing, StatusSent, StatusFailed, StatusCancelled}

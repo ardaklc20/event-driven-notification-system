@@ -102,6 +102,28 @@ func Normalize(n NewNotification) (NewNotification, []FieldError) {
 	return n, errs
 }
 
+// NormalizeBatch runs Normalize on every item of a batch and collects every
+// error. Each error's field names its item, as in "notifications[7].recipient",
+// so a client can find the item it has to fix (K11, K12).
+func NormalizeBatch(items []NewNotification) ([]NewNotification, []FieldError) {
+	out := make([]NewNotification, len(items))
+	var errs []FieldError
+	for i, item := range items {
+		n, itemErrs := Normalize(item)
+		out[i] = n
+		errs = append(errs, ItemErrors(i, itemErrs)...)
+	}
+	return out, errs
+}
+
+// ItemErrors prefixes each field with the batch item it belongs to.
+func ItemErrors(index int, errs []FieldError) []FieldError {
+	for i := range errs {
+		errs[i].Field = fmt.Sprintf("notifications[%d].%s", index, errs[i].Field)
+	}
+	return errs
+}
+
 // recipientFormat returns why recipient is invalid for channel, or "".
 func recipientFormat(channel Channel, recipient string) string {
 	switch channel {
