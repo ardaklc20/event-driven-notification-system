@@ -181,3 +181,40 @@ func TestTooManyRequestsByProfile(t *testing.T) {
 		}
 	})
 }
+
+// TestRetryKeepsScheduledAt: a scheduled notification gets 503 once. The
+// retry moves available_at; scheduled_at keeps the planned time, and the row
+// ends sent on its second attempt (K7, K26).
+func TestRetryKeepsScheduledAt(t *testing.T) {
+	pool := testdb.New(t)
+	var id string
+	var scheduled time.Time
+	if err := pool.QueryRow(t.Context(),
+		`INSERT INTO notifications (recipient, channel, content, priority, correlation_id, scheduled_at, available_at)
+		 VALUES ('+905551234567', 'sms', 'later', 'normal', 'corr-scheduled',
+		         clock_timestamp() + interval '300 milliseconds', clock_timestamp() + interval '300 milliseconds')
+		 RETURNING id::text, scheduled_at`).Scan(&id, &scheduled); err != nil {
+		t.Fatal(err)
+	}
+	rec, srv := newProvider(t, sequence(http.StatusServiceUnavailable, http.StatusAccepted))
+	w := startWorker(t, pool, srv.URL+"/", defaults())
+	r := waitStatus(t, pool, id, "sent", 10*time.Second)
+	if err := w.stop(t); err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+
+	var after, available time.Time
+	if err := pool.QueryRow(t.Context(), `SELECT scheduled_at, available_at FROM notifications WHERE id = $1::uuid`,
+		id).Scan(&after, &available); err != nil {
+		t.Fatal(err)
+	}
+	if !after.Equal(scheduled) {
+		t.Errorf("scheduled_at moved from %s to %s", scheduled, after)
+	}
+	if !available.After(scheduled) {
+		t.Errorf("available_at %s, want moved past scheduled_at %s by the retry", available, scheduled)
+	}
+	if r.attempts != 2 || len(rec.all()) != 2 {
+		t.Errorf("attempts %d and %d POSTs, want 2 and 2", r.attempts, len(rec.all()))
+	}
+}

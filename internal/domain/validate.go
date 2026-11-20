@@ -7,6 +7,7 @@ import (
 	"net/mail"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -26,6 +27,8 @@ const (
 	CodeNUL ErrorCode = "nul_character"
 	// CodeTooLong: the content is over its channel's configured limit.
 	CodeTooLong ErrorCode = "too_long"
+	// CodePast: scheduled_at is at or before the database clock (K26).
+	CodePast ErrorCode = "in_the_past"
 )
 
 // FieldError is one rule violation.
@@ -99,7 +102,36 @@ func Normalize(n NewNotification) (NewNotification, []FieldError) {
 		add("content", CodeNUL, "must not contain the NUL character (U+0000)")
 	}
 
+	if n.ScheduledAt != "" {
+		at, err := ParseScheduledAt(n.ScheduledAt)
+		if err != nil {
+			add("scheduled_at", CodeFormat, ScheduledAtFormat)
+		} else {
+			n.ScheduledAt = at.Format(time.RFC3339Nano)
+		}
+	}
+
 	return n, errs
+}
+
+// ScheduledAtFormat is the message for a scheduled_at that does not parse.
+const ScheduledAtFormat = "must be an RFC 3339 time with an offset (Z or ±hh:mm), for example 2026-11-22T09:00:00Z"
+
+// ParseScheduledAt reads an RFC 3339 time that carries its offset, Z or
+// ±hh:mm, and returns it in UTC (K26). A time without an offset is refused:
+// it would mean a different moment on every server.
+func ParseScheduledAt(s string) (time.Time, error) {
+	at, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return at.UTC(), nil
+}
+
+// PastError returns the field error for a scheduled_at at or before the
+// database clock; field names the item in a batch.
+func PastError(field string) FieldError {
+	return FieldError{Field: field, Code: CodePast, Message: "must be after the current time"}
 }
 
 // NormalizeBatch runs Normalize on every item of a batch and collects every
@@ -193,6 +225,9 @@ type hashedItem struct {
 	Channel   Channel  `json:"channel"`
 	Content   string   `json:"content"`
 	Priority  Priority `json:"priority"`
+	// Left out when empty, so a request without scheduled_at hashes as it
+	// did before the field existed and its stored key still replays.
+	ScheduledAt string `json:"scheduled_at,omitempty"`
 }
 
 // RequestHash returns the SHA-256 of the operation and its normalized items

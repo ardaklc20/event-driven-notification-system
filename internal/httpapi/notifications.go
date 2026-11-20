@@ -22,6 +22,8 @@ type NotificationRequest struct {
 	Channel   string `json:"channel" enum:"sms,email,push" example:"sms"`
 	Content   string `json:"content" minLength:"1" example:"Your code is 123456" doc:"At most 160 (sms), 10000 (email) or 1000 (push) Unicode code points by default; the limits are configurable and apply to new notifications only."`
 	Priority  string `json:"priority,omitempty" enum:"high,normal,low" default:"normal"`
+	// K26: an optional absolute time.
+	ScheduledAt string `json:"scheduled_at,omitempty" format:"date-time" example:"2026-11-22T09:00:00Z" doc:"Optional. The earliest time the notification may be sent, RFC 3339 with an offset (Z or ±hh:mm); a time without an offset gets 422. A new request whose time is at or before the server's clock gets 422; there is no upper limit. Without it the notification is sent as soon as possible."`
 }
 
 func (r NotificationRequest) toDomain() domain.NewNotification {
@@ -30,6 +32,8 @@ func (r NotificationRequest) toDomain() domain.NewNotification {
 		Channel:   domain.Channel(r.Channel),
 		Content:   r.Content,
 		Priority:  domain.Priority(r.Priority),
+		// Normalize rewrites it in UTC.
+		ScheduledAt: r.ScheduledAt,
 	}
 }
 
@@ -41,7 +45,10 @@ func (r *NotificationRequest) Resolve(_ huma.Context, prefix *huma.PathBuffer) [
 	_, fieldErrs := domain.Normalize(r.toDomain())
 	var errs []error
 	for _, fe := range fieldErrs {
-		if fe.Code == domain.CodeRequired || fe.Code == domain.CodeUnknownValue {
+		// The schema's date-time format already reports a scheduled_at that
+		// does not parse, with the same RFC 3339 rule.
+		if fe.Code == domain.CodeRequired || fe.Code == domain.CodeUnknownValue ||
+			(fe.Field == "scheduled_at" && fe.Code == domain.CodeFormat) {
 			continue
 		}
 		errs = append(errs, &huma.ErrorDetail{Location: prefix.With(fe.Field), Message: fe.Message})
@@ -141,6 +148,7 @@ type NotificationBody struct {
 	SentAt            *time.Time `json:"sent_at" nullable:"true" doc:"When the provider's acceptance was recorded; set together with status sent"`
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
+	ScheduledAt       *time.Time `json:"scheduled_at" nullable:"true" doc:"The earliest send time the request asked for, in UTC, or null when the notification was not scheduled. Retries never change it"`
 }
 
 type notificationOutput struct {
@@ -199,6 +207,7 @@ func toBody(n domain.Notification) NotificationBody {
 		SentAt:            n.SentAt,
 		CreatedAt:         n.CreatedAt,
 		UpdatedAt:         n.UpdatedAt,
+		ScheduledAt:       n.ScheduledAt,
 	}
 }
 

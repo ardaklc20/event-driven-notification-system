@@ -541,3 +541,23 @@ func TestCancelDuringRetryWait(t *testing.T) {
 			n.Status, n.Attempts, s.requestsFor("retry-wait"))
 	}
 }
+
+// TestScheduledCancel: a notification scheduled 3 seconds ahead is cancelled
+// at once; after 5 seconds of a running worker the provider has received no
+// POST for it (B2, K9, K26).
+func TestScheduledCancel(t *testing.T) {
+	s := newStack(t, func(w http.ResponseWriter, _ *http.Request) { accept(w) })
+	at := time.Now().Add(3 * time.Second).UTC().Format(time.RFC3339Nano)
+	id := idOf(t, s.create(t,
+		`{"recipient":"+905551234567","channel":"sms","content":"later","scheduled_at":"`+at+`"}`,
+		correlation("scheduled-cancel")))
+	if r := s.cancel(t, id); r.status != http.StatusOK {
+		t.Fatalf("cancel: status %d, body %s; want 200", r.status, r.body)
+	}
+	time.Sleep(5 * time.Second)
+	n := s.get(t, id)
+	if n.Status != "cancelled" || n.Attempts != 0 || n.ScheduledAt == nil || s.requestsFor("scheduled-cancel") != 0 {
+		t.Fatalf("status %s, attempts %d, scheduled_at %v, %d POSTs; want cancelled, 0, set, 0",
+			n.Status, n.Attempts, n.ScheduledAt, s.requestsFor("scheduled-cancel"))
+	}
+}

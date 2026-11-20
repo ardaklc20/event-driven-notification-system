@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 8 {
-		t.Fatalf("first up applied %d migrations, want 8", len(first))
+	if len(first) != 9 {
+		t.Fatalf("first up applied %d migrations, want 9", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
