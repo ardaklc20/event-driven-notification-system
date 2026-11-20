@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 9 {
-		t.Fatalf("first up applied %d migrations, want 9", len(first))
+	if len(first) != 10 {
+		t.Fatalf("first up applied %d migrations, want 10", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -116,6 +116,18 @@ func TestMigrations(t *testing.T) {
 		_, err = db.ExecContext(ctx,
 			`UPDATE provider_breaker SET probe_token = gen_random_uuid(), probe_expires_at = now()`)
 		assertConstraint(t, "probe while closed", err, "provider_breaker_probe_only_open")
+	})
+
+	t.Run("status triggers exist", func(t *testing.T) {
+		var got string
+		if err := db.QueryRowContext(ctx,
+			`SELECT string_agg(tgname, ',' ORDER BY tgname) FROM pg_trigger
+			 WHERE tgrelid = 'notifications'::regclass AND NOT tgisinternal`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if want := "notifications_status_notify,notifications_status_version"; got != want {
+			t.Errorf("triggers = %s, want %s", got, want)
+		}
 	})
 
 	t.Run("generated id is UUIDv7 and defaults apply", func(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/config"
 	"github.com/ardaklc20/event-driven-notification-system/internal/httpapi"
 	"github.com/ardaklc20/event-driven-notification-system/internal/postgres"
+	"github.com/ardaklc20/event-driven-notification-system/internal/realtime"
 	"github.com/ardaklc20/event-driven-notification-system/internal/service"
 )
 
@@ -59,6 +60,22 @@ func runServer() int {
 	defer pool.Close()
 
 	store := postgres.NewStore(pool)
+
+	// The status listener runs until the WebSockets have been closed at
+	// shutdown, so its drop does not race their "going away" close (K24, K25).
+	hub := realtime.NewHub(cfg.WSSendQueue)
+	listenCtx, stopListener := context.WithCancel(context.Background())
+	listenDone := make(chan struct{})
+	go func() {
+		defer close(listenDone)
+		postgres.NewListener(pool, hub, logger).Run(listenCtx)
+	}()
+	defer func() {
+		stopListener()
+		<-listenDone
+	}()
+	sockets := httpapi.NewWebSockets()
+
 	readiness := &httpapi.Readiness{}
 	handler := httpapi.New(httpapi.Deps{
 		Logger:    logger,
@@ -70,6 +87,12 @@ func runServer() int {
 		Notifications:     service.NewNotifications(store, cfg.Limits()),
 		Metrics:           service.NewMetrics(store),
 		BatchMaxBodyBytes: cfg.BatchMaxBodyBytes,
+		WebSocket: httpapi.WebSocketDeps{
+			Hub:          hub,
+			Statuses:     service.NewStatuses(store),
+			Conns:        sockets,
+			WriteTimeout: cfg.WSWriteTimeout,
+		},
 	})
 	srv := &http.Server{
 		Handler:           handler,
@@ -79,6 +102,9 @@ func runServer() int {
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
+	// Shutdown neither closes nor waits for hijacked connections; this only
+	// starts closing the WebSockets with status 1001 (K25).
+	srv.RegisterOnShutdown(sockets.StartClose)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.HTTPAddr)
@@ -113,6 +139,13 @@ func runServer() int {
 		logger.Error("server stopped with error", "error", err)
 		return 1
 	}
+	// The bounded wait for the WebSockets, inside the shutdown budget; those
+	// still open when it ends are cut (K25).
+	wsCtx, wsCancel := context.WithTimeout(shutdownCtx, cfg.WSCloseTimeout)
+	sockets.Wait(wsCtx)
+	wsCancel()
+	stopListener()
+	<-listenDone
 	pool.Close()
 	logger.Info("server stopped")
 	return 0

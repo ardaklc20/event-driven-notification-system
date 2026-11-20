@@ -40,6 +40,9 @@ func TestAPIConfig(t *testing.T) {
 		if cfg.BatchMaxBodyBytes != 16<<20 {
 			t.Errorf("BatchMaxBodyBytes = %d, want 16 MiB", cfg.BatchMaxBodyBytes)
 		}
+		if cfg.WSSendQueue != 16 || cfg.WSWriteTimeout != 5*time.Second || cfg.WSCloseTimeout != 5*time.Second {
+			t.Errorf("WebSocket settings = %d %s %s, want 16 5s 5s", cfg.WSSendQueue, cfg.WSWriteTimeout, cfg.WSCloseTimeout)
+		}
 	})
 
 	t.Run("explicit values", func(t *testing.T) {
@@ -49,12 +52,16 @@ func TestAPIConfig(t *testing.T) {
 			"LOG_LEVEL":            "debug",
 			"SHUTDOWN_TIMEOUT":     "3s",
 			"BATCH_MAX_BODY_BYTES": "1048576",
+			"WS_SEND_QUEUE":        "4",
+			"WS_WRITE_TIMEOUT":     "1s",
+			"WS_CLOSE_TIMEOUT":     "2s",
 		}})
 		if err != nil {
 			t.Fatalf("LoadAPI: %v", err)
 		}
 		if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.LogLevel != slog.LevelDebug || cfg.ShutdownTimeout != 3*time.Second ||
-			cfg.BatchMaxBodyBytes != 1<<20 {
+			cfg.BatchMaxBodyBytes != 1<<20 || cfg.WSSendQueue != 4 || cfg.WSWriteTimeout != time.Second ||
+			cfg.WSCloseTimeout != 2*time.Second {
 			t.Errorf("got %+v", cfg)
 		}
 	})
@@ -96,6 +103,9 @@ func TestAPIConfig(t *testing.T) {
 			"zero sms limit":       {"DATABASE_URL": testURL, "SMS_CONTENT_LIMIT": "0"},
 			"negative push limit":  {"DATABASE_URL": testURL, "PUSH_CONTENT_LIMIT": "-1"},
 			"zero batch body":      {"DATABASE_URL": testURL, "BATCH_MAX_BODY_BYTES": "0"},
+			"zero send queue":      {"DATABASE_URL": testURL, "WS_SEND_QUEUE": "0"},
+			"zero write timeout":   {"DATABASE_URL": testURL, "WS_WRITE_TIMEOUT": "0s"},
+			"close wait too long":  {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "5s", "WS_CLOSE_TIMEOUT": "5s"},
 		} {
 			if _, err := config.LoadAPI(env.Options{Environment: vars}); err == nil {
 				t.Errorf("%s: LoadAPI accepted %v", name, vars)

@@ -28,6 +28,9 @@ type Deps struct {
 	// BatchMaxBodyBytes is the largest batch body; 0 means
 	// DefaultBatchMaxBodyBytes (K12).
 	BatchMaxBodyBytes int64
+	// WebSocket configures the real-time status endpoints (K24, K25); they
+	// are registered only when it has a Hub.
+	WebSocket WebSocketDeps
 }
 
 // DefaultBatchMaxBodyBytes is the default batch body limit, 16 MiB (K12).
@@ -61,6 +64,8 @@ func newAPI(deps Deps) (*http.ServeMux, huma.API) {
 	registerNotifications(api, deps)
 	registerBatches(api, deps)
 	registerMetrics(api, deps)
+	// Plain handlers on the same mux: OpenAPI does not describe WebSockets (K25).
+	registerWebSockets(mux, deps)
 	return mux, api
 }
 
