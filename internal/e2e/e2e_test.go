@@ -325,20 +325,31 @@ func TestCorrelationIDEndToEnd(t *testing.T) {
 		t.Fatalf("provider got %d requests, header %v; want one with X-Correlation-ID test-123", len(headers), headers)
 	}
 
+	// The worker writes its result line after the row turns sent, so the
+	// lines are awaited, not read once.
 	check := func(name string, logs *logBuffer, atLeast int) {
 		t.Helper()
-		var lines int
-		for _, rec := range logs.records(t) {
-			if rec["notification_id"] != id {
-				continue
+		var records []map[string]any
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			records = records[:0]
+			for _, rec := range logs.records(t) {
+				if rec["notification_id"] == id {
+					records = append(records, rec)
+				}
 			}
-			lines++
+			if len(records) >= atLeast || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		for _, rec := range records {
 			if rec["correlation_id"] != "test-123" {
 				t.Errorf("%s line %v has correlation_id %v, want test-123", name, rec["msg"], rec["correlation_id"])
 			}
 		}
-		if lines < atLeast {
-			t.Errorf("%s: %d lines for the notification, want at least %d", name, lines, atLeast)
+		if len(records) < atLeast {
+			t.Errorf("%s: %d lines for the notification, want at least %d", name, len(records), atLeast)
 		}
 	}
 	check("api", s.apiLogs, 1)       // notification accepted
