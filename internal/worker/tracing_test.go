@@ -3,14 +3,17 @@ package worker_test
 import (
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 	"github.com/ardaklc20/event-driven-notification-system/internal/testdb"
 	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
@@ -91,24 +94,72 @@ func TestAttemptSpanLink(t *testing.T) {
 	wantLinkedToStored(t, spansOf(t, rec, trace.SpanKindConsumer, 1)[0])
 }
 
-// TestRetryAttemptsLinked: each attempt is its own trace, each linked to the
-// same stored context (K27).
+// TestRetryAttemptsLinked: provider attempts and a claim whose start deadline
+// is missed each have their own trace linked to the same stored context (K27).
 func TestRetryAttemptsLinked(t *testing.T) {
 	pool := testdb.New(t)
 	s, rec := tracedSettings(t)
+	var pause sync.Once
+	s.hooks.BeforeGate = func(domain.Claim) {
+		pause.Do(func() { time.Sleep(2 * s.cfg.PermitGrace) })
+	}
 	id := insertTraced(t, pool)
-	_, srv := newProvider(t, sequence(http.StatusServiceUnavailable, http.StatusAccepted))
+	provider, srv := newProvider(t, sequence(http.StatusServiceUnavailable, http.StatusAccepted))
 	w := startWorker(t, pool, srv.URL+"/", s)
 	waitStatus(t, pool, id, "sent", 10*time.Second)
 	if err := w.stop(t); err != nil {
 		t.Fatal(err)
 	}
-	attempts := spansOf(t, rec, trace.SpanKindConsumer, 2)
-	for _, a := range attempts {
-		wantLinkedToStored(t, a)
+	arrivals := provider.all()
+	result := readRow(t, pool, id)
+	if len(arrivals) != 2 || result.attempts != 2 {
+		t.Fatalf("%d POSTs, row %+v; want exactly two provider attempts", len(arrivals), result)
 	}
-	if attempts[0].SpanContext().TraceID() == attempts[1].SpanContext().TraceID() {
-		t.Fatal("both attempts share one trace ID, want one trace each")
+	seen := make(map[trace.TraceID]bool)
+	byClass := make(map[string]trace.TraceID)
+	missedStarts := 0
+	// A missed start deadline also produces a consumer span, but returns its
+	// attempt without a POST. Check every link and allow only that specific
+	// extra span; the two actual provider attempts must still be distinct.
+	for _, span := range rec.Ended() {
+		if span.SpanKind() != trace.SpanKindConsumer {
+			continue
+		}
+		wantLinkedToStored(t, span)
+		traceID := span.SpanContext().TraceID()
+		if seen[traceID] {
+			t.Fatal("consumer spans share a trace ID, want one trace each")
+		}
+		seen[traceID] = true
+		class := ""
+		for _, attr := range span.Attributes() {
+			if attr.Key == "provider.class" {
+				class = attr.Value.AsString()
+			}
+		}
+		switch class {
+		case "temporary", "accepted":
+			if _, exists := byClass[class]; exists {
+				t.Fatalf("multiple consumer spans with provider class %q", class)
+			}
+			byClass[class] = traceID
+		default:
+			status := span.Status()
+			if class != "" || status.Code != codes.Error || status.Description != "start deadline missed" {
+				t.Fatalf("unexpected consumer span: class %q, status %+v", class, status)
+			}
+			missedStarts++
+		}
+	}
+	if missedStarts == 0 {
+		t.Fatal("no consumer span recorded the forced start deadline miss")
+	}
+	for i, class := range []string{"temporary", "accepted"} {
+		traceID, exists := byClass[class]
+		parts := strings.Split(arrivals[i].header.Get("Traceparent"), "-")
+		if !exists || len(parts) != 4 || parts[1] != traceID.String() {
+			t.Fatalf("POST %d traceparent %q does not match its %s consumer span", i+1, arrivals[i].header.Get("Traceparent"), class)
+		}
 	}
 }
 
