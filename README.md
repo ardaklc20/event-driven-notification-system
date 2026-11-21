@@ -290,7 +290,7 @@ A template is stored once and used by any number of notifications ([K33](docs/DE
 
 | Endpoint | Answer |
 |---|---|
-| `POST /templates` | `201` with `{id, name, channel, body, created_at}`; `422` for any rule below |
+| `POST /templates` | `201` with `{id, name, channel, body, created_at}`; `400` for malformed JSON, `422` for any rule below |
 | `GET /templates/{id}` | `200`; `404` for an unknown ID, `422` for a malformed one |
 | `GET /templates` | Newest first, paged with `limit` (default 50, 1 to 200) and `next_cursor`, as `GET /notifications` |
 
@@ -389,9 +389,11 @@ Tracing is off by default. To see traces, start the stack with the `tracing` pro
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile tracing up -d --wait
+ID=$(curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"traced"}' | jq -r .id)
 ```
 
-Send a notification, then open the Jaeger UI at <http://localhost:16686> ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)).
+The second command sends a notification; a few seconds later its spans are in the Jaeger UI at <http://localhost:16686> ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)).
 
 | Span | Service | Made by |
 |---|---|---|
@@ -928,7 +930,7 @@ Bir şablon bir kez kaydedilir ve istenen sayıda bildirimde kullanılır ([K33]
 
 | Endpoint | Cevap |
 |---|---|
-| `POST /templates` | `{id, name, channel, body, created_at}` ile `201`; aşağıdaki kurallardan biri bozulursa `422` |
+| `POST /templates` | `{id, name, channel, body, created_at}` ile `201`; bozuk JSON için `400`, aşağıdaki kurallardan biri bozulursa `422` |
 | `GET /templates/{id}` | `200`; bilinmeyen ID için `404`, bozuk ID için `422` |
 | `GET /templates` | En yeni önce; `GET /notifications` gibi `limit` (varsayılan 50, 1 ile 200 arası) ve `next_cursor` ile sayfalanır |
 
@@ -1027,9 +1029,11 @@ Her kural ihlali, alan başına bir kayıtla (`location` ve `message`) `422` al�
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile tracing up -d --wait
+ID=$(curl -s -X POST http://localhost:8080/notifications -H 'Content-Type: application/json' \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"traced"}' | jq -r .id)
 ```
 
-Bir bildirim gönderin, sonra Jaeger arayüzünü <http://localhost:16686> adresinde açın ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)).
+İkinci komut bir bildirim gönderir; birkaç saniye sonra span'leri <http://localhost:16686> adresindeki Jaeger arayüzündedir ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)).
 
 | Span | Servis | Üreten |
 |---|---|---|
