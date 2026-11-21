@@ -400,11 +400,11 @@ Send a notification, then open the Jaeger UI at <http://localhost:16686> ([K27](
 | `provider POST` | `notification-worker` | A child of the attempt: the otelhttp client transport around the start gate. Its request carries a `traceparent` header to the provider |
 
 - **Linked traces, not one trace.** The create transaction stores the W3C `traceparent` of the API's server span in `notifications.traceparent`; if the client sent its own `traceparent`, the server span is its child, and the stored value is the server span's, not the header. Each delivery attempt starts a new trace with a **link** to that stored context. As a child, a 1,000-item batch with all its retries would hang under one request's trace; OpenTelemetry's messaging conventions use links between a producer and its consumers.
-- **Following a notification.** Read the trace ID, the second field of the stored value:
+- **Following a notification.** With the notification's ID in `ID`, read the trace ID, the second field of the stored value:
 
   ```bash
   docker compose exec -T postgres psql -U notifications -d notifications -tAc \
-    "select split_part(traceparent, '-', 2) from notifications where id = '<id>'"
+    "select split_part(traceparent, '-', 2) from notifications where id = '$ID'"
   ```
 
   That trace holds the API request. In Jaeger, search the service `notification-worker`: each `deliver <channel>` span lists the request trace under its references, and a retry is one more linked trace.
@@ -1038,11 +1038,11 @@ Bir bildirim gönderin, sonra Jaeger arayüzünü <http://localhost:16686> adres
 | `provider POST` | `notification-worker` | Denemenin çocuğu: start gate'i saran otelhttp istemci transport'u. İsteği provider'a bir `traceparent` header'ı taşır |
 
 - **Tek trace değil, bağlı trace'ler.** Oluşturma transaction'ı API'nin sunucu span'inin W3C `traceparent` değerini `notifications.traceparent` sütununa yazar; istemci kendi `traceparent`'ını gönderdiyse sunucu span'i onun çocuğudur ve saklanan değer header değil, sunucu span'inin değeridir. Her teslim denemesi, saklanan bu bağlama bir **link** ile yeni bir trace başlatır. Çocuk olsaydı 1.000 öğelik bir toplu istek bütün tekrar denemeleriyle tek bir isteğin trace'i altında toplanırdı; OpenTelemetry'nin mesajlaşma kuralları üretici ile tüketicileri arasında link kullanır.
-- **Bir bildirimi izlemek.** Trace ID'si saklanan değerin ikinci alanıdır:
+- **Bir bildirimi izlemek.** Bildirimin ID'si `ID` içindeyken trace ID'si saklanan değerin ikinci alanıdır:
 
   ```bash
   docker compose exec -T postgres psql -U notifications -d notifications -tAc \
-    "select split_part(traceparent, '-', 2) from notifications where id = '<id>'"
+    "select split_part(traceparent, '-', 2) from notifications where id = '$ID'"
   ```
 
   Bu trace API isteğini tutar. Jaeger'da `notification-worker` servisini arayın: her `deliver <channel>` span'i referanslarında istek trace'ini gösterir; her tekrar deneme bir bağlı trace daha demektir.
