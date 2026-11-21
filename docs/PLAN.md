@@ -60,7 +60,7 @@ Every slice passes all of these before its pull request is merged.
 | 13 | [Real-time status updates](slices/13-realtime-status.md) | Optional | B4 | K6, K9, K12, K16, K18, K24, K25, K43, K45, K46 | 6, 8, 12 | `feat/realtime-status` | done ([#20](https://github.com/ardaklc20/event-driven-notification-system/pull/20)) |
 | 14 | [Templates](slices/14-templates.md) | Optional | B3 | K10, K11, K12, K13, K33, K36, K44, K47 | 8, 10 | `feat/templates` | done ([#21](https://github.com/ardaklc20/event-driven-notification-system/pull/21)) |
 | 15 | [Distributed tracing](slices/15-distributed-tracing.md) | Optional | B5 | K21, K27, K42 | 10 | `feat/tracing` | done ([#22](https://github.com/ardaklc20/event-driven-notification-system/pull/22)) |
-| 16 | [Final release check](slices/16-final-release-check.md) | Core + optional | D1–D6, completed bonuses | K4, K19, K29, K31 | 10 and every bonus slice marked `done` | `docs/final-readme` | planned |
+| 16 | [Final release check](slices/16-final-release-check.md) | Core + optional | D1–D6, completed bonuses | K4, K19, K29, K31 | 10 and every bonus slice marked `done` | `docs/final-readme` | done ([#23](https://github.com/ardaklc20/event-driven-notification-system/pull/23)) |
 
 ### Why this order
 
