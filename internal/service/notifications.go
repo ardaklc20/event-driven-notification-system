@@ -36,6 +36,8 @@ type CreateInput struct {
 	Notification  domain.NewNotification
 	Key           string // Idempotency-Key; empty when the request has none
 	CorrelationID string
+	// Traceparent is the API request's server span context, or "" (K27).
+	Traceparent string
 }
 
 // Create follows the K10 order: structure rules and defaults, the request hash,
@@ -52,6 +54,7 @@ func (s *Notifications) Create(ctx context.Context, in CreateInput, respond func
 		Notification:  n,
 		CorrelationID: in.CorrelationID,
 		Key:           in.Key,
+		Traceparent:   in.Traceparent,
 		RequestHash:   domain.RequestHash(domain.OperationCreate, []domain.NewNotification{n}),
 		Prepare: func(templates domain.Templates) (domain.NewNotification, error) {
 			out, errs := s.limits.Prepare(n, templates)
@@ -141,6 +144,8 @@ type BatchInput struct {
 	Items         []domain.NewNotification
 	Key           string
 	CorrelationID string
+	// Traceparent is the batch request's server span context, or "" (K27).
+	Traceparent string
 }
 
 // CreateBatch follows the order of Create for every item: structure rules and
@@ -163,6 +168,7 @@ func (s *Notifications) CreateBatch(ctx context.Context, in BatchInput,
 		Items:         items,
 		CorrelationID: in.CorrelationID,
 		Key:           in.Key,
+		Traceparent:   in.Traceparent,
 		RequestHash:   domain.RequestHash(domain.OperationBatch, items),
 		Prepare: func(templates domain.Templates) ([]domain.NewNotification, error) {
 			out := make([]domain.NewNotification, len(items))

@@ -24,6 +24,7 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/postgres"
 	"github.com/ardaklc20/event-driven-notification-system/internal/realtime"
 	"github.com/ardaklc20/event-driven-notification-system/internal/service"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 func main() {
@@ -61,6 +62,23 @@ func runServer() int {
 
 	store := postgres.NewStore(pool)
 
+	// Tracing is off unless OTEL_EXPORTER_OTLP_ENDPOINT is set (K27).
+	tracer, err := tracing.New(ctx, cfg.TracingConfig("notification-api"))
+	if err != nil {
+		logger.Error("tracing", "error", err)
+		return 1
+	}
+	defer func() {
+		// The final flush is bounded on its own, after the HTTP and WebSocket
+		// shutdown; a collector that never answers cannot hold the process.
+		flushCtx, cancel := context.WithTimeout(context.Background(), tracing.ShutdownTimeout)
+		defer cancel()
+		if err := tracer.Shutdown(flushCtx); err != nil {
+			logger.Warn("tracing flush", "error", err)
+		}
+	}()
+	logger.Info("tracing", slog.Bool("enabled", tracer.Enabled()))
+
 	// The status listener runs until the WebSockets have been closed at
 	// shutdown, so its drop does not race their "going away" close (K24, K25).
 	hub := realtime.NewHub(cfg.WSSendQueue)
@@ -87,6 +105,7 @@ func runServer() int {
 		Notifications:     service.NewNotifications(store, cfg.Limits()),
 		Metrics:           service.NewMetrics(store),
 		Templates:         service.NewTemplates(store),
+		Tracing:           tracer,
 		BatchMaxBodyBytes: cfg.BatchMaxBodyBytes,
 		WebSocket: httpapi.WebSocketDeps{
 			Hub:          hub,

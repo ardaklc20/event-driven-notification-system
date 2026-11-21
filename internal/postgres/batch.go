@@ -31,21 +31,23 @@ const (
 )
 
 // insertItemsSQL returns one multi-row INSERT for n items. $1 is the
-// correlation ID and $2 the batch ID, shared by every row; each item adds
-// seven parameters, so 1,000 items use 7,002, below the protocol's 65,535
+// correlation ID, $2 the batch ID and $3 the traceparent (” when tracing is
+// off), shared by every row (K27); each item adds
+// seven parameters, so 1,000 items use 7,003, below the protocol's 65,535
 // (K17). A scheduled item is first available at its scheduled time (K26).
 func insertItemsSQL(n int) string {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO notifications
-		(recipient, channel, content, priority, batch_position, scheduled_at, available_at, template_id, correlation_id, batch_id)
+		(recipient, channel, content, priority, batch_position, scheduled_at, available_at, template_id, correlation_id, batch_id,
+		 traceparent)
 		VALUES `)
 	for i := range n {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		p := 3 + i*7
+		p := 4 + i*7
 		fmt.Fprintf(&b, "($%d, $%d, $%d, $%d::text::notification_priority, $%d, $%d::timestamptz, "+
-			"coalesce($%d::timestamptz, now()), $%d::text::uuid, $1, $2::text::uuid)",
+			"coalesce($%d::timestamptz, now()), $%d::text::uuid, $1, $2::text::uuid, nullif($3, ''))",
 			p, p+1, p+2, p+3, p+4, p+5, p+5, p+6)
 	}
 	b.WriteString(" RETURNING id::text, batch_position")
@@ -101,8 +103,8 @@ func (s *Store) CreateBatch(ctx context.Context, cmd domain.BatchCommand) (domai
 		return domain.CreateResult{}, fmt.Errorf("insert batch: %w", err)
 	}
 
-	args := make([]any, 0, 2+7*len(items))
-	args = append(args, cmd.CorrelationID, batchID)
+	args := make([]any, 0, 3+7*len(items))
+	args = append(args, cmd.CorrelationID, batchID, cmd.Traceparent)
 	for i, n := range items {
 		args = append(args, n.Recipient, string(n.Channel), n.Content, string(n.Priority), i, scheduledArg(n), templateArg(n))
 	}

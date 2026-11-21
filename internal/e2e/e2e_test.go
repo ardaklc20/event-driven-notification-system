@@ -23,6 +23,7 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
 	"github.com/ardaklc20/event-driven-notification-system/internal/service"
 	"github.com/ardaklc20/event-driven-notification-system/internal/testdb"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 	"github.com/ardaklc20/event-driven-notification-system/internal/worker"
 )
 
@@ -94,6 +95,11 @@ type stack struct {
 	providerURL string
 	apiLogs     *logBuffer
 	workerLogs  *logBuffer
+	// apiTracing and workerTracing are nil unless the test turns tracing on.
+	apiTracing    *tracing.Provider
+	workerTracing *tracing.Provider
+	// stopWorker stops the worker and returns how long Run took to return.
+	stopWorker func() time.Duration
 }
 
 // newStack starts the API, the provider stub and the worker.
@@ -108,11 +114,20 @@ func newStack(t *testing.T, answer http.HandlerFunc) *stack {
 // only with startWorker.
 func newPausedStack(t *testing.T, answer http.HandlerFunc) *stack {
 	t.Helper()
+	return newStackWithTracing(t, answer, nil, nil)
+}
+
+// newStackWithTracing starts the API and the provider stub with the given
+// tracing providers; the worker starts with startWorker.
+func newStackWithTracing(t *testing.T, answer http.HandlerFunc, api, wrk *tracing.Provider) *stack {
+	t.Helper()
 	s := &stack{
-		pool:       testdb.New(t),
-		provider:   &providerStub{answer: answer},
-		apiLogs:    &logBuffer{},
-		workerLogs: &logBuffer{},
+		pool:          testdb.New(t),
+		provider:      &providerStub{answer: answer},
+		apiLogs:       &logBuffer{},
+		workerLogs:    &logBuffer{},
+		apiTracing:    api,
+		workerTracing: wrk,
 	}
 	providerSrv := httptest.NewServer(s.provider)
 	t.Cleanup(providerSrv.Close)
@@ -121,6 +136,7 @@ func newPausedStack(t *testing.T, answer http.HandlerFunc) *stack {
 		Logger:        slog.New(slog.NewJSONHandler(s.apiLogs, nil)),
 		Readiness:     &httpapi.Readiness{},
 		Notifications: service.NewNotifications(postgres.NewStore(s.pool), domain.DefaultLimits()),
+		Tracing:       s.apiTracing,
 	}))
 	t.Cleanup(apiSrv.Close)
 	s.apiURL = apiSrv.URL
@@ -132,7 +148,7 @@ func newPausedStack(t *testing.T, answer http.HandlerFunc) *stack {
 func (s *stack) startWorker(t *testing.T) {
 	t.Helper()
 	logger := slog.New(slog.NewJSONHandler(s.workerLogs, nil)).With(slog.String("worker_id", "e2e-worker"))
-	w := worker.New(postgres.NewStore(s.pool), provider.NewClient(s.providerURL, 5*time.Second, 4), logger, worker.Config{
+	w := worker.New(postgres.NewStore(s.pool), provider.NewClient(s.providerURL, 5*time.Second, 4, provider.WithTracing(s.workerTracing)), logger, worker.Config{
 		Profile:          provider.ProfileStandard,
 		LeaseDuration:    15 * time.Second,
 		ResultBudget:     5 * time.Second,
@@ -147,21 +163,32 @@ func (s *stack) startWorker(t *testing.T) {
 		PermitInterval:   11 * time.Millisecond,
 		PermitGrace:      100 * time.Millisecond,
 		Breaker:          domain.BreakerPolicy{Threshold: 5, Cooldown: 30 * time.Second, MaxCooldown: 5 * time.Minute},
+		Tracing:          s.workerTracing,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("worker: %v", err)
+	var (
+		once sync.Once
+		took time.Duration
+	)
+	s.stopWorker = func() time.Duration {
+		once.Do(func() {
+			start := time.Now()
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("worker: %v", err)
+				}
+			case <-time.After(15 * time.Second):
+				t.Error("worker did not stop within 15 seconds")
 			}
-		case <-time.After(15 * time.Second):
-			t.Error("worker did not stop within 15 seconds")
-		}
-	})
+			took = time.Since(start)
+		})
+		return took
+	}
+	t.Cleanup(func() { s.stopWorker() })
 }
 
 type reply struct {

@@ -109,7 +109,7 @@ func startWorker(t *testing.T, pool *pgxpool.Pool, providerURL string, s setting
 	}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})).
 		With(slog.String("worker_id", id))
-	client := provider.NewClient(providerURL, s.httpTimeout, s.cfg.InFlight)
+	client := provider.NewClient(providerURL, s.httpTimeout, s.cfg.InFlight, provider.WithTracing(s.cfg.Tracing))
 	var store worker.Store = postgres.NewStore(pool)
 	if s.wrap != nil {
 		store = s.wrap(store)

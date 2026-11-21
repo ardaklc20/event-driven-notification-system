@@ -14,6 +14,7 @@ import (
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 	"github.com/ardaklc20/event-driven-notification-system/internal/service"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 // NotificationRequest is the body of POST /notifications.
@@ -245,6 +246,7 @@ func registerNotifications(api huma.API, deps Deps) {
 			Notification:  in.Body.toDomain(),
 			Key:           in.IdempotencyKey,
 			CorrelationID: correlationIDFrom(ctx),
+			Traceparent:   tracing.Traceparent(ctx),
 		}, marshalAccepted)
 		if err != nil {
 			return nil, problemFor(ctx, logger, err)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 	"github.com/ardaklc20/event-driven-notification-system/internal/service"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 // BatchRequest is the body of POST /notifications/batch.
@@ -105,6 +106,7 @@ func registerBatches(api huma.API, deps Deps) {
 			Items:         in.Body.toDomain(),
 			Key:           in.IdempotencyKey,
 			CorrelationID: correlationIDFrom(ctx),
+			Traceparent:   tracing.Traceparent(ctx),
 		}, marshalBatchAccepted)
 		if err != nil {
 			return nil, problemFor(ctx, logger, err)
