@@ -81,10 +81,10 @@ func registerTemplates(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/templates",
 		Summary:       "Create a template",
-		Description:   "Stores a template with {{name}} placeholders. Templates cannot be changed or deleted; a changed message is a new template.",
+		Description:   "Stores a template with {{name}} placeholders. Templates cannot be changed or deleted; a changed message is a new template. Malformed JSON gets 400, a broken rule 422.",
 		Tags:          []string{"Templates"},
 		DefaultStatus: http.StatusCreated,
-		Errors:        []int{http.StatusUnprocessableEntity},
+		Errors:        []int{http.StatusBadRequest, http.StatusUnprocessableEntity},
 	}, func(ctx context.Context, in *createTemplateInput) (*templateOutput, error) {
 		logger := loggerFrom(ctx, deps.Logger)
 		t, err := deps.Templates.Create(ctx, in.Body.toDomain())

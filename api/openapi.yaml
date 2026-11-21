@@ -1112,7 +1112,7 @@ paths:
       tags:
         - Templates
     post:
-      description: Stores a template with {{name}} placeholders. Templates cannot be changed or deleted; a changed message is a new template.
+      description: Stores a template with {{name}} placeholders. Templates cannot be changed or deleted; a changed message is a new template. Malformed JSON gets 400, a broken rule 422.
       operationId: create-template
       requestBody:
         content:
@@ -1127,6 +1127,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/TemplateBody"
           description: Created
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Bad Request
         "422":
           content:
             application/problem+json:
