@@ -352,6 +352,70 @@ func TestWebSocketSnapshotThenUpdate(t *testing.T) {
 	}
 }
 
+// TestWebSocketUUIDCase: UUIDs name the same subscription regardless of
+// letter case; snapshots and committed updates always carry canonical IDs.
+func TestWebSocketUUIDCase(t *testing.T) {
+	const (
+		notificationID = "019abcde-0000-7000-8000-abcdef123456"
+		batchID        = "019abcde-0000-7000-8000-abcdef123457"
+	)
+	cases := []struct {
+		name string
+		id   func(string) string
+	}{
+		{name: "canonical", id: func(id string) string { return id }},
+		{name: "uppercase", id: strings.ToUpper},
+		{name: "mixedcase", id: strings.NewReplacer("a", "A", "c", "C", "e", "E").Replace},
+	}
+	for _, kind := range []string{"notifications", "batches"} {
+		for _, tc := range cases {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				e := newWSEnv(t, wsOptions{})
+				if _, err := e.pool.Exec(t.Context(),
+					`INSERT INTO batches (id, item_count, correlation_id) VALUES ($1::uuid, 1, 'ws-case-test')`, batchID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := e.pool.Exec(t.Context(),
+					`INSERT INTO notifications (id, recipient, channel, content, priority, correlation_id, batch_id, batch_position)
+					 VALUES ($1::uuid, '+905551234567', 'sms', 'hello', 'normal', 'ws-case-test', $2::uuid, 0)`,
+					notificationID, batchID); err != nil {
+					t.Fatal(err)
+				}
+
+				id := notificationID
+				if kind == "batches" {
+					id = batchID
+				}
+				c := e.dial("/ws/" + kind + "/" + tc.id(id))
+				var snap httpapi.StatusMessage
+				if kind == "batches" {
+					batch := readBatch(t, c)
+					if batch.Type != "snapshot" || batch.BatchID != batchID || len(batch.Notifications) != 1 {
+						t.Fatalf("batch snapshot %+v, want canonical batch ID and one item", batch)
+					}
+					snap = batch.Notifications[0]
+				} else {
+					snap = readStatus(t, c)
+					if snap.Type != "snapshot" {
+						t.Fatalf("first message %+v, want a snapshot", snap)
+					}
+				}
+				if snap.NotificationID != notificationID || snap.BatchID == nil || *snap.BatchID != batchID ||
+					snap.Status != "queued" || snap.Version != 0 {
+					t.Fatalf("snapshot %+v, want canonical IDs and queued version 0", snap)
+				}
+
+				setStatus(t, e.pool, notificationID, "processing")
+				up := readStatus(t, c)
+				if up.Type != "update" || up.NotificationID != notificationID || up.BatchID == nil || *up.BatchID != batchID ||
+					up.Status != "processing" || up.Version != 1 {
+					t.Fatalf("update %+v, want canonical IDs and processing version 1", up)
+				}
+			})
+		}
+	}
+}
+
 // TestSnapshotNoGap: a change committed after the registration and before
 // the snapshot read is not lost: the snapshot holds it, its buffered event is
 // not sent again, and the next change follows (K24).

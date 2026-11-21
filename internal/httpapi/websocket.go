@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,7 +104,9 @@ func registerWebSockets(mux *http.ServeMux, deps Deps) {
 	h := &wsHandler{deps: ws, logger: deps.Logger}
 
 	mux.HandleFunc("GET /ws/notifications/{id}", func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
+		// PostgreSQL emits canonical lowercase UUIDs in status events; use
+		// the same form for the subscription topic and snapshot lookup.
+		id := strings.ToLower(r.PathValue("id"))
 		h.serve(w, r, realtime.NotificationTopic(id), "notification", func(ctx context.Context) (any, []domain.StatusEvent, error) {
 			ev, err := ws.Statuses.Notification(ctx, id)
 			if err != nil {
@@ -113,7 +116,7 @@ func registerWebSockets(mux *http.ServeMux, deps Deps) {
 		})
 	})
 	mux.HandleFunc("GET /ws/batches/{id}", func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
+		id := strings.ToLower(r.PathValue("id"))
 		h.serve(w, r, realtime.BatchTopic(id), "batch", func(ctx context.Context) (any, []domain.StatusEvent, error) {
 			events, err := ws.Statuses.Batch(ctx, id)
 			if err != nil {
