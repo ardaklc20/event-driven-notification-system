@@ -17,7 +17,7 @@ import (
 )
 
 // readLimit is about five times the largest snapshot, a batch of 1,000
-// (README, "Real-time status"). The library's default is 32 KiB.
+// (docs/REFERENCE.md, "Real-time status"). The library's default is 32 KiB.
 const readLimit = 1 << 20
 
 func main() {

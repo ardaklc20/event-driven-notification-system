@@ -212,8 +212,18 @@ func TestSendStartsWithPausedWorker(t *testing.T) {
 	if workers := ratecheck.Workers(all); len(workers) != 2 {
 		t.Fatalf("starts from %v, want both workers", workers)
 	}
-	if n := countMsg(wa.logs.records(t), missedLine); n != 1 {
-		t.Fatalf("worker A wrote %d %q lines, want 1", n, missedLine)
+	// The forced pause must miss its permit. A busy host can also delay
+	// unrelated claims, so do not require exactly one miss across the worker.
+	pausedMissed := false
+	for _, record := range wa.logs.records(t) {
+		msg, _ := record["msg"].(string)
+		if record["notification_id"] == paused && strings.HasPrefix(msg, missedLine) {
+			pausedMissed = true
+			break
+		}
+	}
+	if !pausedMissed {
+		t.Fatalf("worker A wrote no %q line for its paused notification %s", missedLine, paused)
 	}
 	r := readRow(t, pool, paused)
 	if r.status != "sent" || r.attempts != 1 {

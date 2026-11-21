@@ -204,6 +204,11 @@ func ParseAcceptance(body []byte) (acc domain.Acceptance, problem string) {
 		problems = append(problems, "messageId is missing")
 	} else if err := json.Unmarshal(raw, &id); err != nil || id == "" {
 		problems = append(problems, "messageId is not a non-empty string")
+	} else if strings.ContainsRune(id, '\x00') {
+		// PostgreSQL text cannot hold NUL. The provider already accepted the
+		// delivery, so discard this optional field instead of failing the
+		// result write and retrying an accepted notification.
+		problems = append(problems, "messageId contains NUL")
 	} else {
 		acc.MessageID = id
 	}

@@ -25,6 +25,7 @@ func TestParseAcceptance(t *testing.T) {
 		{"empty body", ``, "", time.Time{}, true},
 		{"messageId a number", `{"messageId":42,"timestamp":"2026-11-20T10:30:00Z"}`, "", ts, true},
 		{"messageId empty", `{"messageId":"","timestamp":"2026-11-20T10:30:00Z"}`, "", ts, true},
+		{"messageId contains NUL", `{"messageId":"m-\u0000123","timestamp":"2026-11-20T10:30:00Z"}`, "", ts, true},
 		{"timestamp missing", `{"messageId":"m-1","status":"accepted"}`, "m-1", time.Time{}, true},
 		{"timestamp not RFC 3339", `{"messageId":"m-1","timestamp":"20/11/2026"}`, "m-1", time.Time{}, true},
 	}
