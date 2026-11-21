@@ -105,8 +105,8 @@ func wantNothingStored(t *testing.T, pool *pgxpool.Pool) {
 }
 
 // TestCreateTemplate: a valid template gets 201 and reads back the same; a
-// body with malformed syntax gets 422 and no row; an unknown ID gets 404
-// (K33, K47).
+// body with malformed template syntax gets 422 and malformed JSON 400, with no
+// row; an unknown ID gets 404 (K33, K47).
 func TestCreateTemplate(t *testing.T) {
 	pool := testdb.New(t)
 	base := templateServer(t, pool)
@@ -130,6 +130,10 @@ func TestCreateTemplate(t *testing.T) {
 		jsonOf(t, httpapi.TemplateRequest{Name: "broken", Channel: "sms", Body: "Hello {{first_name"}), nil)
 	if p := decodeProblem(t, raw); resp.StatusCode != http.StatusUnprocessableEntity || !p.has("body.body") {
 		t.Fatalf("malformed syntax: status %d %s, want 422 on body.body", resp.StatusCode, raw)
+	}
+	resp, raw = send(t, http.MethodPost, base+"/templates", `{"name":"cut`, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed JSON: status %d %s, want 400", resp.StatusCode, raw)
 	}
 	if n := rows(t, pool, "templates"); n != 1 {
 		t.Fatalf("%d templates, want 1", n)
