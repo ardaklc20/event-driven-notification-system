@@ -61,7 +61,7 @@ func claimStatement(breaker, permitGuard, extra string) string {
 			FROM next, permit AS p
 			WHERE n.id = next.id
 			RETURNING n.id, n.recipient, n.channel, n.content, n.correlation_id, n.attempts,
-			          n.lease_token, n.lease_expires_at
+			          n.lease_token, n.lease_expires_at, n.traceparent
 		), moved AS (
 			UPDATE channel_limits AS l
 			SET next_permit_at = p.permit_at + $4::bigint * interval '1 microsecond'
@@ -74,7 +74,8 @@ func claimStatement(breaker, permitGuard, extra string) string {
 		       c.lease_token::text,
 		       floor(extract(epoch FROM c.lease_expires_at - clock_timestamp()) * 1000000)::bigint,
 		       floor(extract(epoch FROM p.permit_at + $5::bigint * interval '1 microsecond' - clock_timestamp())
-		             * 1000000)::bigint
+		             * 1000000)::bigint,
+		       c.traceparent
 		FROM (SELECT 1) AS one
 		LEFT JOIN breaker AS b ON true
 		LEFT JOIN permit AS p ON true
@@ -225,11 +226,12 @@ func (s *Store) claim(ctx context.Context, query string, req domain.ClaimRequest
 		id, recipient, channel, content, corr, token *string
 		attempt                                      *int
 		leaseUS, permitUS                            *int64
+		traceparent                                  *string
 	)
 	err = s.pool.QueryRow(ctx, query, string(req.Channel), req.MaxAttempts, req.Lease.Microseconds(),
 		req.PermitInterval.Microseconds(), req.PermitGrace.Microseconds()).Scan(
 		&generation, &openUS, &hasPermit, &waitUS,
-		&id, &recipient, &channel, &content, &corr, &attempt, &token, &leaseUS, &permitUS)
+		&id, &recipient, &channel, &content, &corr, &attempt, &token, &leaseUS, &permitUS, &traceparent)
 	switch {
 	case err != nil:
 		return domain.ClaimResult{}, false, fmt.Errorf("claim: %w", err)
@@ -259,6 +261,7 @@ func (s *Store) claim(ctx context.Context, query string, req domain.ClaimRequest
 			PermitRemaining: time.Duration(*permitUS) * time.Microsecond,
 			Generation:      *generation,
 			Probe:           probe,
+			Traceparent:     deref(traceparent),
 		}}, false, nil
 	case waitUS != nil && *waitUS > 0:
 		return domain.ClaimResult{Outcome: domain.ClaimThrottled, Wait: time.Duration(*waitUS) * time.Microsecond}, false, nil
@@ -287,4 +290,12 @@ func (s *Store) RecoverExpired(ctx context.Context, maxAttempts, batch int) ([]d
 		return nil, fmt.Errorf("recover: %w", err)
 	}
 	return out, nil
+}
+
+// deref returns *s, or "" for nil.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

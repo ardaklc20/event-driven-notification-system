@@ -16,9 +16,17 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
+
+// tracerName names the worker's tracer (K27).
+const tracerName = "github.com/ardaklc20/event-driven-notification-system/internal/worker"
 
 // Store is what the worker needs from the database. Every result write is
 // conditioned on the claim's lease and reports false when the lease was no
@@ -61,6 +69,9 @@ type Config struct {
 	PermitGrace    time.Duration
 	// Breaker holds the circuit breaker's settings (K34).
 	Breaker domain.BreakerPolicy
+	// Tracing, when enabled, gives every attempt its own span linked to the
+	// stored trace context of the request (K27). Nil: no spans.
+	Tracing *tracing.Provider
 }
 
 // queryTimeout bounds one claim or recovery statement.
@@ -338,8 +349,23 @@ func (w *Worker) deliver(c claimed) {
 			slog.String("lease_left", time.Until(c.deadline).Round(time.Millisecond).String()))
 		return
 	}
+	// Each attempt is a new trace with one link to the request that created
+	// the notification, not its child (K27). The provider call becomes a
+	// child of this span, so its traceparent comes from this trace.
+	_, span := w.cfg.Tracing.TracerProvider().Tracer(tracerName).Start(context.Background(), "deliver "+string(c.Channel),
+		trace.WithNewRoot(),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithLinks(trace.Link{SpanContext: tracing.SpanContext(c.Traceparent)}),
+		trace.WithAttributes(
+			attribute.String("notification.id", c.ID),
+			attribute.String("notification.channel", string(c.Channel)),
+			attribute.Int("notification.attempt", c.Attempt),
+		))
+	defer span.End()
+
 	callCtx, cancelCall := context.WithDeadline(context.Background(), callDeadline)
 	defer cancelCall()
+	callCtx = trace.ContextWithSpan(callCtx, span)
 	// The start gate checks the permit's start deadline and, when it passes,
 	// writes the start line with the send start it read (K21, K42).
 	callCtx = provider.WithPermit(callCtx, provider.Permit{
@@ -361,10 +387,15 @@ func (w *Worker) deliver(c claimed) {
 	})
 	duration := time.Since(start)
 	if errors.Is(callErr, provider.ErrStartDeadline) {
+		span.SetStatus(codes.Error, "start deadline missed")
 		w.giveBack(log, c)
 		return
 	}
 	outcome := provider.Classify(resp, callErr, w.cfg.Profile)
+	span.SetAttributes(attribute.String("provider.class", string(outcome.Class)))
+	if outcome.Class != provider.ClassAccepted {
+		span.SetStatus(codes.Error, outcome.Error)
+	}
 
 	if w.hooks.beforeWrite != nil {
 		w.hooks.beforeWrite(c.Claim)

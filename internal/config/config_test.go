@@ -98,14 +98,15 @@ func TestAPIConfig(t *testing.T) {
 
 	t.Run("validation", func(t *testing.T) {
 		for name, vars := range map[string]map[string]string{
-			"address without port": {"DATABASE_URL": testURL, "HTTP_ADDR": "localhost"},
-			"zero shutdown":        {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "0s"},
-			"zero sms limit":       {"DATABASE_URL": testURL, "SMS_CONTENT_LIMIT": "0"},
-			"negative push limit":  {"DATABASE_URL": testURL, "PUSH_CONTENT_LIMIT": "-1"},
-			"zero batch body":      {"DATABASE_URL": testURL, "BATCH_MAX_BODY_BYTES": "0"},
-			"zero send queue":      {"DATABASE_URL": testURL, "WS_SEND_QUEUE": "0"},
-			"zero write timeout":   {"DATABASE_URL": testURL, "WS_WRITE_TIMEOUT": "0s"},
-			"close wait too long":  {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "5s", "WS_CLOSE_TIMEOUT": "5s"},
+			"address without port":    {"DATABASE_URL": testURL, "HTTP_ADDR": "localhost"},
+			"zero shutdown":           {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "0s"},
+			"zero sms limit":          {"DATABASE_URL": testURL, "SMS_CONTENT_LIMIT": "0"},
+			"negative push limit":     {"DATABASE_URL": testURL, "PUSH_CONTENT_LIMIT": "-1"},
+			"zero batch body":         {"DATABASE_URL": testURL, "BATCH_MAX_BODY_BYTES": "0"},
+			"zero send queue":         {"DATABASE_URL": testURL, "WS_SEND_QUEUE": "0"},
+			"zero write timeout":      {"DATABASE_URL": testURL, "WS_WRITE_TIMEOUT": "0s"},
+			"close wait too long":     {"DATABASE_URL": testURL, "SHUTDOWN_TIMEOUT": "5s", "WS_CLOSE_TIMEOUT": "5s"},
+			"otel endpoint no scheme": {"DATABASE_URL": testURL, "OTEL_EXPORTER_OTLP_ENDPOINT": "jaeger:4318"},
 		} {
 			if _, err := config.LoadAPI(env.Options{Environment: vars}); err == nil {
 				t.Errorf("%s: LoadAPI accepted %v", name, vars)

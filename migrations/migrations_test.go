@@ -35,8 +35,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first up: %v", err)
 	}
-	if len(first) != 11 {
-		t.Fatalf("first up applied %d migrations, want 11", len(first))
+	if len(first) != 12 {
+		t.Fatalf("first up applied %d migrations, want 12", len(first))
 	}
 	for i, r := range first {
 		if r.Source.Version != int64(i+1) {
@@ -137,6 +137,17 @@ func TestMigrations(t *testing.T) {
 			`INSERT INTO notifications (recipient, channel, content, priority, correlation_id, template_id)
 			 VALUES ('+905551234567', 'sms', 'x', 'normal', 'test', '01900000-0000-7000-8000-000000000000')`)
 		assertSQLState(t, "unknown template", err, "23503")
+	})
+
+	t.Run("traceparent format", func(t *testing.T) {
+		insert := `INSERT INTO notifications (recipient, channel, content, priority, correlation_id, traceparent)
+			VALUES ('+905551234567', 'sms', 'x', 'normal', 'test', $1)`
+		_, err := db.ExecContext(ctx, insert, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+		if err != nil {
+			t.Fatalf("valid traceparent: %v", err)
+		}
+		_, err = db.ExecContext(ctx, insert, "not-a-traceparent")
+		assertConstraint(t, "malformed traceparent", err, "notifications_traceparent_format")
 	})
 
 	t.Run("status triggers exist", func(t *testing.T) {

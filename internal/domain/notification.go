@@ -121,6 +121,9 @@ type Claim struct {
 	// Generation is the circuit breaker's generation the claim read (K34).
 	// Only a result of the current generation moves the breaker.
 	Generation int64
+	// Traceparent is the stored trace context of the request that created
+	// the notification, or "" (K27). Each attempt's span links to it.
+	Traceparent string
 	// Probe is true for the one claim taken after the breaker's cooldown.
 	Probe bool
 }
@@ -237,6 +240,9 @@ type CreateCommand struct {
 	// Key is the Idempotency-Key; empty means the request has none.
 	Key         string
 	RequestHash []byte
+	// Traceparent is the trace context of the API request's server span, or
+	// "" when tracing is off (K27). It is not part of the request hash.
+	Traceparent string
 	// Prepare runs only when this command is about to write a new
 	// notification: when it reserved the key, or has no key. It gets the
 	// stored template the request names, if any, loaded in the same
@@ -273,6 +279,9 @@ type BatchCommand struct {
 	// Key is the Idempotency-Key; empty means the request has none.
 	Key         string
 	RequestHash []byte
+	// Traceparent is stored with every item: the batch request's server span
+	// (K27).
+	Traceparent string
 	// Prepare runs only when this command is about to write new
 	// notifications, as for a single create; the templates of every item are
 	// loaded with one query. It returns the items to save, in request order.

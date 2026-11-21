@@ -8,8 +8,10 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/service"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 const (
@@ -32,6 +34,9 @@ type Deps struct {
 	// WebSocket configures the real-time status endpoints (K24, K25); they
 	// are registered only when it has a Hub.
 	WebSocket WebSocketDeps
+	// Tracing, when enabled, wraps the API in otelhttp's server middleware
+	// (K27). Nil or disabled: no spans, and no trace context is stored.
+	Tracing *tracing.Provider
 }
 
 // DefaultBatchMaxBodyBytes is the default batch body limit, 16 MiB (K12).
@@ -45,6 +50,17 @@ func New(deps Deps) http.Handler {
 	h = recoverPanics(deps.Logger, h)
 	h = logRequests(deps.Logger, h)
 	h = withCorrelationID(deps.Logger, h)
+	if deps.Tracing.Enabled() {
+		// Outermost, so the server span covers the whole request; a
+		// client's traceparent makes it a child of the client's span.
+		h = otelhttp.NewHandler(h, "api",
+			otelhttp.WithTracerProvider(deps.Tracing.TracerProvider()),
+			otelhttp.WithPropagators(deps.Tracing.Propagator()),
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return r.Method + " " + r.URL.Path }),
+			// Probes every few seconds would bury the requests (K30).
+			otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/healthz" && r.URL.Path != "/readyz" }),
+		)
+	}
 	return h
 }
 

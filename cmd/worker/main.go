@@ -21,6 +21,7 @@ import (
 	"github.com/ardaklc20/event-driven-notification-system/internal/config"
 	"github.com/ardaklc20/event-driven-notification-system/internal/postgres"
 	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 	"github.com/ardaklc20/event-driven-notification-system/internal/worker"
 )
 
@@ -53,7 +54,23 @@ func run() int {
 	// The URL is not logged: a webhook.site URL holds its token.
 	logger.Info("provider configured", slog.String("profile", string(cfg.ProviderProfile)),
 		slog.String("http_timeout", cfg.HTTPTimeout.String()))
-	client := provider.NewClient(cfg.ProviderURL, cfg.HTTPTimeout, cfg.InFlight)
+	// Tracing is off unless OTEL_EXPORTER_OTLP_ENDPOINT is set (K27).
+	tracer, err := tracing.New(ctx, cfg.TracingConfig("notification-worker"))
+	if err != nil {
+		logger.Error("tracing", "error", err)
+		return 1
+	}
+	defer func() {
+		// The final flush is bounded on its own, after the worker's shutdown
+		// budget; a collector that never answers cannot hold the process.
+		flushCtx, cancel := context.WithTimeout(context.Background(), tracing.ShutdownTimeout)
+		defer cancel()
+		if err := tracer.Shutdown(flushCtx); err != nil {
+			logger.Warn("tracing flush", "error", err)
+		}
+	}()
+	logger.Info("tracing", slog.Bool("enabled", tracer.Enabled()))
+	client := provider.NewClient(cfg.ProviderURL, cfg.HTTPTimeout, cfg.InFlight, provider.WithTracing(tracer))
 	w := worker.New(postgres.NewStore(pool), client, logger, worker.Config{
 		Profile:          cfg.ProviderProfile,
 		LeaseDuration:    cfg.LeaseDuration,
@@ -69,6 +86,7 @@ func run() int {
 		PermitInterval:   cfg.PermitInterval,
 		PermitGrace:      cfg.PermitGrace,
 		Breaker:          cfg.Breaker(),
+		Tracing:          tracer,
 	})
 
 	// After the first signal, a second one terminates the process at once.

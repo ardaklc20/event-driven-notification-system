@@ -13,6 +13,7 @@ import (
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
 	"github.com/ardaklc20/event-driven-notification-system/internal/provider"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 // Listen holds the HTTP listen address. The API's healthcheck subcommand reads
@@ -57,6 +58,41 @@ type API struct {
 	WSSendQueue    int           `env:"WS_SEND_QUEUE" envDefault:"16"`
 	WSWriteTimeout time.Duration `env:"WS_WRITE_TIMEOUT" envDefault:"5s"`
 	WSCloseTimeout time.Duration `env:"WS_CLOSE_TIMEOUT" envDefault:"5s"`
+
+	Tracing
+}
+
+// Tracing turns OpenTelemetry on when an OTLP endpoint is set (K27).
+type Tracing struct {
+	// OTLPEndpoint is the collector's base URL, for example
+	// http://jaeger:4318; empty turns tracing off.
+	OTLPEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT"`
+	// ServiceName names the process in the traces; each program sets its own
+	// default.
+	ServiceName string `env:"OTEL_SERVICE_NAME"`
+}
+
+// TracingConfig returns the tracing settings with defaultName when
+// OTEL_SERVICE_NAME is not set.
+func (t Tracing) TracingConfig(defaultName string) tracing.Config {
+	name := t.ServiceName
+	if name == "" {
+		name = defaultName
+	}
+	return tracing.Config{Endpoint: t.OTLPEndpoint, ServiceName: name}
+}
+
+// validate checks the endpoint when it is set: an http or https URL with a
+// host.
+func (t Tracing) validate() error {
+	if t.OTLPEndpoint == "" {
+		return nil
+	}
+	u, err := url.Parse(t.OTLPEndpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT must be an http or https URL with a host, got %q", t.OTLPEndpoint)
+	}
+	return nil
 }
 
 // Limits returns the content limits as the domain type.
@@ -94,6 +130,9 @@ func (c API) Validate() error {
 	if c.WSCloseTimeout <= 0 || c.WSCloseTimeout >= c.ShutdownTimeout {
 		errs = append(errs, fmt.Errorf("WS_CLOSE_TIMEOUT must be positive and below SHUTDOWN_TIMEOUT (%s), got %s", c.ShutdownTimeout, c.WSCloseTimeout))
 	}
+	if err := c.validate(); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -105,6 +144,7 @@ type Migrate struct {
 // Worker is the configuration of cmd/worker.
 type Worker struct {
 	DatabaseURL string `env:"DATABASE_URL,required,notEmpty"`
+	Tracing
 	// One URL for every channel; the channel travels in the body (A2, K14).
 	ProviderURL     string           `env:"PROVIDER_URL,required,notEmpty"`
 	ProviderProfile provider.Profile `env:"PROVIDER_PROFILE" envDefault:"standard"`
@@ -161,6 +201,9 @@ func (c Worker) Validate() error {
 	if u, err := url.Parse(c.ProviderURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		// The URL itself is not repeated: a webhook.site URL holds its token.
 		errs = append(errs, errors.New("PROVIDER_URL must be an absolute http or https URL"))
+	}
+	if err := c.validate(); err != nil {
+		errs = append(errs, err)
 	}
 	if !c.ProviderProfile.Valid() {
 		errs = append(errs, fmt.Errorf("PROVIDER_PROFILE must be %s or %s, got %q",

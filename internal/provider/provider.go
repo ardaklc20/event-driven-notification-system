@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ardaklc20/event-driven-notification-system/internal/domain"
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 // Profile decides how the provider's 429 is handled (K7, K14).
@@ -84,10 +85,27 @@ type Client struct {
 	http    *http.Client
 }
 
+// Option changes how a Client is built.
+type Option func(*options)
+
+type options struct {
+	tracing *tracing.Provider
+}
+
+// WithTracing makes every call a client span of the caller's span, with a
+// traceparent header (K27).
+func WithTracing(p *tracing.Provider) Option {
+	return func(o *options) { o.tracing = p }
+}
+
 // NewClient returns a client for providerURL. Each call is bounded by
 // timeout; maxIdleConns keeps that many connections open for reuse, normally
 // the number of calls in flight.
-func NewClient(providerURL string, timeout time.Duration, maxIdleConns int) *Client {
+func NewClient(providerURL string, timeout time.Duration, maxIdleConns int, opts ...Option) *Client {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = maxIdleConns
 	transport.MaxIdleConnsPerHost = maxIdleConns
@@ -95,8 +113,7 @@ func NewClient(providerURL string, timeout time.Duration, maxIdleConns int) *Cli
 		url:     providerURL,
 		timeout: timeout,
 		http: &http.Client{
-			// Every request passes the start gate (K42).
-			Transport: startGate{next: transport},
+			Transport: newTransport(transport, o.tracing),
 			// Redirects are not followed: the first response comes back as it
 			// is, so a POST never reaches a second address (K14).
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

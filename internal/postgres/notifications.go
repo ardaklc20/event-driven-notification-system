@@ -41,8 +41,9 @@ const (
 	// A scheduled notification is first available at its scheduled time
 	// (K26); any other at once, as the column default would make it.
 	insertNotificationSQL = `
-		INSERT INTO notifications (recipient, channel, content, priority, correlation_id, scheduled_at, available_at, template_id)
-		VALUES ($1, $2, $3, $4::text::notification_priority, $5, $6::timestamptz, coalesce($6::timestamptz, now()), $7::text::uuid)
+		INSERT INTO notifications (recipient, channel, content, priority, correlation_id, scheduled_at, available_at, template_id, traceparent)
+		VALUES ($1, $2, $3, $4::text::notification_priority, $5, $6::timestamptz, coalesce($6::timestamptz, now()), $7::text::uuid,
+		        nullif($8, ''))
 		RETURNING ` + notificationColumns
 
 	// pastScheduledSQL returns the zero-based positions of the times ($1, in
@@ -113,7 +114,7 @@ func (s *Store) CreateNotification(ctx context.Context, cmd domain.CreateCommand
 		return domain.CreateResult{}, err
 	}
 	created, err := scanNotification(tx.QueryRow(ctx, insertNotificationSQL,
-		n.Recipient, string(n.Channel), n.Content, string(n.Priority), cmd.CorrelationID, scheduledArg(n), templateArg(n)))
+		n.Recipient, string(n.Channel), n.Content, string(n.Priority), cmd.CorrelationID, scheduledArg(n), templateArg(n), cmd.Traceparent))
 	if err != nil {
 		return domain.CreateResult{}, fmt.Errorf("insert notification: %w", err)
 	}

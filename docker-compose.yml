@@ -42,6 +42,10 @@ services:
       HTTP_ADDR: ":8080"
       LOG_LEVEL: info
       SHUTDOWN_TIMEOUT: 10s
+      # Tracing is off unless an OTLP endpoint is given (K27); the demo sets
+      # it to http://jaeger:4318 with the tracing profile.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: notification-api
       WS_SEND_QUEUE: "16"
       WS_WRITE_TIMEOUT: 5s
       WS_CLOSE_TIMEOUT: 5s
@@ -73,6 +77,8 @@ services:
       DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
       PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8081/}
       PROVIDER_PROFILE: ${PROVIDER_PROFILE:-standard}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: notification-worker
       HTTP_TIMEOUT: 5s
       RESULT_BUDGET: 5s
       LEASE_DURATION: 30s
@@ -112,6 +118,14 @@ services:
       LOG_LEVEL: info
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${MOCK_PORT:-8081}:8081"
+
+  # Started only with --profile tracing (K27): in-memory storage, OTLP/HTTP on
+  # 4318 inside the network, the UI on the host.
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    profiles: ["tracing"]
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${JAEGER_UI_PORT:-16686}:16686"
 
 volumes:
   pgdata:

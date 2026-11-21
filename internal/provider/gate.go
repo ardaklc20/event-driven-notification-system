@@ -5,6 +5,10 @@ import (
 	"errors"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"github.com/ardaklc20/event-driven-notification-system/internal/tracing"
 )
 
 // ErrStartDeadline means the send did not start: the permit's start deadline
@@ -66,4 +70,21 @@ func closeBody(req *http.Request) {
 	if req.Body != nil {
 		_ = req.Body.Close()
 	}
+}
+
+// newTransport builds the client's transport. Every request passes the start
+// gate, which wraps the HTTP transport directly (K42). With tracing on,
+// otelhttp wraps the gate from outside (K27): the client span starts and the
+// traceparent header is set before the deadline check, never between the
+// counted start and the transport.
+func newTransport(inner http.RoundTripper, tr *tracing.Provider) http.RoundTripper {
+	var rt http.RoundTripper = startGate{next: inner}
+	if tr.Enabled() {
+		rt = otelhttp.NewTransport(rt,
+			otelhttp.WithTracerProvider(tr.TracerProvider()),
+			otelhttp.WithPropagators(tr.Propagator()),
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return "provider " + r.Method }),
+		)
+	}
+	return rt
 }
