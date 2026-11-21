@@ -101,17 +101,19 @@ for i in $(seq 1 30); do
 done
 echo "status=$STATUS"
 sleep 5                        # the batch span processor exports on a timer
-TRACE=$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -tAc \
+TRACE=$(docker compose exec -T postgres psql -U notifications -d notifications -tAc \
   "select split_part(traceparent, '-', 2) from notifications where id = '$ID'")
-curl -s http://localhost:16686/api/services | jq -r '.data[]'
-curl -s "http://localhost:16686/api/traces/$TRACE" | jq '[.data[0].spans[].operationName]'
-curl -s 'http://localhost:16686/api/traces?service=notification-worker&limit=20' \
-  | jq --arg t "$TRACE" '[.data[].spans[] | select(any(.references[]?; .traceID == $t)) | .operationName]'
+curl -s http://localhost:16686/api/v3/services | jq -r '.services[]'
+curl -s "http://localhost:16686/api/v3/traces/$TRACE" | jq '[.result.resourceSpans[].scopeSpans[].spans[].name]'
+MIN=$(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)
+MAX=$(date -u -v+1M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+1 minute' +%Y-%m-%dT%H:%M:%SZ)
+curl -s "http://localhost:16686/api/v3/traces?query.service_name=notification-worker&query.start_time_min=$MIN&query.start_time_max=$MAX" \
+  | jq --arg t "$TRACE" '[.result.resourceSpans[].scopeSpans[].spans[] | select(any(.links[]?; .traceId == $t)) | {name, traceId}]'
 docker compose --profile tracing down
 docker compose up -d
 ```
 
-**Expected observation:** `status=sent` before anything else is read; if the loop ends with another status, the check fails. Both service names are listed; the request's trace holds the API's server span; at least one worker span refers to that trace. The Jaeger UI shows the same, and a screenshot of it goes into the README. The `/api/...` paths are the ones the Jaeger UI itself uses; the screenshot is the evidence the README keeps.
+**Expected observation:** `status=sent` before anything else is read; if the loop ends with another status, the check fails. Both service names are listed; the request's trace holds the API's server span; at least one worker span refers to that trace. The Jaeger UI shows the same, and a screenshot of it goes into the README. The `/api/v3/...` paths are the ones the Jaeger 2.23 UI itself uses (it returns OTLP JSON); the older `/api/services` and `/api/traces?service=` paths answer 404 in this version. The database user is the one the Compose file sets, `notifications`. The screenshot is the evidence the README keeps.
 
 ## Evidence for the pull request
 

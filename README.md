@@ -6,7 +6,7 @@ A notification service in Go that queues SMS, email and push notifications in Po
 
 One image holds four programs, each a Compose service: `api` (the HTTP API), `worker` (claims and delivers notifications; several can run), `migrate` (applies the database migrations and exits) and `mockprovider` (a local stand-in for the external provider). There is no message broker: the `notifications` table in PostgreSQL is the queue.
 
-**Current state (core complete; circuit breaker, scheduling, real-time status and templates, slice 14):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it. A WebSocket client can follow one notification or one batch: it gets the current state, then each status change. Stored templates with `{{name}}` placeholders are rendered once at the API, and the worker sends the rendered content.
+**Current state (core complete; circuit breaker, scheduling, real-time status, templates and tracing, slice 15):** `docker compose up` starts PostgreSQL, applies the migrations, and runs the API, a worker and a local mock provider. A created notification is delivered by the worker and reaches `sent`. Temporary failures are retried with backoff up to five attempts, permanent ones stop at once, and a crashed worker's notification is taken back when its lease expires. Each channel is limited to 100 send starts in any one-second window, shared by every worker, and within a channel `high` goes before `normal` before `low`. A `queued` notification can be cancelled, notifications can be listed with filters and a cursor, up to 1,000 notifications can be created in one all-or-nothing batch whose status is counted and paged, and `GET /metrics` reports queue depth, completions and latency per channel. While the provider keeps failing, one circuit breaker shared by every worker pauses claims on all channels and lets a single probe test the provider before they resume. A notification can carry an absolute `scheduled_at` and is not sent before it. A WebSocket client can follow one notification or one batch: it gets the current state, then each status change. Stored templates with `{{name}}` placeholders are rendered once at the API, and the worker sends the rendered content. With an OTLP endpoint set, the API request, each delivery attempt and each provider call produce OpenTelemetry spans, which Jaeger shows.
 
 ## Requirements
 
@@ -383,6 +383,37 @@ Every rule violation gets `422` with one entry per field (`location` and `messag
 
 The content limits are this application's limits, not carrier or platform guarantees: 160 code points fit one SMS segment only when every character is in the GSM-7 set (with other characters a segment holds 70), and 1,000 code points do not guarantee a push payload under the 4 KB that APNs and FCM allow. They are configurable and apply to new notifications only: after a limit is lowered, a replay of an accepted request still returns its first response.
 
+## Tracing
+
+Tracing is off by default. To see traces, start the stack with the `tracing` profile and one variable, which both the API and the worker read:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile tracing up -d --wait
+```
+
+Send a notification, then open the Jaeger UI at <http://localhost:16686> ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)).
+
+| Span | Service | Made by |
+|---|---|---|
+| `POST /notifications` (and every other route) | `notification-api` | The otelhttp server middleware; `/healthz` and `/readyz` are left out |
+| `deliver <channel>` | `notification-worker` | One per delivery attempt, a consumer span with the notification ID, channel and attempt number |
+| `provider POST` | `notification-worker` | A child of the attempt: the otelhttp client transport around the start gate. Its request carries a `traceparent` header to the provider |
+
+- **Linked traces, not one trace.** The create transaction stores the W3C `traceparent` of the API's server span in `notifications.traceparent`; if the client sent its own `traceparent`, the server span is its child, and the stored value is the server span's, not the header. Each delivery attempt starts a new trace with a **link** to that stored context. As a child, a 1,000-item batch with all its retries would hang under one request's trace; OpenTelemetry's messaging conventions use links between a producer and its consumers.
+- **Following a notification.** Read the trace ID, the second field of the stored value:
+
+  ```bash
+  docker compose exec -T postgres psql -U notifications -d notifications -tAc \
+    "select split_part(traceparent, '-', 2) from notifications where id = '<id>'"
+  ```
+
+  That trace holds the API request. In Jaeger, search the service `notification-worker`: each `deliver <channel>` span lists the request trace under its references, and a retry is one more linked trace.
+- **No URL paths in spans.** otelhttp records the full URL, and a webhook.site URL carries its token in the path. Before a span is exported, `url.full` is cut to the scheme and host, as `http://mockprovider:8081/[redacted]`.
+- **A collector that is down never stops delivery.** The exporter gives up on a batch after 2 seconds without retrying, and the spans of that batch are dropped. At exit, each process flushes for at most 3 more seconds after its shutdown budget (Compose waits 15 seconds before it kills a container). `TestTracingCollectorDown` checks that a notification still reaches `sent` with no collector and with a collector that never answers.
+- **Off means off.** Without `OTEL_EXPORTER_OTLP_ENDPOINT` no exporter is created and `traceparent` stays null.
+
+![A delivery attempt in Jaeger: the deliver span and its provider POST child](docs/images/jaeger-trace.png)
+
 ## Mock provider
 
 Compose points the worker at the `mockprovider` service by default, so the stack needs no external URL.
@@ -433,6 +464,7 @@ Ports are published on `127.0.0.1` only, because the API has no authentication. 
 | `API_PORT` | `8080` | API on `127.0.0.1:8080` |
 | `MOCK_PORT` | `8081` | Mock provider on `127.0.0.1:8081` |
 | `POSTGRES_PORT` | `5433` | PostgreSQL on `127.0.0.1:5433` (not 5432, so it does not collide with a local PostgreSQL) |
+| `JAEGER_UI_PORT` | `16686` | Jaeger UI on `127.0.0.1:16686`, only with the `tracing` profile |
 | `BIND_ADDRESS` | `127.0.0.1` | The host address every port binds to |
 
 Example: `API_PORT=18080 docker compose up`.
@@ -456,6 +488,8 @@ Each program reads typed environment variables and refuses to start with an inva
 | `WS_SEND_QUEUE` | `16` | Messages waiting for one WebSocket; when full, the connection is closed with `1008` |
 | `WS_WRITE_TIMEOUT` | `5s` | Limit for one WebSocket write |
 | `WS_CLOSE_TIMEOUT` | `5s` | Wait for open WebSockets at shutdown; must be below `SHUTDOWN_TIMEOUT` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty (off) | OTLP/HTTP base URL, `http` or `https` with a host; traces go to its `/v1/traces`. Empty turns tracing off ([Tracing](#tracing)) |
+| `OTEL_SERVICE_NAME` | `notification-api` | Service name on the spans |
 
 ### Worker settings
 
@@ -481,6 +515,8 @@ Each program reads typed environment variables and refuses to start with an inva
 | `BREAKER_COOLDOWN` | `30s` | Pause after the breaker opens from closed; at most `BREAKER_MAX_COOLDOWN` |
 | `BREAKER_MAX_COOLDOWN` | `5m` | Cap of the cooldown, which doubles on each reopening |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty (off) | OTLP/HTTP base URL, `http` or `https` with a host; traces go to its `/v1/traces`. Empty turns tracing off ([Tracing](#tracing)) |
+| `OTEL_SERVICE_NAME` | `notification-worker` | Service name on the spans |
 
 ### Mock provider settings
 
@@ -490,7 +526,7 @@ Each program reads typed environment variables and refuses to start with an inva
 | `MOCK_DELAY` | `0s` | Wait before each `202` |
 | `LOG_LEVEL` | `info` | `debug` logs every arrival with its channel and correlation ID |
 
-`migrate` reads only `DATABASE_URL`. Compose sets every value explicitly in [`docker-compose.yml`](docker-compose.yml); `PROVIDER_URL`, `PROVIDER_PROFILE` and `MOCK_DELAY` can be set from the shell.
+`migrate` reads only `DATABASE_URL`. Compose sets every value explicitly in [`docker-compose.yml`](docker-compose.yml); `PROVIDER_URL`, `PROVIDER_PROFILE`, `MOCK_DELAY` and `OTEL_EXPORTER_OTLP_ENDPOINT` can be set from the shell.
 
 ## Tests
 
@@ -547,6 +583,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 - **An outage on one channel pauses all three** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). The circuit breaker is per provider, because the three channels share one URL: a failure that only one channel meets at the provider still stops every claim until a probe succeeds. The probe uses one attempt of the notification it carries, and `failed` notifications are never resent.
 - **Real-time updates are best effort** ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify)). Events held in the API's memory are lost if it stops, a slow client is disconnected, and PostgreSQL does not replay notifications sent while the listener was reconnecting; a client reconnects for a fresh snapshot. Each connection follows one notification or one batch.
 - **Templates accumulate** ([K33](docs/DECISIONS.md#k33--templates-b3-immutable-stored-templates-with-name-placeholders-rendered-at-the-api)). A template cannot be changed or deleted, so a changed message is a new template. Placeholders are plain substitution: there are no conditions, loops or escaping.
+- **Tracing shows linked traces and no database spans** ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)). A notification's request and its attempts are separate traces joined by links, so following one means opening the request's trace and then the linked attempt traces. SQL work is not traced. Spans a down collector cannot take are dropped, and Jaeger keeps them in memory only.
 - **No delivery step in CI** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lints, tests, checks the OpenAPI document and builds the image; nothing is published or deployed.
 
 ## Bonuses
@@ -558,7 +595,7 @@ A second run applies nothing. Each migration runs in its own transaction: if one
 | B2 — Scheduled notifications | Done ([Scheduled notifications](#scheduled-notifications)) |
 | B4 — Real-time status updates over WebSocket | Done ([Real-time status](#real-time-status)) |
 | B3 — Message templates | Done ([Templates](#templates)) |
-| B5 — Distributed tracing | Planned ([slice 15](docs/slices/15-distributed-tracing.md)) |
+| B5 — Distributed tracing | Done ([Tracing](#tracing)) |
 
 ## Project layout
 
@@ -575,6 +612,7 @@ internal/domain/        notification types, validation, request hash, template p
 internal/service/       create, read, cancel, list, batch, template and metrics rules; the listing cursor; WebSocket snapshot reads
 internal/httpapi/       router, Huma operations, middleware, the WebSocket endpoints
 internal/realtime/      WebSocket subscribers, their queues, the listener generation and the version filter
+internal/tracing/       tracer provider, OTLP/HTTP exporter, W3C propagator, URL redaction, stored traceparent
 internal/postgres/      connection pool and all SQL: create, batch, read, list, cancel, metrics snapshot, claim with permit and probe slot, result writes with the circuit breaker, give-back, recovery, the status listener and snapshot reads
 internal/worker/        claim loop per channel, lease and start deadlines, retries and backoff, lease recovery, breaker pauses
 internal/provider/      provider HTTP client, start gate, response classification with outage flags, Retry-After
@@ -603,7 +641,7 @@ SMS, e-posta ve push bildirimlerini PostgreSQL'de kuyruğa alan ve kanal başın
 
 Tek bir imaj, her biri bir Compose servisi olan dört program taşır: `api` (HTTP API), `worker` (bildirimleri claim edip teslim eder; birden fazla çalışabilir), `migrate` (veritabanı migration'larını uygulayıp çıkar) ve `mockprovider` (harici provider'ın yerel yerine geçeni). Mesaj kuyruğu sunucusu yoktur: kuyruk, PostgreSQL'deki `notifications` tablosudur.
 
-**Şu anki durum (çekirdek tamam; devre kesici, zamanlama, gerçek zamanlı durum ve şablonlar, dilim 14):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez. Bir WebSocket istemcisi tek bir bildirimi ya da tek bir toplu isteği izleyebilir: önce güncel durumu, sonra her durum değişikliğini alır. `{{name}}` yer tutuculu kayıtlı şablonlar API'de bir kez render edilir ve worker render edilmiş içeriği gönderir.
+**Şu anki durum (çekirdek tamam; devre kesici, zamanlama, gerçek zamanlı durum, şablonlar ve izleme, dilim 15):** `docker compose up` PostgreSQL'i başlatır, migration'ları uygular; API'yi, bir worker'ı ve yerel bir mock provider'ı çalıştırır. Oluşturulan bildirimi worker teslim eder ve bildirim `sent` olur. Geçici hatalar backoff ile en fazla beş denemeye kadar tekrar denenir, kalıcı hatalar hemen durur, çöken bir worker'ın bildirimi lease'i dolunca geri alınır. Her kanal, bütün worker'lar tarafından paylaşılan bir sınırla herhangi bir bir saniyelik pencerede en fazla 100 gönderim başlangıcı alır; bir kanal içinde `high`, `normal`'dan, `normal` da `low`'dan önce gelir. `queued` bir bildirim iptal edilebilir; bildirimler filtreler ve bir cursor ile listelenebilir; tek bir ya hep ya hiç toplu istekle en fazla 1.000 bildirim oluşturulabilir ve toplu isteğin durumu sayılarla ve sayfalarla okunabilir; `GET /metrics` kanal başına kuyruk derinliğini, tamamlananları ve gecikmeyi verir. Provider hata vermeye devam ederken tüm worker'ların paylaştığı tek bir devre kesici her kanalda claim'leri durdurur ve claim'ler sürmeden önce provider'ı tek bir yoklamayla dener. Bir bildirim mutlak bir `scheduled_at` taşıyabilir ve o zamandan önce gönderilmez. Bir WebSocket istemcisi tek bir bildirimi ya da tek bir toplu isteği izleyebilir: önce güncel durumu, sonra her durum değişikliğini alır. `{{name}}` yer tutuculu kayıtlı şablonlar API'de bir kez render edilir ve worker render edilmiş içeriği gönderir. Bir OTLP endpoint'i verildiğinde API isteği, her teslim denemesi ve her provider çağrısı OpenTelemetry span'leri üretir; Jaeger bunları gösterir.
 
 ## Gereksinimler
 
@@ -980,6 +1018,37 @@ Her kural ihlali, alan başına bir kayıtla (`location` ve `message`) `422` al�
 
 İçerik sınırları bu uygulamanın sınırlarıdır, operatör ya da platform garantisi değildir: 160 kod noktası tek bir SMS parçasına ancak bütün karakterler GSM-7 kümesindeyse sığar (başka karakterlerle bir parça 70 karakter alır); 1.000 kod noktası da push payload'ının APNs ve FCM'nin izin verdiği 4 KB'ın altında kalacağını garanti etmez. Sınırlar ayarlanabilir ve yalnızca yeni bildirimlere uygulanır: bir sınır düşürüldükten sonra, kabul edilmiş bir isteğin tekrarı yine ilk yanıtını alır.
 
+## Tracing (izleme)
+
+İzleme varsayılan olarak kapalıdır. Trace'leri görmek için stack'i `tracing` profiliyle ve hem API'nin hem worker'ın okuduğu tek bir değişkenle başlatın:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile tracing up -d --wait
+```
+
+Bir bildirim gönderin, sonra Jaeger arayüzünü <http://localhost:16686> adresinde açın ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)).
+
+| Span | Servis | Üreten |
+|---|---|---|
+| `POST /notifications` (ve diğer bütün route'lar) | `notification-api` | otelhttp sunucu middleware'i; `/healthz` ve `/readyz` dışarıda bırakılır |
+| `deliver <channel>` | `notification-worker` | Her teslim denemesi için bir tane; bildirim ID'si, kanal ve deneme numarasını taşıyan bir consumer span'i |
+| `provider POST` | `notification-worker` | Denemenin çocuğu: start gate'i saran otelhttp istemci transport'u. İsteği provider'a bir `traceparent` header'ı taşır |
+
+- **Tek trace değil, bağlı trace'ler.** Oluşturma transaction'ı API'nin sunucu span'inin W3C `traceparent` değerini `notifications.traceparent` sütununa yazar; istemci kendi `traceparent`'ını gönderdiyse sunucu span'i onun çocuğudur ve saklanan değer header değil, sunucu span'inin değeridir. Her teslim denemesi, saklanan bu bağlama bir **link** ile yeni bir trace başlatır. Çocuk olsaydı 1.000 öğelik bir toplu istek bütün tekrar denemeleriyle tek bir isteğin trace'i altında toplanırdı; OpenTelemetry'nin mesajlaşma kuralları üretici ile tüketicileri arasında link kullanır.
+- **Bir bildirimi izlemek.** Trace ID'si saklanan değerin ikinci alanıdır:
+
+  ```bash
+  docker compose exec -T postgres psql -U notifications -d notifications -tAc \
+    "select split_part(traceparent, '-', 2) from notifications where id = '<id>'"
+  ```
+
+  Bu trace API isteğini tutar. Jaeger'da `notification-worker` servisini arayın: her `deliver <channel>` span'i referanslarında istek trace'ini gösterir; her tekrar deneme bir bağlı trace daha demektir.
+- **Span'lerde URL yolu yok.** otelhttp URL'nin tamamını kaydeder ve bir webhook.site URL'si token'ını yolunda taşır. Bir span dışarı aktarılmadan önce `url.full` şema ve host'a indirilir: `http://mockprovider:8081/[redacted]`.
+- **Çalışmayan bir collector teslimatı durdurmaz.** Exporter bir partiden tekrar denemeden 2 saniye sonra vazgeçer ve o partinin span'leri düşer. Çıkışta her süreç kapanış bütçesinden sonra en fazla 3 saniye daha boşaltma yapar (Compose bir container'ı öldürmeden önce 15 saniye bekler). `TestTracingCollectorDown`, collector hiç yokken ve hiç cevap vermeyen bir collector varken bildirimin yine `sent` olduğunu kontrol eder.
+- **Kapalı gerçekten kapalıdır.** `OTEL_EXPORTER_OTLP_ENDPOINT` yoksa exporter oluşturulmaz ve `traceparent` null kalır.
+
+![Jaeger'da bir teslim denemesi: deliver span'i ve onun çocuğu provider POST](docs/images/jaeger-trace.png)
+
 ## Mock provider
 
 Compose worker'ı varsayılan olarak `mockprovider` servisine yönlendirir; böylece stack harici bir URL'e ihtiyaç duymaz.
@@ -1030,6 +1099,7 @@ API'de kimlik doğrulama olmadığı için portlar yalnızca `127.0.0.1` üzerin
 | `API_PORT` | `8080` | API, `127.0.0.1:8080` |
 | `MOCK_PORT` | `8081` | Mock provider, `127.0.0.1:8081` |
 | `POSTGRES_PORT` | `5433` | PostgreSQL, `127.0.0.1:5433` (yerel bir PostgreSQL ile çakışmasın diye 5432 değil) |
+| `JAEGER_UI_PORT` | `16686` | Jaeger arayüzü `127.0.0.1:16686` üzerinde, yalnızca `tracing` profiliyle |
 | `BIND_ADDRESS` | `127.0.0.1` | Bütün portların bağlandığı host adresi |
 
 Örnek: `API_PORT=18080 docker compose up`.
@@ -1053,6 +1123,8 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 | `WS_SEND_QUEUE` | `16` | Bir WebSocket için bekleyen mesajlar; dolunca bağlantı `1008` ile kapanır |
 | `WS_WRITE_TIMEOUT` | `5s` | Tek bir WebSocket yazımı için sınır |
 | `WS_CLOSE_TIMEOUT` | `5s` | Kapanışta açık WebSocket'ler için bekleme; `SHUTDOWN_TIMEOUT`'tan küçük olmalı |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | boş (kapalı) | OTLP/HTTP taban URL'si, host içeren `http` ya da `https`; trace'ler `/v1/traces` yoluna gider. Boşsa izleme kapalıdır ([İzleme](#tracing-izleme)) |
+| `OTEL_SERVICE_NAME` | `notification-api` | Span'lerdeki servis adı |
 
 ### Worker ayarları
 
@@ -1078,6 +1150,8 @@ Her program tipli ortam değişkenlerini okur; geçersiz bir değerle başlamay�
 | `BREAKER_COOLDOWN` | `30s` | Devre kesici kapalıyken açıldığında bekleme süresi; en fazla `BREAKER_MAX_COOLDOWN` |
 | `BREAKER_MAX_COOLDOWN` | `5m` | Her yeniden açılışta ikiye katlanan bekleme süresinin üst sınırı |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ya da `error` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | boş (kapalı) | OTLP/HTTP taban URL'si, host içeren `http` ya da `https`; trace'ler `/v1/traces` yoluna gider. Boşsa izleme kapalıdır ([İzleme](#tracing-izleme)) |
+| `OTEL_SERVICE_NAME` | `notification-worker` | Span'lerdeki servis adı |
 
 ### Mock provider ayarları
 
@@ -1144,6 +1218,7 @@ docker compose run --rm migrate
 - **Bir kanaldaki kesinti üç kanalı da durdurur** ([K34](docs/DECISIONS.md#k34--failure-handling-b1-one-circuit-breaker-for-the-provider-shared-by-all-workers)). Üç kanal aynı URL'yi paylaştığı için devre kesici provider başınadır: provider'da yalnızca bir kanalın karşılaştığı bir hata da bir yoklama başarılı olana kadar tüm claim'leri durdurur. Yoklama taşıdığı bildirimin bir denemesini kullanır ve `failed` bildirimler asla yeniden gönderilmez.
 - **Gerçek zamanlı güncellemeler en iyi çabadır** ([K24](docs/DECISIONS.md#k24--real-time-status-events-b4-postgresql-listennotify)). API dururken bellekteki olaylar kaybolur, yavaş bir istemcinin bağlantısı kesilir ve PostgreSQL dinleyici yeniden bağlanırken gönderilen bildirimleri yeniden oynatmaz; istemci yeni bir anlık görüntü için yeniden bağlanır. Her bağlantı tek bir bildirimi ya da tek bir toplu isteği izler.
 - **Şablonlar birikir** ([K33](docs/DECISIONS.md#k33--templates-b3-immutable-stored-templates-with-name-placeholders-rendered-at-the-api)). Bir şablon değiştirilemez ya da silinemez; bu yüzden değişen bir mesaj yeni bir şablondur. Yer tutucular düz yerine koymadır: koşul, döngü ya da kaçış yoktur.
+- **İzleme bağlı trace'ler gösterir, veritabanı span'i yoktur** ([K27](docs/DECISIONS.md#k27--distributed-tracing-b5-opentelemetry-over-otlphttp-linked-traces-jaeger-as-an-optional-profile)). Bir bildirimin isteği ve denemeleri link'lerle bağlanan ayrı trace'lerdir; bir bildirimi izlemek önce isteğin trace'ini, sonra bağlı deneme trace'lerini açmak demektir. SQL işleri izlenmez. Çalışmayan bir collector'ın alamadığı span'ler düşer ve Jaeger onları yalnızca bellekte tutar.
 - **CI'da teslim adımı yok** ([K29](docs/DECISIONS.md#k29--ci-b6-a-github-actions-pipeline-for-lint-tests-the-openapi-check-and-the-docker-build)). CI lint, test, OpenAPI kontrolü ve imaj derlemesi yapar; hiçbir şey yayımlanmaz ya da dağıtılmaz.
 
 ## Bonuslar
@@ -1155,7 +1230,7 @@ docker compose run --rm migrate
 | B2 — Zamanlanmış bildirimler | Tamam ([Zamanlanmış bildirimler](#zamanlanmış-bildirimler)) |
 | B4 — WebSocket ile gerçek zamanlı durum güncellemeleri | Tamam ([Gerçek zamanlı durum](#gerçek-zamanlı-durum)) |
 | B3 — Mesaj şablonları | Tamam ([Şablonlar](#şablonlar)) |
-| B5 — Dağıtık izleme | Planlandı ([dilim 15](docs/slices/15-distributed-tracing.md)) |
+| B5 — Dağıtık izleme | Tamamlandı ([İzleme](#tracing-izleme)) |
 
 ## Proje yapısı
 
@@ -1172,6 +1247,7 @@ internal/domain/        bildirim tipleri, doğrulama, istek özeti, şablon ayr�
 internal/service/       oluşturma, okuma, iptal, listeleme, toplu istek, şablon ve metrik kuralları; listeleme cursor'ı; WebSocket anlık görüntü okumaları
 internal/httpapi/       router, Huma operasyonları, middleware, WebSocket endpoint'leri
 internal/realtime/      WebSocket aboneleri, kuyrukları, dinleyici nesli ve sürüm filtresi
+internal/tracing/       tracer provider, OTLP/HTTP exporter, W3C propagator, URL maskeleme, saklanan traceparent
 internal/postgres/      bağlantı havuzu ve bütün SQL: oluşturma, toplu oluşturma, okuma, listeleme, iptal, metrik anlık görüntüsü, izinli ve yoklama yerli claim, devre kesiciyle sonuç yazma, geri verme, kurtarma, durum dinleyicisi ve anlık görüntü okumaları
 internal/worker/        kanal başına claim döngüsü, lease ve başlama son anları, tekrar denemeler ve backoff, lease kurtarma, devre kesici beklemeleri
 internal/provider/      provider HTTP istemcisi, başlatma kapısı, kesinti işaretli cevap sınıflandırması, Retry-After
